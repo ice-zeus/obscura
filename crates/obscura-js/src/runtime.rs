@@ -3929,6 +3929,8 @@ impl ObscuraJsRuntime {
         let state = self.state.borrow();
         // Native callers can mutate this interior-mutable tree without a JS
         // activity notification. Do not retain a base value across that access.
+        // No-render builds retain their existing JS-only cache behavior.
+        #[cfg(feature = "render")]
         state.base_url_cache.borrow_mut().take();
         state.dom.as_ref().map(f)
     }
@@ -3972,6 +3974,7 @@ impl ObscuraJsRuntime {
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
         let r = self.state.borrow();
         if r.dom.is_some() {
+            #[cfg(feature = "render")]
             r.base_url_cache.borrow_mut().take();
             Some(std::cell::Ref::map(r, |s| &s.dom))
         } else {
@@ -17319,6 +17322,19 @@ mod tests {
             after.as_str().unwrap(),
             "http://example.com/other/data/x.json"
         );
+    }
+
+    #[cfg(not(feature = "render"))]
+    #[test]
+    fn native_dom_reads_keep_base_cache_without_rendering() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        assert_eq!(rt.evaluate("document.baseURI").unwrap().as_str(), Some("http://example.com/app/"));
+        assert!(rt.state.borrow().base_url_cache.borrow().is_some());
+        rt.with_dom(|dom| dom.document());
+        assert!(rt.state.borrow().base_url_cache.borrow().is_some());
+        drop(rt.dom_ref());
+        assert!(rt.state.borrow().base_url_cache.borrow().is_some());
+        assert_eq!(rt.evaluate("document.baseURI").unwrap().as_str(), Some("http://example.com/app/"));
     }
 
     #[cfg(feature = "render")]

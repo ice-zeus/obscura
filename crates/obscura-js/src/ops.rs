@@ -6320,6 +6320,7 @@ fn op_waapi_control(state: &OpState, id: f64, #[string] action: &str, value: f64
 
 // Rendering and JS URL reflection share one document-generation cache. Geometry
 // and image getters must not run a whole-document selector on every read.
+#[cfg(feature = "render")]
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     base_values_memoized(state).0
 }
