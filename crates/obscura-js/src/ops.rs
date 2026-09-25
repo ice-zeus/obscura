@@ -6318,24 +6318,19 @@ fn op_waapi_control(state: &OpState, id: f64, #[string] action: &str, value: f64
     changed
 }
 
-// Not tied to `render`: the JS layer resolves every relative URL through here, in all build
-// variants.
+// Rendering and JS URL reflection share one document-generation cache. Geometry
+// and image getters must not run a whole-document selector on every read.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
-    let document_url = url::Url::parse(&state.url).ok()?;
-    let base_href = state.dom.as_ref().and_then(|dom| {
-        dom.query_selector("base[href]")
-            .ok()
-            .flatten()
-            .and_then(|id| {
-                dom.get_node(id)
-                    .and_then(|node| node.get_attribute("href").map(str::to_string))
-            })
-    });
+    base_values_memoized(state).0
+}
+
+fn resolve_document_base_url(document_url: &str, base_href: Option<&str>) -> Option<String> {
+    let document_url = url::Url::parse(document_url).ok()?;
     match base_href {
         // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
         // A data: or javascript: base falls back to the document URL. Accepting it would instead
         // make every later relative resolution fail.
-        Some(href) => match document_url.join(&href) {
+        Some(href) => match document_url.join(href) {
             Ok(base) if base.scheme() != "data" && base.scheme() != "javascript" => {
                 Some(base.to_string())
             }
@@ -6380,8 +6375,10 @@ fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>
             return (cached.resolved.clone(), cached.raw_href.clone());
         }
     }
-    let resolved = document_base_url(state);
+    // Resolve both forms from the same first <base href>. Keep the existing
+    // conservative mutation key so reordering/removal and URL changes are seen.
     let raw_href = document_base_href(state);
+    let resolved = resolve_document_base_url(&state.url, raw_href.as_deref());
     *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
         activity_generation: state.activity_generation,
         document_generation: state.document_generation,

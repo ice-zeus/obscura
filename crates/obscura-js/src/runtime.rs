@@ -3868,6 +3868,7 @@ impl ObscuraJsRuntime {
     }
     pub fn take_dom(&self) -> Option<DomTree> {
         let mut state = self.state.borrow_mut();
+        state.base_url_cache.get_mut().take();
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
@@ -3926,6 +3927,9 @@ impl ObscuraJsRuntime {
 
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
         let state = self.state.borrow();
+        // Native callers can mutate this interior-mutable tree without a JS
+        // activity notification. Do not retain a base value across that access.
+        state.base_url_cache.borrow_mut().take();
         state.dom.as_ref().map(f)
     }
 
@@ -3968,6 +3972,7 @@ impl ObscuraJsRuntime {
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
         let r = self.state.borrow();
         if r.dom.is_some() {
+            r.base_url_cache.borrow_mut().take();
             Some(std::cell::Ref::map(r, |s| &s.dom))
         } else {
             None
@@ -17314,6 +17319,74 @@ mod tests {
             after.as_str().unwrap(),
             "http://example.com/other/data/x.json"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_base_cache_tracks_dom_url_and_document_replacement() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base id="a" href="/a/"><base id="b" href="/b/"></head>
+            <body><img id="image" src="picture.svg"><p>geometry</p></body></html>"#,
+        );
+        let check = |rt: &mut ObscuraJsRuntime, expected: &str| {
+            let base = {
+                let mut state = rt.state.borrow_mut();
+                ensure_prepared_render(&mut state).unwrap().base_url().unwrap().to_string()
+            };
+            assert_eq!(base, expected);
+            let image = rt.evaluate("document.getElementById('image').currentSrc").unwrap();
+            assert_eq!(image.as_str().unwrap(), url::Url::parse(expected).unwrap().join("picture.svg").unwrap().as_str());
+            assert_eq!(rt.evaluate("document.baseURI").unwrap().as_str().unwrap(), expected);
+        };
+        check(&mut rt, "http://example.com/a/");
+        // Warm both geometry and image metadata, then change which base wins.
+        check(&mut rt, "http://example.com/a/");
+        for (script, expected) in [
+            ("document.head.insertBefore(document.getElementById('b'),document.getElementById('a'))", "http://example.com/b/"),
+            ("document.getElementById('b').removeAttribute('href')", "http://example.com/a/"),
+            ("document.getElementById('a').setAttribute('href','assets/')", "http://example.com/deep/assets/"),
+            ("document.getElementById('a').remove()", "http://example.com/deep/page"),
+            ("document.getElementById('b').setAttribute('href','javascript:bad')", "http://example.com/deep/page"),
+            ("document.getElementById('b').setAttribute('href','https://cdn.example.net/v2/')", "https://cdn.example.net/v2/"),
+        ] {
+            rt.evaluate(script).unwrap();
+            check(&mut rt, expected);
+        }
+        // The embedder updates the native document URL separately from JS history.
+        rt.evaluate("document.getElementById('b').setAttribute('href','assets/')").unwrap();
+        rt.set_url("http://example.com/other/page");
+        rt.run_page_init();
+        check(&mut rt, "http://example.com/other/assets/");
+        rt.set_dom(parse_html("<html><head><base href='/replacement/'></head><body></body></html>"));
+        let mut state = rt.state.borrow_mut();
+        assert_eq!(ensure_prepared_render(&mut state).unwrap().base_url(), Some("http://example.com/replacement/"));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_base_cache_sees_native_dom_access_and_removal() {
+        let rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let base = |rt: &ObscuraJsRuntime| {
+            let mut state = rt.state.borrow_mut();
+            ensure_prepared_render(&mut state).unwrap().base_url().unwrap().to_string()
+        };
+        assert_eq!(base(&rt), "http://example.com/app/");
+        rt.with_dom(|dom| {
+            let node = dom.query_selector("base").unwrap().unwrap();
+            dom.with_node_mut(node, |node| node.set_attribute("href", "/native/".into()));
+        });
+        assert_eq!(base(&rt), "http://example.com/native/");
+        {
+            let dom = rt.dom_ref().unwrap();
+            let dom = dom.as_ref().unwrap();
+            let node = dom.query_selector("base").unwrap().unwrap();
+            dom.remove(node);
+        }
+        assert_eq!(base(&rt), "http://example.com/deep/page");
+        rt.set_dom(parse_html(BASE_HREF_PAGE));
+        assert_eq!(base(&rt), "http://example.com/app/");
+        rt.take_dom();
+        assert_eq!(crate::ops::document_base_url(&rt.state.borrow()).as_deref(), Some("http://example.com/deep/page"));
     }
 
     #[tokio::test(flavor = "current_thread")]
