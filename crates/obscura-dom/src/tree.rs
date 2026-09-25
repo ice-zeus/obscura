@@ -1131,6 +1131,37 @@ impl DomTree {
         Some(self.children(root))
     }
 
+    /// Internal preorder traversal for synchronous reads such as selectors.
+    /// Unlike `descendants`, this does not allocate a snapshot of the subtree
+    /// before the first result. Only deferred siblings on the current ancestor
+    /// path are retained, and no RefCell borrow survives an iterator step.
+    pub(crate) fn descendants_iter(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let mut next = self.with_node(node_id, |node| node.first_child).flatten();
+        let mut siblings = Vec::new();
+        let mut remaining = self.node_slot_count();
+        std::iter::from_fn(move || {
+            let current = next.take()?;
+            if remaining == 0 {
+                eprintln!("obscura: descendants iterator cap hit at node {} - tree has a cycle", node_id.index());
+                siblings.clear();
+                return None;
+            }
+            remaining -= 1;
+            let (child, sibling) = self
+                .with_node(current, |node| (node.first_child, node.next_sibling))
+                .unwrap_or_default();
+            if let Some(child) = child {
+                if let Some(sibling) = sibling {
+                    siblings.push(sibling);
+                }
+                next = Some(child);
+            } else {
+                next = sibling.or_else(|| siblings.pop());
+            }
+            Some(current)
+        })
+    }
+
     pub fn descendants(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
@@ -1782,6 +1813,41 @@ impl Default for DomTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_descendants_match_snapshots_and_keep_shadow_roots_separate() {
+        let tree = crate::parse_html("<!doctype html><main id='root'>text<!--gap--><div><i></i><b></b></div><p></p></main><aside id='host'></aside>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let child = element(&tree, "span");
+        tree.append_child(shadow, child);
+        let mut roots = tree.descendants(tree.document());
+        roots.extend([tree.document(), shadow, child]);
+        for root in roots {
+            assert_eq!(tree.descendants_iter(root).collect::<Vec<_>>(), tree.descendants(root));
+        }
+        assert!(!tree.descendants_iter(tree.document()).any(|node| node == child));
+        assert_eq!(tree.descendants_iter(shadow).collect::<Vec<_>>(), vec![child]);
+        tree.detach(child);
+        assert_eq!(tree.descendants_iter(shadow).count(), 0);
+        assert_eq!(tree.descendants_iter(child).count(), 0);
+    }
+
+    #[test]
+    fn streaming_descendants_bound_broken_child_and_sibling_cycles() {
+        for sibling_cycle in [false, true] {
+            let tree = DomTree::new();
+            let child = element(&tree, "div");
+            tree.append_child(tree.document(), child);
+            tree.with_node_mut(child, |node| {
+                if sibling_cycle { node.next_sibling = Some(child); }
+                else { node.first_child = Some(child); }
+            });
+            let mut walk = tree.descendants_iter(tree.document());
+            assert_eq!(walk.by_ref().count(), tree.node_slot_count());
+            assert_eq!(walk.next(), None);
+        }
+    }
 
     fn element(tree: &DomTree, local: &str) -> NodeId {
         tree.new_node(NodeData::Element {
