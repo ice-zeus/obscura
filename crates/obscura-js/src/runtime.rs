@@ -286,6 +286,36 @@ pub struct WatchdogToken {
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+fn run_script_watchdog(
+    pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    timeout: std::time::Duration,
+    terminate: impl FnOnce(),
+) {
+    let (lock, cvar) = &*pair;
+    let mut cancelled = lock.lock().unwrap();
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        // A fast script can cancel before this thread starts. Notifications
+        // are not buffered, so check the predicate before waiting; otherwise
+        // the caller's join blocks for the entire script timeout.
+        if *cancelled {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            terminate();
+            return;
+        }
+
+        let result = cvar.wait_timeout(cancelled, remaining).unwrap();
+        cancelled = result.0;
+        if *cancelled {
+            return;
+        }
+    }
+}
+
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
 /// runtime borrow. The CDP dispatcher uses this to bound every command so a
 /// hung page cannot hold this connection's V8 lock forever. Pair with
@@ -3252,23 +3282,9 @@ impl ObscuraJsRuntime {
         let pair_clone = pair.clone();
 
         let watchdog = std::thread::spawn(move || {
-            let (lock, cvar) = &*pair_clone;
-            let mut cancelled = lock.lock().unwrap();
-            let deadline = std::time::Instant::now() + timeout;
-
-            loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    isolate_handle.terminate_execution();
-                    return;
-                }
-
-                let result = cvar.wait_timeout(cancelled, remaining).unwrap();
-                cancelled = result.0;
-                if *cancelled {
-                    return;
-                }
-            }
+            run_script_watchdog(pair_clone, timeout, || {
+                isolate_handle.terminate_execution();
+            });
         });
 
         let result = self.execute_classic_script(name, source);
@@ -3308,6 +3324,39 @@ impl ObscuraJsRuntime {
         let result = event_loop
             .await
             .map_err(|e| format!("Event loop error: {}", e));
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        self.finish_heap_checked(result)
+    }
+
+    /// Poll page work, then park until the runtime's timer/I/O waker fires.
+    /// Unlike run-to-idle, an already idle runtime does not complete the first
+    /// poll. Lifecycle callers can wait for their quiet-window deadline without
+    /// busy-polling, and can recheck network state after each subsequent wake.
+    /// The caller owns the timeout and synchronous-execution watchdog.
+    #[doc(hidden)]
+    pub async fn wait_for_event_loop_activity(&mut self) -> Result<(), String> {
+        self.begin_javascript_task();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        let mut waiting_for_wake = false;
+        let result = std::future::poll_fn(|cx| {
+            let tick = self
+                .runtime()
+                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            match tick {
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
+                }
+                _ if waiting_for_wake => std::task::Poll::Ready(Ok(())),
+                _ => {
+                    // poll_event_loop registers this waker even at true idle.
+                    // Do not self-wake: real work or the caller's deadline
+                    // will schedule the next poll.
+                    waiting_for_wake = true;
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         self.finish_heap_checked(result)
     }
@@ -3868,6 +3917,7 @@ impl ObscuraJsRuntime {
     }
     pub fn take_dom(&self) -> Option<DomTree> {
         let mut state = self.state.borrow_mut();
+        state.base_url_cache.get_mut().take();
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
@@ -3926,6 +3976,11 @@ impl ObscuraJsRuntime {
 
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
         let state = self.state.borrow();
+        // Native callers can mutate this interior-mutable tree without a JS
+        // activity notification. Do not retain a base value across that access.
+        // No-render builds retain their existing JS-only cache behavior.
+        #[cfg(feature = "render")]
+        state.base_url_cache.borrow_mut().take();
         state.dom.as_ref().map(f)
     }
 
@@ -3968,6 +4023,8 @@ impl ObscuraJsRuntime {
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
         let r = self.state.borrow();
         if r.dom.is_some() {
+            #[cfg(feature = "render")]
+            r.base_url_cache.borrow_mut().take();
             Some(std::cell::Ref::map(r, |s| &s.dom))
         } else {
             None
@@ -7726,6 +7783,87 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_activity_wait_parks_an_idle_runtime() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.run_event_loop().await.unwrap();
+        let mut wait = std::pin::pin!(rt.wait_for_event_loop_activity());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            wait.as_mut().poll(&mut cx).is_pending(),
+            "an idle runtime must park instead of completing synchronously",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_activity_wait_drives_timer_microtasks_and_observers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("network-idle-tasks", r#"
+            globalThis.__idleEvents = [];
+            new MutationObserver(() => __idleEvents.push('observer'))
+                .observe(document.body, { attributes: true });
+            setTimeout(() => {
+                __idleEvents.push('timer');
+                Promise.resolve().then(() => {
+                    __idleEvents.push('microtask');
+                    document.body.setAttribute('data-ready', 'yes');
+                });
+            }, 15);
+        "#).unwrap();
+        // No periodic sleep drives the runtime here. If it loses the timer's
+        // waker, the generous safety deadline fails instead of pumping it.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                rt.wait_for_event_loop_activity().await.unwrap();
+                if rt.evaluate("__idleEvents.includes('observer')").unwrap()
+                    == serde_json::json!(true)
+                {
+                    break;
+                }
+            }
+        }).await.expect("timer and observer must wake the parked runtime");
+        assert_eq!(rt.evaluate("__idleEvents").unwrap(),
+            serde_json::json!(["timer", "microtask", "observer"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_activity_wait_drives_network_completion() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(30));
+        rt.execute_script("network-idle-fetch", r#"
+            fetch('/value').then(r => r.text()).then(value => {
+                document.body.setAttribute('data-response', value);
+            });
+        "#).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                rt.wait_for_event_loop_activity().await.unwrap();
+                if rt.evaluate("document.body.getAttribute('data-response')").unwrap()
+                    == serde_json::json!("hydrated")
+                {
+                    break;
+                }
+            }
+        }).await.expect("network response must wake the parked runtime");
+        accepted.try_recv().expect("real HTTP request was received");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_activity_wait_cancellation_preserves_timer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("network-idle-cancel", r#"
+            globalThis.__afterCancel = false;
+            setTimeout(() => { __afterCancel = true; }, 15);
+        "#).unwrap();
+        {
+            let mut wait = std::pin::pin!(rt.wait_for_event_loop_activity());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), rt.run_event_loop())
+            .await.expect("timer survives cancellation").unwrap();
+        assert_eq!(rt.evaluate("__afterCancel").unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn idle_event_loop_flushes_resolved_promise_continuations() {
         let mut rt = setup_runtime("<html><body><div id='state'>pending</div></body></html>");
         rt.execute_script(
@@ -7929,11 +8067,22 @@ mod tests {
             serde_json::json!(0.0),
             "an interval installed by a level-six timer must clamp before its first tick",
         );
-        rt.run_autonomous_event_loop_turn().await.unwrap();
-        assert_eq!(
-            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
-            serde_json::json!(1.0),
-        );
+        // A V8 maintenance wake can yield without dispatching a timer. Keep
+        // the clamping assertion above, but wait for bounded callback progress
+        // rather than assuming the next autonomous turn delivers a timer task.
+        let ticks = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                rt.run_autonomous_event_loop_turn().await.unwrap();
+                let ticks = rt.evaluate("globalThis.__deepIntervalTicks").unwrap();
+                if ticks != serde_json::json!(0.0) {
+                    break ticks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the clamped interval must make progress despite maintenance wakes");
+        assert_eq!(ticks, serde_json::json!(1.0));
         rt.execute_script(
             "clear-deep-interval",
             "clearInterval(globalThis.__deepInterval)",
@@ -17348,6 +17497,87 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "render"))]
+    #[test]
+    fn native_dom_reads_keep_base_cache_without_rendering() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        assert_eq!(rt.evaluate("document.baseURI").unwrap().as_str(), Some("http://example.com/app/"));
+        assert!(rt.state.borrow().base_url_cache.borrow().is_some());
+        rt.with_dom(|dom| dom.document());
+        assert!(rt.state.borrow().base_url_cache.borrow().is_some());
+        drop(rt.dom_ref());
+        assert!(rt.state.borrow().base_url_cache.borrow().is_some());
+        assert_eq!(rt.evaluate("document.baseURI").unwrap().as_str(), Some("http://example.com/app/"));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_base_cache_tracks_dom_url_and_document_replacement() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base id="a" href="/a/"><base id="b" href="/b/"></head>
+            <body><img id="image" src="picture.svg"><p>geometry</p></body></html>"#,
+        );
+        let check = |rt: &mut ObscuraJsRuntime, expected: &str| {
+            let base = {
+                let mut state = rt.state.borrow_mut();
+                ensure_prepared_render(&mut state).unwrap().base_url().unwrap().to_string()
+            };
+            assert_eq!(base, expected);
+            let image = rt.evaluate("document.getElementById('image').currentSrc").unwrap();
+            assert_eq!(image.as_str().unwrap(), url::Url::parse(expected).unwrap().join("picture.svg").unwrap().as_str());
+            assert_eq!(rt.evaluate("document.baseURI").unwrap().as_str().unwrap(), expected);
+        };
+        check(&mut rt, "http://example.com/a/");
+        // Warm both geometry and image metadata, then change which base wins.
+        check(&mut rt, "http://example.com/a/");
+        for (script, expected) in [
+            ("document.head.insertBefore(document.getElementById('b'),document.getElementById('a'))", "http://example.com/b/"),
+            ("document.getElementById('b').removeAttribute('href')", "http://example.com/a/"),
+            ("document.getElementById('a').setAttribute('href','assets/')", "http://example.com/deep/assets/"),
+            ("document.getElementById('a').remove()", "http://example.com/deep/page"),
+            ("document.getElementById('b').setAttribute('href','javascript:bad')", "http://example.com/deep/page"),
+            ("document.getElementById('b').setAttribute('href','https://cdn.example.net/v2/')", "https://cdn.example.net/v2/"),
+        ] {
+            rt.evaluate(script).unwrap();
+            check(&mut rt, expected);
+        }
+        // The embedder updates the native document URL separately from JS history.
+        rt.evaluate("document.getElementById('b').setAttribute('href','assets/')").unwrap();
+        rt.set_url("http://example.com/other/page");
+        rt.run_page_init();
+        check(&mut rt, "http://example.com/other/assets/");
+        rt.set_dom(parse_html("<html><head><base href='/replacement/'></head><body></body></html>"));
+        let mut state = rt.state.borrow_mut();
+        assert_eq!(ensure_prepared_render(&mut state).unwrap().base_url(), Some("http://example.com/replacement/"));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_base_cache_sees_native_dom_access_and_removal() {
+        let rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let base = |rt: &ObscuraJsRuntime| {
+            let mut state = rt.state.borrow_mut();
+            ensure_prepared_render(&mut state).unwrap().base_url().unwrap().to_string()
+        };
+        assert_eq!(base(&rt), "http://example.com/app/");
+        rt.with_dom(|dom| {
+            let node = dom.query_selector("base").unwrap().unwrap();
+            dom.with_node_mut(node, |node| node.set_attribute("href", "/native/".into()));
+        });
+        assert_eq!(base(&rt), "http://example.com/native/");
+        {
+            let dom = rt.dom_ref().unwrap();
+            let dom = dom.as_ref().unwrap();
+            let node = dom.query_selector("base").unwrap().unwrap();
+            dom.remove(node);
+        }
+        assert_eq!(base(&rt), "http://example.com/deep/page");
+        rt.set_dom(parse_html(BASE_HREF_PAGE));
+        assert_eq!(base(&rt), "http://example.com/app/");
+        rt.take_dom();
+        assert_eq!(crate::ops::document_base_url(&rt.state.borrow()).as_deref(), Some("http://example.com/deep/page"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn base_href_governs_fetch_and_xhr_targets() {
         let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
@@ -19766,6 +19996,85 @@ mod tests {
             serde_json::json!("ran")
         );
         assert_eq!(request_thread.join().unwrap(), "/scoped.js");
+    }
+
+    #[test]
+    fn script_watchdog_pre_cancelled_skips_timeout() {
+        let pair = std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            run_script_watchdog(pair, std::time::Duration::from_secs(5), || {
+                panic!("a cancelled watchdog must not terminate execution");
+            });
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cancellation before startup must not wait for the five-second budget");
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn script_watchdog_cancellation_joins_promptly() {
+        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_pair = pair.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            run_script_watchdog(worker_pair, std::time::Duration::from_secs(5), || {
+                panic!("cancellation must prevent termination");
+            });
+            done_tx.send(()).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        {
+            let (lock, cvar) = &*pair;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+        }
+        done_rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cancellation must wake and join the watchdog promptly");
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn script_watchdog_uncancelled_reaches_deadline() {
+        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut terminated = false;
+        let budget = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        run_script_watchdog(pair, budget, || terminated = true);
+        assert!(terminated, "an uncancelled script must still be terminated");
+        assert!(started.elapsed() >= budget, "the timeout must not be shortened");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guarded_classic_script_preserves_completion_microtasks_and_errors() {
+        let mut rt = ObscuraJsRuntime::new();
+        let padding = format!("/*{}*/", "x".repeat(10_000));
+        let source = format!(
+            "globalThis.__guardedCount = (globalThis.__guardedCount || 0) + 1; \
+             Promise.resolve().then(() => {{ globalThis.__guardedMicrotasks = \
+                 (globalThis.__guardedMicrotasks || 0) + 1; }}); {padding}",
+        );
+        for _ in 0..3 {
+            rt.execute_script_guarded("guarded-fast-script", &source).unwrap();
+        }
+        assert_eq!(rt.evaluate("[__guardedCount, __guardedMicrotasks]").unwrap(),
+                   serde_json::json!([3, 3]));
+        let error = rt.execute_script_guarded(
+            "guarded-throw",
+            &format!("throw new Error('guarded-script-error'); {padding}"),
+        ).unwrap_err();
+        assert!(error.contains("guarded-script-error"), "{error}");
+        assert_eq!(rt.evaluate("__guardedCount + 1").unwrap().as_f64(), Some(4.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_script_timeout_preserves_classic_execution() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.execute_script_with_timeout(
+            "zero-timeout", "globalThis.__zeroTimeoutRan = true;", std::time::Duration::ZERO,
+        ).unwrap();
+        assert_eq!(rt.evaluate("__zeroTimeoutRan").unwrap(), serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]

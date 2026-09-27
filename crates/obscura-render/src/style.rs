@@ -424,7 +424,9 @@ pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
-        if name == "animation" || name.starts_with("animation-") {
+        // display:none determines whether a CSS animation can exist, even
+        // when an important declaration overrides the normal display value.
+        if name == "display" || name == "animation" || name.starts_with("animation-") {
             apply_value(style, &name, value.trim());
         }
     }
