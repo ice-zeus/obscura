@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Opt in to real ANGLE graphics; default feature sets remain unchanged.
+webgl = ["render", "dep:obscura-webgl"]
 default = []
 # Builds obscura-net with its stealth (wreq) HTTP client and lets scripted
 # fetch()/XHR be routed through it so JS-level requests carry the same Chrome
@@ -20,6 +22,7 @@ render = ["dep:obscura-render", "obscura-render/paint"]
 deno_core = "0.412"
 
 [dependencies]
+obscura-webgl = { workspace = true, optional = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 deno_core = "0.412"

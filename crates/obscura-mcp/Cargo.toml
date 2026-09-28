@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Opt in to real ANGLE graphics; default feature sets remain unchanged.
+webgl = ["render", "obscura-browser/webgl"]
 default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 render = ["obscura-browser/render", "dep:base64"]

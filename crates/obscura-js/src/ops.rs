@@ -200,6 +200,8 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    #[cfg(feature = "render")]
+    pub(crate) canvas_epoch: u32,
     /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
     /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
     /// Interior mutability so the read path keeps its shared borrow.
@@ -290,6 +292,10 @@ pub struct ObscuraState {
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
+    #[cfg(feature = "webgl")]
+    pub(crate) webgl: crate::webgl_ops::Contexts,
+    #[cfg(feature = "webgl")]
+    pub(crate) webgl_surfaces: HashMap<NodeId, (u32, u32, Vec<u8>)>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -395,6 +401,8 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            #[cfg(feature = "render")]
+            canvas_epoch: next_canvas_epoch(),
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
             prepared_render: None,
@@ -442,6 +450,10 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            #[cfg(feature = "webgl")]
+            webgl: crate::webgl_ops::Contexts::default(),
+            #[cfg(feature = "webgl")]
+            webgl_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -673,6 +685,23 @@ impl RealmStates {
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        for (_, _, state) in self.entries.iter().filter(|(known, _, _)| known == context) {
+            // Pending native work can retain this state after its realm closes.
+            // Retire its posted callbacks as well as its graphics resources.
+            let mut state = state.borrow_mut();
+            state.document_generation = state.document_generation.wrapping_add(1);
+            #[cfg(feature = "render")]
+            {
+                state.canvas_epoch = 0;
+                state.canvas_surfaces.clear();
+            }
+            #[cfg(feature = "webgl")]
+            {
+                crate::webgl_ops::canvas_placeholder::clear(&mut state);
+                state.webgl.entries.clear();
+                state.webgl_surfaces.clear();
+            }
+        }
         self.entries.retain(|(known, _, _)| known != context);
     }
 
@@ -1160,6 +1189,8 @@ pub struct RenderResourceResponse {
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
     pub body: Arc<[u8]>,
+    #[cfg(feature = "webgl")]
+    pub image_origin_clean: bool,
 }
 
 /// A transport response the runtime applied; the page turns it into the
@@ -1771,6 +1802,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             "null".to_string()
         }
         "document_node_id" => dom.document().index().to_string(),
+        // Keep this as an exact string: JS wrapper caches must not conflate
+        // document identities when the host installs a replacement DOM.
+        "document_generation" => gs.document_generation.to_string(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script
             // changes through title.textContent must be reflected by
@@ -4073,6 +4107,31 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "render")]
+    #[test]
+    fn exhausted_canvas_epochs_never_wrap_to_an_old_owner() {
+        let next = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
+        assert_eq!(super::allocate_canvas_epoch(&next),u32::MAX - 1);
+        assert_eq!(super::allocate_canvas_epoch(&next),0);
+        assert_eq!(super::allocate_canvas_epoch(&next),0);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn canvas_epochs_distinguish_reused_frames_and_reject_retired_documents() {
+        let mut first = super::ObscuraState::new();
+        let mut second = super::ObscuraState::new();
+        first.frame_id = 7;
+        second.frame_id = 7;
+        assert_eq!(first.document_generation, second.document_generation);
+        assert_ne!(first.canvas_epoch, second.canvas_epoch);
+        assert!(super::canvas_owner_matches(&first, 7, first.canvas_epoch));
+        assert!(!super::canvas_owner_matches(&second, 7, first.canvas_epoch));
+        assert!(!super::canvas_owner_matches(&first, 0, first.canvas_epoch));
+        first.canvas_epoch = 0;
+        assert!(!super::canvas_owner_matches(&first, 7, 0));
+    }
+
     use super::{
         FetchCredentials, ObscuraState, cors_response_allows, cors_unsafe_request_header_names,
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
@@ -6213,6 +6272,33 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     true
 }
 
+// Frame IDs and per-state document generations may recur after frame teardown.
+// Canvas epochs are process-unique and never wrap to a previously issued owner.
+#[cfg(feature = "render")]
+pub(crate) fn next_canvas_epoch() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    allocate_canvas_epoch(&NEXT)
+}
+
+#[cfg(feature = "render")]
+fn allocate_canvas_epoch(next: &std::sync::atomic::AtomicU32) -> u32 {
+    next.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed,
+        |value| value.checked_add(1)).unwrap_or(0)
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn canvas_owner_matches(state: &ObscuraState, frame: u32, epoch: u32) -> bool {
+    epoch != 0 && state.frame_id == frame && state.canvas_epoch == epoch
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_canvas_document_epoch(state: &OpState, frame: u32) -> u32 {
+    let owner = frame_state(state, frame);
+    let Ok(owner) = owner.try_borrow() else { return 0 };
+    if owner.frame_id == frame { owner.canvas_epoch } else { 0 }
+}
+
 /// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
 /// canvas resize supplies a new fixed backing store and atomically replaces
 /// the previous surface for the same DOM node.
@@ -6220,6 +6306,8 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
 #[op2]
 fn op_canvas_register_surface(
     state: &OpState,
+    frame: u32,
+    epoch: u32,
     nid: u32,
     width: u32,
     height: u32,
@@ -6242,8 +6330,9 @@ fn op_canvas_register_surface(
         return false;
     }
 
-    let shared = state.borrow::<SharedState>().clone();
-    let mut state = shared.borrow_mut();
+    let shared = frame_state(state, frame);
+    let Ok(mut state) = shared.try_borrow_mut() else { return false };
+    if !canvas_owner_matches(&state, frame, epoch) { return false; }
     let node = NodeId::new(nid);
     let is_canvas = state
         .dom
@@ -6256,6 +6345,8 @@ fn op_canvas_register_surface(
     if !is_canvas {
         return false;
     }
+    #[cfg(feature = "webgl")]
+    if state.webgl.placeholders.owns_node(node) { return false; }
     let replacing = state
         .canvas_surfaces
         .get(&node)
@@ -6287,9 +6378,10 @@ fn op_canvas_register_surface(
 /// screencast/readiness without throwing away otherwise-valid layout.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
-    let mut state = shared.borrow_mut();
+fn op_canvas_paint_damage(state: &OpState, frame: u32, epoch: u32, nid: u32) -> bool {
+    let shared = frame_state(state, frame);
+    let Ok(mut state) = shared.try_borrow_mut() else { return false };
+    if !canvas_owner_matches(&state, frame, epoch) { return false; }
     let node = NodeId::new(nid);
     if !state.canvas_surfaces.contains_key(&node) {
         return false;
@@ -6356,6 +6448,7 @@ pub fn build_extension() -> Extension {
     {
         ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
+        ops.push(op_canvas_document_epoch());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
@@ -6376,6 +6469,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    #[cfg(feature = "webgl")]
+    ops.extend(crate::webgl_ops::declarations());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
@@ -7226,6 +7321,13 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .ok()
         }
     };
+    #[cfg(feature = "webgl")]
+    let origin_clean = response.as_ref().is_some_and(|response| {
+        let gs = shared.borrow();
+        url::Url::parse(&gs.url).ok().zip(parsed_url.as_ref()).is_some_and(|(owner, requested)| {
+            crate::image_security::response_origin_clean(&owner, requested, request_profile, response)
+        })
+    });
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -7237,6 +7339,11 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
+                        #[cfg(feature = "webgl")]
+                        gs.render_resources.seed_image_shared_with_origin(
+                            selected_url.clone(), request_profile, Arc::from(bytes), origin_clean,
+                        );
+                        #[cfg(not(feature = "webgl"))]
                         gs.render_resources.seed_image(
                             selected_url.clone(),
                             request_profile,
