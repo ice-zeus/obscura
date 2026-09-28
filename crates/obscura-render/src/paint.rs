@@ -7888,9 +7888,14 @@ fn bounded_raster_size(w: u32, h: u32) -> (u32, u32) {
 /// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
 /// resized to `w`x`h`.
 fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let resized = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
-    let mut raw = resized.into_raw();
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    // A same-size resize clones the complete pixel buffer in image::resize.
+    // Consume the decoded buffer instead; actual resizes keep the same filter.
+    let mut raw = if img.dimensions() == (w, h) {
+        img.into_raw()
+    } else {
+        image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle).into_raw()
+    };
     for pixel in raw.chunks_exact_mut(4) {
         let a = pixel[3] as u32;
         pixel[0] = ((pixel[0] as u32 * a) / 255) as u8;
@@ -13368,6 +13373,27 @@ mod tests {
         assert_eq!(metadata.0, PLACEHOLDER);
         assert_eq!(metadata.2, Some((1.0, 1.0)));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn consumed_raster_pixels_match_the_original_decode_and_resize_pipeline() {
+        let rgba = image::RgbaImage::from_fn(3, 2, |x, y| {
+            image::Rgba([(x * 75) as u8, (y * 110) as u8, 37, ((x + y) * 63) as u8])
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba).write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let bytes = encoded.into_inner();
+        for (w, h) in [(3, 2), (1, 1), (9, 7), (3, 8)] {
+            let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            let mut expected = image::imageops::resize(&decoded, w, h, image::imageops::FilterType::Triangle).into_raw();
+            for pixel in expected.chunks_exact_mut(4) {
+                let alpha = u32::from(pixel[3]);
+                for channel in &mut pixel[..3] { *channel = (u32::from(*channel) * alpha / 255) as u8; }
+            }
+            let actual = raster_to_pixmap(&bytes, w, h).unwrap();
+            assert_eq!(actual.data(), expected.as_slice(), "{w}x{h}");
+        }
+        assert!(raster_to_pixmap(b"invalid", 3, 2).is_none());
     }
 
     #[test]
