@@ -278,117 +278,36 @@ fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
-/// Holds the cancel channel and the watchdog thread; pass it back to
-/// `disarm_watchdog` to stop the watchdog and learn whether it fired.
+/// Owns one independent deadline in the shared watchdog service.
 pub struct WatchdogToken {
-    pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    join: Option<std::thread::JoinHandle<()>>,
-    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-fn run_script_watchdog(
-    pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    timeout: std::time::Duration,
-    terminate: impl FnOnce(),
-) {
-    let (lock, cvar) = &*pair;
-    let mut cancelled = lock.lock().unwrap();
-    let deadline = std::time::Instant::now() + timeout;
-
-    loop {
-        // A fast script can cancel before this thread starts. Notifications
-        // are not buffered, so check the predicate before waiting; otherwise
-        // the caller's join blocks for the entire script timeout.
-        if *cancelled {
-            return;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            terminate();
-            return;
-        }
-
-        let result = cvar.wait_timeout(cancelled, remaining).unwrap();
-        cancelled = result.0;
-        if *cancelled {
-            return;
-        }
-    }
+    armed: Option<crate::cdp_watchdog::Armed>,
 }
 
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
-/// runtime borrow. The CDP dispatcher uses this to bound every command so a
-/// hung page cannot hold this connection's V8 lock forever. Pair with
-/// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
+/// runtime borrow. The shared worker remains independent of the V8 thread.
+/// Pair with [`WatchdogToken::stop`]; if it returns true, clear termination
 /// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
 pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
-    let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pair_c = pair.clone();
-    let fired_c = fired.clone();
-    let join = std::thread::spawn(move || {
-        let (lock, cvar) = &*pair_c;
-        let mut cancelled = lock.lock().unwrap();
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            // Check first: stop() may have set this (and notified into the void)
-            // before this thread even started, which happens constantly for fast
-            // CDP commands where stop() is called right after spawn. Without this
-            // top check the lost notify means we wait the full budget before
-            // noticing, and stop()'s join() blocks for that whole time.
-            if *cancelled {
-                return;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                fired_c.store(true, std::sync::atomic::Ordering::SeqCst);
-                handle.terminate_execution();
-                return;
-            }
-            let (guard, _) = cvar.wait_timeout(cancelled, remaining).unwrap();
-            cancelled = guard;
-            if *cancelled {
-                return;
-            }
-        }
-    });
-    WatchdogToken {
-        pair,
-        join: Some(join),
-        fired,
-    }
+    WatchdogToken { armed: Some(crate::cdp_watchdog::arm(handle, budget)) }
 }
 
 impl WatchdogToken {
-    fn cancel_and_join(&mut self) {
-        if self.join.is_none() {
-            return;
-        }
-        {
-            let (lock, cvar) = &*self.pair;
-            *lock.lock().unwrap() = true;
-            cvar.notify_one();
-        }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+    fn cancel(&mut self) -> bool {
+        self.armed.take().map(crate::cdp_watchdog::disarm).unwrap_or(false)
     }
 
-    /// Stop the watchdog. Returns true if it had already fired (terminated the
-    /// isolate). The caller must then clear the termination flag via
-    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
+    /// Stop the watchdog. Returns true if it had already fired. Removal and
+    /// firing share the service's lock, so return also acknowledges that this
+    /// deadline can no longer terminate a later operation on the isolate.
     pub fn stop(mut self) -> bool {
-        self.cancel_and_join();
-        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+        self.cancel()
     }
 }
 
 impl Drop for WatchdogToken {
     fn drop(&mut self) {
-        // Futures which own a watchdog may be cancelled while parked on I/O.
-        // Dropping the token must not leave a detached thread which later
-        // terminates an isolate that has already moved on to another task.
-        self.cancel_and_join();
+        // Cancellation of an owning future must remove its deadline too.
+        self.cancel();
     }
 }
 
@@ -3276,26 +3195,11 @@ impl ObscuraJsRuntime {
             return self.execute_classic_script(name, source);
         }
 
-        let isolate_handle = self.runtime().v8_isolate().thread_safe_handle();
-
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let pair_clone = pair.clone();
-
-        let watchdog = std::thread::spawn(move || {
-            run_script_watchdog(pair_clone, timeout, || {
-                isolate_handle.terminate_execution();
-            });
-        });
-
+        let watchdog = self.arm_watchdog(timeout);
         let result = self.execute_classic_script(name, source);
-
-        {
-            let (lock, cvar) = &*pair;
-            let mut cancelled = lock.lock().unwrap();
-            *cancelled = true;
-            cvar.notify_one();
-        }
-        let _ = watchdog.join();
+        // Keep classic-script error handling below, while acknowledging and
+        // clearing any termination before the next script enters this isolate.
+        self.disarm_watchdog(watchdog);
 
         match result {
             Ok(()) => Ok(()),
@@ -3439,7 +3343,7 @@ impl ObscuraJsRuntime {
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
-    /// fires. This spawns a watchdog thread that terminates the isolate once
+    /// fires. The shared watchdog worker terminates the isolate once
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
@@ -19998,52 +19902,69 @@ mod tests {
         assert_eq!(request_thread.join().unwrap(), "/scoped.js");
     }
 
-    #[test]
-    fn script_watchdog_pre_cancelled_skips_timeout() {
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            run_script_watchdog(pair, std::time::Duration::from_secs(5), || {
-                panic!("a cancelled watchdog must not terminate execution");
-            });
-            done_tx.send(()).unwrap();
-        });
-        done_rx.recv_timeout(std::time::Duration::from_secs(1))
-            .expect("cancellation before startup must not wait for the five-second budget");
-        thread.join().unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_watchdog_pre_cancelled_skips_timeout() {
+        let mut rt = ObscuraJsRuntime::new();
+        let started = std::time::Instant::now();
+        let token = rt.arm_watchdog(std::time::Duration::from_secs(5));
+        assert!(!rt.disarm_watchdog(token));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2));
     }
 
-    #[test]
-    fn script_watchdog_cancellation_joins_promptly() {
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let worker_pair = pair.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            run_script_watchdog(worker_pair, std::time::Duration::from_secs(5), || {
-                panic!("cancellation must prevent termination");
-            });
-            done_tx.send(()).unwrap();
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        {
-            let (lock, cvar) = &*pair;
-            *lock.lock().unwrap() = true;
-            cvar.notify_one();
-        }
-        done_rx.recv_timeout(std::time::Duration::from_secs(1))
-            .expect("cancellation must wake and join the watchdog promptly");
-        thread.join().unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_watchdog_cancellation_joins_promptly() {
+        let mut rt = ObscuraJsRuntime::new();
+        let token = rt.arm_watchdog(std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        assert!(!rt.disarm_watchdog(token));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
-    #[test]
-    fn script_watchdog_uncancelled_reaches_deadline() {
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let mut terminated = false;
+    #[tokio::test(flavor = "current_thread")]
+    async fn script_watchdog_uncancelled_reaches_deadline() {
+        let mut rt = ObscuraJsRuntime::new();
         let budget = std::time::Duration::from_millis(20);
         let started = std::time::Instant::now();
-        run_script_watchdog(pair, budget, || terminated = true);
-        assert!(terminated, "an uncancelled script must still be terminated");
-        assert!(started.elapsed() >= budget, "the timeout must not be shortened");
+        let token = rt.arm_watchdog(budget);
+        assert!(rt.evaluate("while (true) {}").is_err());
+        assert!(rt.disarm_watchdog(token));
+        assert!(started.elapsed() >= budget);
+        assert_eq!(rt.evaluate("2 + 2").unwrap(), serde_json::json!(4));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_shared_runtime_watchdog_cannot_interrupt_later_work() {
+        let mut rt = ObscuraJsRuntime::new();
+        drop(rt.arm_watchdog(std::time::Duration::from_millis(30)));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(rt.evaluate("40 + 2").unwrap(), serde_json::json!(42));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_runtime_watchdog_keeps_nested_deadlines_independent() {
+        let mut rt = ObscuraJsRuntime::new();
+        let outer = rt.arm_watchdog(std::time::Duration::from_millis(50));
+        let inner = rt.arm_watchdog(std::time::Duration::from_secs(5));
+        assert!(!rt.disarm_watchdog(inner));
+        assert!(rt.evaluate("while (true) {}").is_err());
+        assert!(rt.disarm_watchdog(outer));
+        assert_eq!(rt.evaluate("7").unwrap(), serde_json::json!(7));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_runtime_watchdog_cancel_at_deadline_leaves_no_late_termination() {
+        let mut rt = ObscuraJsRuntime::new();
+        for _ in 0..32 {
+            let token = rt.arm_watchdog(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Either cancellation or firing may win. Disarm must acknowledge
+            // that race and clear a fired termination before later work starts.
+            rt.disarm_watchdog(token);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            assert_eq!(rt.evaluate("21 * 2").unwrap(), serde_json::json!(42));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
