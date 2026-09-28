@@ -2230,6 +2230,7 @@ impl Page {
         #[derive(Debug, Clone, Copy)]
         enum ScriptKind {
             Classic,
+            ClassicNoModule,
             Module,
             ImportMap,
         }
@@ -2296,7 +2297,11 @@ impl Page {
                                 "module" => ScriptKind::Module,
                                 "importmap" => ScriptKind::ImportMap,
                                 "" | "text/javascript" | "application/javascript" => {
-                                    ScriptKind::Classic
+                                    if node.get_attribute("nomodule").is_some() {
+                                        ScriptKind::ClassicNoModule
+                                    } else {
+                                        ScriptKind::Classic
+                                    }
                                 }
                                 _ => continue,
                             };
@@ -2665,6 +2670,10 @@ impl Page {
             }
 
             match script.kind {
+                // Module support makes legacy classic bundles inert. Keep
+                // their already-started flag, but never fetch or evaluate
+                // them: running both bundles can initialize one DOM twice.
+                ScriptKind::ClassicNoModule => {}
                 ScriptKind::ImportMap => {
                     if script.src.is_some() {
                         tracing::warn!("External import maps are not supported");
@@ -4317,6 +4326,15 @@ impl Page {
         } else {
             self.evaluate(expression)
         }
+    }
+
+    /// Host-owned input operations with private runtime state. Never route
+    /// caller-provided CDP expressions through this embedding-only entry point.
+    #[doc(hidden)]
+    pub fn evaluate_host_expression(&mut self, expression: &str) -> serde_json::Value {
+        self.js.as_mut()
+            .and_then(|js| js.evaluate_host_expression(expression).ok())
+            .unwrap_or(serde_json::Value::Null)
     }
 
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
@@ -7243,6 +7261,79 @@ mod tests {
         page.dom = Some(parse_html(html));
         page.init_js();
         page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nomodule_does_not_initialize_the_same_dom_twice() {
+        // Reduced from a page shipping both legacy and modern application
+        // entry points. Each entry retains the same child for a later commit;
+        // executing both makes the second removal correctly throw.
+        let mut page = import_map_test_page("nomodule-double-init", "https://nomodule.example",
+            include_str!("../tests/fixtures/nomodule-double-initialization.html"));
+        page.execute_scripts().await;
+        assert_eq!(page.js.as_mut().unwrap().evaluate("commitResult").unwrap(),
+            serde_json::json!([1, [], 0, null, false]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_nomodule_is_boolean_and_does_not_suppress_modules_or_import_maps() {
+        let mut page = import_map_test_page("nomodule-types", "https://nomodule.example", r#"
+            <html><head><script>globalThis.runs = [];</script>
+            <script id="legacy" nomodule="false">runs.push('legacy')</script>
+            <script type="text/javascript" nomodule>runs.push('typed-legacy')</script>
+            <script nomodule type="importmap">{"imports":{"number":"data:text/javascript,export default 7"}}</script>
+            <script nomodule type="module">import n from 'number'; runs.push(n);</script>
+            <script>runs.push('classic')</script></head><body></body></html>"#);
+        page.execute_scripts().await;
+        let js = page.js.as_mut().unwrap();
+        assert_eq!(js.evaluate("runs").unwrap(), serde_json::json!(["classic", 7]));
+        assert_eq!(js.evaluate(r#"(() => {
+            const s = document.getElementById('legacy'); s.noModule = false;
+            document.body.appendChild(s); return runs;
+        })()"#).unwrap(), serde_json::json!(["classic", 7]),
+            "parser-skipped legacy scripts must remain already started when moved");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_nomodule_never_fetches_external_classic_bundles() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut requests = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests += 1;
+                        stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+                        stream.set_write_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+                        let _ = stream.read(&mut [0u8; 2048]);
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop_rx.try_recv().is_ok() || std::time::Instant::now() >= deadline { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(e) => panic!("fixture accept failed: {e}"),
+                }
+            }
+            requests
+        });
+        let mut page = import_map_test_page("nomodule-no-fetch", &format!("http://{address}"), r#"
+            <html><head>
+                <script nomodule src="/legacy.js"></script>
+                <script nomodule async src="/legacy-async.js"></script>
+                <script nomodule defer src="/legacy-defer.js"></script>
+                <script nomodule="false" src="/legacy-boolean.js"></script>
+                <script>globalThis.classicKept = true;</script>
+            </head><body></body></html>"#);
+        page.execute_scripts().await;
+        let _ = stop_tx.send(());
+        assert_eq!(worker.join().unwrap(), 0, "nomodule must skip fetch, not just evaluation");
+        assert_eq!(page.js.as_mut().unwrap().evaluate("classicKept").unwrap(), serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]

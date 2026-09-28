@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Legacy and modern entry points must not initialize the same DOM twice</title>
+<!-- Offline reduction: no framework, network, fingerprints, timers or solver.
+     Both entry points retain one DOM child. Only the module must execute. -->
+<body>
+<span id="parent"><span id="child">Loading</span></span>
+<script>globalThis.commits = []; globalThis.commitErrors = [];</script>
+<script nomodule>
+  { const parent = document.getElementById('parent'), child = parent.firstChild;
+    commits.push(() => parent.removeChild(child)); }
+</script>
+<script type="module">
+  const parent = document.getElementById('parent'), child = parent.firstChild;
+  commits.push(() => parent.removeChild(child));
+  for (const commit of commits) {
+    try { commit(); } catch (error) { commitErrors.push(error.name); }
+  }
+  globalThis.commitResult = [commits.length, commitErrors, parent.childNodes.length,
+    child.parentNode, child.isConnected];
+</script>
+</body>

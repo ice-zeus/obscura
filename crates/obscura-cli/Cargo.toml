@@ -14,6 +14,8 @@ name = "obscura-worker"
 path = "src/worker.rs"
 
 [features]
+# Opt in to real ANGLE graphics; default feature sets remain unchanged.
+webgl = ["render", "obscura-browser/webgl", "obscura-cdp/webgl", "obscura-mcp/webgl"]
 default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]

@@ -3,6 +3,10 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/webgl.js");
+    println!("cargo:rerun-if-changed=js/imagebitmap.js");
+    println!("cargo:rerun-if-changed=js/imagedata.js");
+    println!("cargo:rerun-if-changed=js/offscreen.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -13,7 +17,18 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
 
-    let bootstrap_js = include_str!("js/bootstrap.js");
+    let bootstrap_js: &'static str = if cfg!(feature = "webgl") {
+        // Keep the implementation inside the bootstrap closure. No installer or
+        // privileged graphics state is published to page JavaScript.
+        Box::leak(include_str!("js/bootstrap.js")
+            .replace("/* @obscura-webgl */", &include_str!("js/webgl.js")
+                .replace("/* @obscura-imagedata */", include_str!("js/imagedata.js"))
+                .replace("/* @obscura-imagebitmap */", include_str!("js/imagebitmap.js"))
+                .replace("/* @obscura-offscreen */", include_str!("js/offscreen.js")))
+            .into_boxed_str())
+    } else {
+        include_str!("js/bootstrap.js")
+    };
 
     if is_cross {
         // Cross-compilation: the host V8 (linked into this build script) produces

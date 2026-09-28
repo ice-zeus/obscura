@@ -6,6 +6,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+#[cfg(all(test, feature = "webgl"))]
+#[path = "webgl_tests.rs"]
+mod webgl_tests;
+
 use deno_core::{JsRuntime, RuntimeOptions, v8};
 use obscura_dom::{DomTree, NodeId};
 #[cfg(feature = "render")]
@@ -29,12 +33,20 @@ use crate::ops::{
 };
 
 #[cfg(feature = "render")]
-struct RuntimeCanvasSurfaceSource<'a>(&'a HashMap<NodeId, crate::ops::CanvasBackingSurface>);
+struct RuntimeCanvasSurfaceSource<'a> {
+    canvas: &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+    #[cfg(feature = "webgl")]
+    webgl: &'a HashMap<NodeId, (u32, u32, Vec<u8>)>,
+}
 
 #[cfg(feature = "render")]
 impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
     fn surface(&self, node: NodeId) -> Option<obscura_render::CanvasSurface<'_>> {
-        let surface = self.0.get(&node)?;
+        #[cfg(feature = "webgl")]
+        if let Some((width, height, pixels)) = self.webgl.get(&node) {
+            return obscura_render::CanvasSurface::from_rgba8(*width, *height, pixels);
+        }
+        let surface = self.canvas.get(&node)?;
         obscura_render::CanvasSurface::from_rgba8(
             surface.width,
             surface.height,
@@ -413,6 +425,8 @@ struct EnteredRuntime<'a>(&'a mut JsRuntime);
 struct EnteredRuntimeFuture<F> {
     isolate: *mut deno_core::v8::Isolate,
     future: Option<Pin<Box<F>>>,
+    #[cfg(feature = "webgl")]
+    graphics_cleanup: Option<crate::webgl_ops::DeferredCleanup>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -439,11 +453,14 @@ impl<F: Future> Future for EnteredRuntimeFuture<F> {
         // borrowed JsRuntime, which cannot move or drop while this exists.
         let this = unsafe { self.get_unchecked_mut() };
         let _entry = unsafe { IsolateEntry::new(this.isolate) };
-        this.future
+        let result = this.future
             .as_mut()
             .expect("entered runtime future polled after drop")
             .as_mut()
-            .poll(cx)
+            .poll(cx);
+        #[cfg(feature = "webgl")]
+        if let Some(cleanup) = &this.graphics_cleanup { cleanup.drain(); }
+        result
     }
 }
 
@@ -453,6 +470,8 @@ impl<F> Drop for EnteredRuntimeFuture<F> {
         // isolate is current too.
         let _entry = unsafe { IsolateEntry::new(self.isolate) };
         drop(self.future.take());
+        #[cfg(feature = "webgl")]
+        if let Some(cleanup) = &self.graphics_cleanup { cleanup.drain(); }
     }
 }
 
@@ -463,6 +482,8 @@ fn entered_runtime_future<'a, F>(
 where
     F: Future,
 {
+    #[cfg(feature = "webgl")]
+    let graphics_cleanup = crate::webgl_ops::deferred_cleanup(runtime);
     let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
     let entry = unsafe { IsolateEntry::new(isolate) };
     let future = Box::pin(make_future(runtime));
@@ -470,6 +491,8 @@ where
     EnteredRuntimeFuture {
         isolate,
         future: Some(future),
+        #[cfg(feature = "webgl")]
+        graphics_cleanup,
         _not_send: PhantomData,
     }
 }
@@ -490,6 +513,8 @@ impl std::ops::DerefMut for EnteredRuntime<'_> {
 
 impl Drop for EnteredRuntime<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "webgl")]
+        if let Some(cleanup) = crate::webgl_ops::deferred_cleanup(self.0) { cleanup.drain(); }
         // SAFETY: this isolate was entered by the matching `runtime()` call
         // and, entries being a per-thread stack, is the current one: any
         // isolate entered since belongs to a nested operation that has already
@@ -607,6 +632,8 @@ impl ObscuraJsRuntime {
                 // Empty until a frame realm exists, which is what keeps the
                 // lookup free for pages that have no frames.
                 op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+                #[cfg(feature = "webgl")]
+                op_state.put(crate::webgl_ops::DeferredCleanup::default());
             }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
@@ -724,6 +751,9 @@ impl ObscuraJsRuntime {
             return None;
         }
         let ops = v8::Global::new(scope, ops);
+        if !crate::host_state::seal(scope) {
+            return None;
+        }
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
         Some(ops)
@@ -855,6 +885,9 @@ impl ObscuraJsRuntime {
             }
         }
         // The child realm must not expose the handoff to frame script either.
+        if !crate::host_state::seal(scope) {
+            return false;
+        }
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
         copied > 0
@@ -1150,6 +1183,48 @@ impl ObscuraJsRuntime {
         self.finish_heap_checked(result)
     }
 
+    /// Run a trusted host expression with the realm's private bootstrap state.
+    /// Page expressions must continue through `execute_runtime_script`: this
+    /// entry point supplies an additional lexical capability, never a global.
+    fn execute_host_expression(
+        &mut self,
+        name: &'static str,
+        expression: String,
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        use deno_core::v8;
+        let function = self.execute_runtime_script(name, format!(
+            "(function(__hostState) {{ 'use strict'; return (\n{}\n); }})",
+            expression.trim_end().trim_end_matches(';'),
+        ))?;
+        let result = (|| {
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            let isolate = entered.v8_isolate();
+            v8::scope!(let scope, isolate);
+            let context = v8::Local::new(scope, main);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            v8::tc_scope!(let scope, scope);
+            let private = crate::host_state::get(scope)
+                .ok_or_else(|| "Runtime host state is unavailable".to_string())?;
+            let function = v8::Local::new(scope, function);
+            let function = v8::Local::<v8::Function>::try_from(function)
+                .map_err(|_| "Host expression did not compile to a function".to_string())?;
+            let receiver = v8::undefined(scope).into();
+            let value = function.call(scope, receiver, &[private])
+                .ok_or_else(|| exception_text(scope))?;
+            Ok(v8::Global::new(scope, value))
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    /// Embedding-only expression used by input dispatch; not a CDP evaluator.
+    #[doc(hidden)]
+    pub fn evaluate_host_expression(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        self.begin_javascript_task();
+        let value = self.execute_host_expression("<host-input>", expression.to_string())?;
+        self.v8_to_json(value)
+    }
+
     /// Parse and merge an inline document import map. Rules which would alter
     /// already-observed module resolutions are discarded while unrelated new
     /// rules remain available, matching Chromium's multiple-map model.
@@ -1201,6 +1276,7 @@ impl ObscuraJsRuntime {
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
         {
+            gs.canvas_epoch = crate::ops::next_canvas_epoch();
             gs.prepared_render = None;
             gs.animation_sample = obscura_render::AnimationSample::default();
             gs.animation_timeline = obscura_render::AnimationTimelineState::default();
@@ -1226,6 +1302,12 @@ impl ObscuraJsRuntime {
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
+            #[cfg(feature = "webgl")]
+            {
+                crate::webgl_ops::canvas_placeholder::clear(&mut gs);
+                gs.webgl.entries.clear();
+                gs.webgl_surfaces.clear();
+            }
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -1509,11 +1591,11 @@ impl ObscuraJsRuntime {
                 state.resolved_scroll = None;
             }
         }
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_host_expression(
             "<set-viewport>",
             format!(
-                "globalThis.__obscura_viewport_w={width};\
-                 globalThis.__obscura_viewport_h={height};\
+                "(function(){{__hostState.viewportWidth={width};\
+                 __hostState.viewportHeight={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
@@ -1524,7 +1606,7 @@ impl ObscuraJsRuntime {
                  }}\
                  if(typeof globalThis.__obscura_recompute_resizes==='function'){{\
                    globalThis.__obscura_recompute_resizes();\
-                 }}",
+                 }}}})()",
             ),
         );
     }
@@ -1538,11 +1620,11 @@ impl ObscuraJsRuntime {
             Some((width, height))
                 if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 =>
             {
-                format!("globalThis.__obscura_set_screen_override({width},{height},{emulated});")
+                format!("__hostState.setScreenOverride({width},{height},{emulated});")
             }
-            _ => format!("globalThis.__obscura_set_screen_override(null,null,{emulated});"),
+            _ => format!("__hostState.setScreenOverride(null,null,{emulated});"),
         };
-        let _ = self.execute_runtime_script("<set-screen-size>", script);
+        let _ = self.execute_host_expression("<set-screen-size>", script);
     }
 
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.
@@ -1678,6 +1760,24 @@ impl ObscuraJsRuntime {
         surface_color: [u8; 4],
     ) -> Option<Vec<u8>> {
         let mut state = self.state.borrow_mut();
+        #[cfg(feature = "webgl")]
+        {
+            crate::webgl_ops::prepare_surfaces(&mut state);
+            let ObscuraState { dom, render_resources, canvas_surfaces, webgl_surfaces, element_scroll_offsets, .. } = &mut *state;
+            let dom = dom.as_ref()?;
+            let mut prepared = obscura_render::prepare_dom_at_animation_time(
+                dom, viewport, base_url, render_resources, animation_sample_time,
+            )?;
+            let resolved = prepared.resolve_scroll_state(dom, scroll, element_scroll_offsets);
+            let surfaces = RuntimeCanvasSurfaceSource { canvas: canvas_surfaces, webgl: webgl_surfaces };
+            let result = obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+                dom, &mut prepared, render_resources, &resolved, surface_color, &surfaces,
+            );
+            if result.is_some() { crate::webgl_ops::did_present(&mut state); }
+            return result;
+        }
+        #[cfg(not(feature = "webgl"))]
+        {
         let ObscuraState {
             dom,
             render_resources,
@@ -1692,6 +1792,7 @@ impl ObscuraJsRuntime {
             surface_color,
             render_resources,
         )
+        }
     }
 
     #[cfg(feature = "render")]
@@ -1707,6 +1808,8 @@ impl ObscuraJsRuntime {
             return None;
         }
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state)?;
             let ObscuraState {
                 dom,
@@ -1714,18 +1817,27 @@ impl ObscuraJsRuntime {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,
                 scroll,
                 surface_color,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_some() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -1778,6 +1890,8 @@ impl ObscuraJsRuntime {
     ) -> Result<obscura_render::Pixmap, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
             let ObscuraState {
                 dom,
@@ -1785,13 +1899,19 @@ impl ObscuraJsRuntime {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -1802,7 +1922,10 @@ impl ObscuraJsRuntime {
                 region,
                 surface_color,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_ok() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -1816,6 +1939,8 @@ impl ObscuraJsRuntime {
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
             let ObscuraState {
                 dom,
@@ -1823,13 +1948,19 @@ impl ObscuraJsRuntime {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -1840,7 +1971,10 @@ impl ObscuraJsRuntime {
                 region,
                 paint_backgrounds,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_ok() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -1857,6 +1991,8 @@ impl ObscuraJsRuntime {
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
             let ObscuraState {
                 dom,
@@ -1864,6 +2000,8 @@ impl ObscuraJsRuntime {
                 render_resources,
                 element_scroll_offsets,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let dom = dom
@@ -1878,8 +2016,12 @@ impl ObscuraJsRuntime {
                     element_scroll_offsets,
                     (region.width, region.height),
                 );
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom,
                 prepared_render
                     .as_mut()
@@ -1889,7 +2031,10 @@ impl ObscuraJsRuntime {
                 region,
                 paint_backgrounds,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_ok() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -2263,6 +2408,11 @@ impl ObscuraJsRuntime {
                         profile,
                         is_font,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
+                            #[cfg(feature = "webgl")]
+                            image_origin_clean: crate::image_security::response_origin_clean(
+                                &initiator, &parsed,
+                                profile.unwrap_or(crate::ops::ImageRequestProfile::NoCorsInclude), &response,
+                            ),
                             url: response.url.to_string(),
                             status: response.status,
                             headers: response.headers,
@@ -2381,9 +2531,22 @@ impl ObscuraJsRuntime {
                 _ => None,
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
+            // Save provenance before the ordinary cache seed consumes the
+            // response. The permission is stored on that exact cache entry.
+            #[cfg(feature = "webgl")]
+            let image_permission = bytes.as_ref().map(|bytes| (
+                load.url.clone(), std::sync::Arc::clone(bytes),
+                load.response.as_ref().is_some_and(|r| r.image_origin_clean),
+            ));
             match load.profile {
                 Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
                 None => self.seed_shared_render_resource(load.url, bytes),
+            }
+            #[cfg(feature = "webgl")]
+            if let Some((url, bytes, clean)) = image_permission.filter(|_| !is_font) {
+                self.state.borrow_mut().render_resources.set_image_origin_for_bytes(
+                    &url, load.profile.unwrap_or(crate::ops::ImageRequestProfile::NoCorsInclude), &bytes, clean,
+                );
             }
             if let Some(response) = load.response {
                 self.state
@@ -2505,11 +2668,11 @@ impl ObscuraJsRuntime {
                         var __result = await (0, eval)({src});\n\
                         globalThis.__obscura_objects[{oid}] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
+                        __hostState.awaitRejected = false;\n\
                     }} catch(e) {{\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __hostState.awaitRejected = true;\n\
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
@@ -2534,11 +2697,11 @@ impl ObscuraJsRuntime {
                     }} catch(e) {{\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __hostState.awaitRejected = true;\n\
                         return globalThis.__obscura_await_meta;\n\
                     }}\n\
                     globalThis.__obscura_objects[{oid}] = __result;\n\
-                    globalThis.__obscura_await_rejected = false;\n\
+                    __hostState.awaitRejected = false;\n\
                     return {meta_fn};\n\
                 }})()",
                 src = source_literal,
@@ -2549,7 +2712,7 @@ impl ObscuraJsRuntime {
         };
 
         let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
+            .execute_host_expression("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
@@ -2599,9 +2762,9 @@ impl ObscuraJsRuntime {
         // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
         // would throw the message away.
         let thrown = self
-            .execute_runtime_script(
+            .execute_host_expression(
                 "<readRejected>",
-                "globalThis.__obscura_await_rejected".to_string(),
+                "__hostState.awaitRejected".to_string(),
             )
             .map_err(|e| format!("JS error: {}", e))?;
         if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
@@ -2665,25 +2828,27 @@ impl ObscuraJsRuntime {
             let code = format!(
                 "(async function() {{\n\
                     {setup}\n\
-                    var __fn = ({fn_decl});\n\
+                    var __fn = (0, eval)({fn_source});\n\
                     var __this = ({this_expr});\n\
                     var __result;\n\
                     try {{\n\
                         __result = await __fn.call(__this, {args});\n\
                         globalThis.__obscura_objects[{oid}] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
+                        __hostState.awaitRejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __hostState.awaitRejected = true;\n\
                     }} finally {{\n\
                         globalThis.__obscura_done_{done_counter} = true;\n\
                     }}\n\
                 }})()",
                 setup = setup,
-                fn_decl = function_declaration,
+                // Compile caller code at global scope so it cannot capture
+                // the host wrapper's private state through a lexical closure.
+                fn_source = js_string_literal(&format!("({function_declaration}\n)")),
                 this_expr = this_expr,
                 args = args_list,
                 oid = js_string_literal(&oid),
@@ -2692,7 +2857,7 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.execute_runtime_script("<callFnAsync>", code)
+            self.execute_host_expression("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
@@ -2735,9 +2900,9 @@ impl ObscuraJsRuntime {
             // and `Promise.reject({code: 42})` as `{code: 42}`, which is
             // indistinguishable from resolving with it.
             let rejected = self
-                .execute_runtime_script(
+                .execute_host_expression(
                     "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
+                    "__hostState.awaitRejected".to_string(),
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
@@ -4741,6 +4906,8 @@ mod tests {
                     status: 200,
                     headers: Default::default(),
                     body: body.clone(),
+                    #[cfg(feature = "webgl")]
+                    image_origin_clean: false,
                 }),
             })
         };
@@ -14751,6 +14918,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "webgl"))]
     fn unavailable_webgl_context_does_not_claim_success() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt
@@ -14888,10 +15056,16 @@ mod tests {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = &mut *state;
             let (_, scroll) = resolved_scroll.as_ref().expect("scroll snapshot");
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
             obscura_render::paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref().expect("canvas DOM"),
                 prepared_render.as_mut().expect("prepared canvas layout"),
@@ -17408,7 +17582,7 @@ mod tests {
     
     #[tokio::test(flavor = "current_thread")]
     async fn a_rejection_does_not_leak_into_the_next_call() {
-        // `__obscura_await_rejected` is a global, so the success branch has to
+        // The private rejection flag is reused, so the success branch must
         // clear it. Without that the first rejection would mark every later
         // call on the same runtime as thrown.
         let mut rt = setup_runtime("<html><body></body></html>");
