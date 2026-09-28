@@ -747,6 +747,17 @@ const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+// Coerce the selector exactly as the general DOM bridge does. The results
+// remain private arrays/numbers until the existing realm wrappers consume them.
+const _querySelector = (root, selector, scoped) => __obscuraCore.ops.op_query_selector(
+  root, String(selector ?? ""), scoped, _realmFrameId);
+const _querySelectorAll = (root, selector, scoped) => {
+  // _domParse historically contained conversion/op failures for the all form.
+  try {
+    return __obscuraCore.ops.op_query_selector_all(root, String(selector ?? ""), scoped, _realmFrameId);
+  } catch { return []; }
+};
+
 const _formStateLoaded = new Set();
 function _loadFormState(nid) {
   if (_formStateLoaded.has(nid)) return;
@@ -3761,9 +3772,9 @@ class Element extends Node {
     return this._attributes;
   }
   getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _wrapEl(_querySelector(this._nid, s, true)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _querySelectorAll(this._nid, s, true);
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
@@ -5600,9 +5611,9 @@ class Document extends Node {
     const needle = String(id);
     return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) { return _wrapEl(_querySelector(0, s, false)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = _querySelectorAll(0, s, false);
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
@@ -6126,9 +6137,9 @@ class DocumentFragment extends Node {
       _dom("set_inner_html", this._nid, html);
     }
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _wrapEl(_querySelector(this._nid, s, true)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _querySelectorAll(this._nid, s, true);
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {

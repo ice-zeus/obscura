@@ -1302,6 +1302,25 @@ mod tests {
         );
     }
 
+    /// Typed query results must use the wrapper's document even when a parent
+    /// invokes a same-origin frame's document or element method.
+    #[test]
+    fn typed_selectors_on_cross_realm_wrappers_keep_the_owning_document() {
+        let mut parent = page("https://parent.example/", "<main><p class='hit'>parent</p></main>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<main><p class='hit'>first</p><p class='hit'>second</p></main>").unwrap();
+        assert_eq!(frame.evaluate(&mut parent,
+            "Array.from(document.querySelectorAll('.hit'), node => node.textContent)").unwrap(),
+            serde_json::json!(["first", "second"]));
+        assert_eq!(parent.evaluate(r#"(() => {
+            const doc = globalThis.__obscura_frameObjects[1].document;
+            const root = doc.querySelector('main');
+            const nodes = root.querySelectorAll('.hit');
+            return [nodes.length, nodes[0] === doc.querySelector('.hit'),
+                nodes[1].textContent, document.querySelector('.hit').textContent];
+        })()"#).unwrap(), serde_json::json!([2, true, "second", "parent"]));
+    }
+
     /// A cross-origin frame must stay opaque. Nothing about it is published to
     /// the page, and V8's own access check answers `undefined` for anything the
     /// page reaches for, because the two realms keep different security tokens.

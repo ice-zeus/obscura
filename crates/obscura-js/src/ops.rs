@@ -1439,6 +1439,57 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
     serde_json::json!({ "originClean": true, "css": css }).to_string()
 }
 
+// Keep queries on the owning realm's DOM. These read-only ops bypass command
+// parsing and JSON text without caching any results or changing selector rules.
+#[op2(fast)]
+fn op_query_selector(
+    state: &OpState,
+    root: u32,
+    #[string] selector: &str,
+    scoped: bool,
+    frame_id: u32,
+) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let state = shared.borrow();
+        let Some(dom) = state.dom.as_ref() else { return -1.0 };
+        let result = if scoped {
+            dom.query_selector_from(NodeId::new(root), selector)
+        } else {
+            dom.query_selector(selector)
+        };
+        result.ok().flatten().map(|id| id.index() as f64).unwrap_or(-1.0)
+    })).unwrap_or_else(|_| {
+        tracing::error!("selector op panicked; returning no match");
+        -1.0
+    })
+}
+
+#[op2]
+#[serde]
+fn op_query_selector_all(
+    state: &OpState,
+    root: u32,
+    #[string] selector: &str,
+    scoped: bool,
+    frame_id: u32,
+) -> Vec<i32> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let state = shared.borrow();
+        let Some(dom) = state.dom.as_ref() else { return Vec::new() };
+        let result = if scoped {
+            dom.query_selector_all_from(NodeId::new(root), selector)
+        } else {
+            dom.query_selector_all(selector)
+        };
+        result.unwrap_or_default().into_iter().map(|id| id.index() as i32).collect()
+    })).unwrap_or_else(|_| {
+        tracing::error!("selector op panicked; returning no matches");
+        Vec::new()
+    })
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -6084,6 +6135,8 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_query_selector(),
+        op_query_selector_all(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),

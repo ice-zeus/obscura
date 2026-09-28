@@ -14613,6 +14613,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_selector_results_preserve_scope_order_coercion_and_identity() {
+        let mut rt = setup_runtime(
+            r#"<main id="a"><i class="x" id="one"></i><i class="x" id="two"></i></main><i class="x" id="three"></i>"#,
+        );
+        assert_eq!(rt.evaluate(r#"(() => {
+            let coerced = 0;
+            const selector = { toString() { coerced++; return '.x'; } };
+            const root = document.getElementById('a');
+            const nodes = root.querySelectorAll(selector);
+            const first = root.querySelector('.x');
+            const fragment = document.createDocumentFragment();
+            const detached = document.createElement('i'); detached.className = 'x';
+            fragment.appendChild(detached);
+            const snapshot = document.querySelectorAll('.x');
+            root.appendChild(document.createElement('i')).className = 'x';
+            const throws = { toString() { throw new Error('conversion'); } };
+            let singleThrows = false;
+            try { document.querySelector(throws); } catch { singleThrows = true; }
+            return [coerced, Array.from(nodes, n => n.id), first === nodes[0],
+                nodes instanceof NodeList, snapshot.length, document.querySelectorAll('.x').length,
+                fragment.querySelector('.x') === detached, fragment.querySelectorAll('.x').length,
+                document.querySelector('['), document.querySelectorAll('[').length,
+                document.querySelector(null), root.querySelector(undefined),
+                singleThrows, document.querySelectorAll(throws).length, root.querySelectorAll(throws).length];
+        })()"#).unwrap(), serde_json::json!([
+            1, ["one", "two"], true, true, 3, 4, true, 1, null, 0, null, null, true, 0, 0
+        ]));
+    }
+
+    #[test]
+    fn typed_selector_bridge_matches_legacy_results_and_keeps_shadow_scope() {
+        let mut rt = setup_runtime(r#"<div id="host"></div><b class="outside"></b>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const host = document.getElementById('host');
+            const shadow = host.attachShadow({ mode: 'open' });
+            shadow.innerHTML = '<b class="inside"></b>';
+            const typed = __obscura_test_ops.op_query_selector_all(0, '*', false, 0);
+            const legacy = JSON.parse(__obscura_test_ops.op_dom('query_selector_all', '*', '', 0));
+            return [JSON.stringify(typed) === JSON.stringify(legacy),
+                shadow.querySelector('.inside') !== null, shadow.querySelector('.outside') === null,
+                document.querySelector('.inside') === null,
+                shadow.querySelectorAll('b').length];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, 1]));
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
