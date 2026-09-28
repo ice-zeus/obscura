@@ -22,6 +22,11 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    // Created by later evaluation, input and emulation paths. Register them
+    // before the snapshot hide list is captured, just like the other internals.
+    '__obscura_await_rejected', '__obscura_click_target',
+    '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
+    '__obscura_viewport_w', '__obscura_viewport_h',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',

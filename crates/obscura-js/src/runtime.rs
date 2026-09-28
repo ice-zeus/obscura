@@ -4400,6 +4400,32 @@ mod tests {
     }
 
     #[test]
+    fn late_runtime_internal_names_use_the_existing_reflection_registry() {
+        let mut rt = setup_runtime("<button id='target'>Click</button>");
+        rt.set_viewport(900.0, 700.0);
+        rt.set_screen_size_override(Some((1280.0, 800.0)), true);
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.getElementById('target').click();
+            globalThis.__obscura_await_rejected = false;
+            globalThis.__obscura_page_owned = 42;
+            const names = ['__obscura_await_rejected', '__obscura_click_target',
+                '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
+                '__obscura_viewport_w', '__obscura_viewport_h'];
+            const surfaces = [Object.keys(window), Object.getOwnPropertyNames(window),
+                Reflect.ownKeys(window), Object.keys(Object.getOwnPropertyDescriptors(window))];
+            const ordinary = { __obscura_screen_w: 1 };
+            return [surfaces.every(keys => names.every(name => !keys.includes(name))),
+                surfaces.every(keys => keys.includes('__obscura_page_owned')),
+                Object.keys(ordinary).includes('__obscura_screen_w'),
+                innerWidth, innerHeight, screen.width, screen.height];
+        })()"#).unwrap(), serde_json::json!([true, true, true, 900, 700, 1280, 800]));
+        rt.set_screen_size_override(None, false);
+        rt.set_screen_size_override(Some((1400.0, 900.0)), true);
+        assert_eq!(rt.evaluate("[Reflect.ownKeys(window).includes('__obscura_screen_w'), screen.width]").unwrap(),
+            serde_json::json!([false, 1400]));
+    }
+
+    #[test]
     fn page_script_cannot_reach_deno_core_or_bootstrap_handoff() {
         let mut rt = setup_runtime("<html><body><p id='value'>safe</p></body></html>");
         rt.evaluate("delete globalThis.__obscura_test_ops").unwrap();
