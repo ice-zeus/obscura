@@ -14613,6 +14613,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn computed_style_fallback_defaults_do_not_leak_between_declarations() {
+        let mut rt = setup_runtime("<div id='a'></div><div id='b'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            // Force the existing no-render fallback without altering the
+            // declarations or their inline-style behavior.
+            const native = __obscura_test_ops.op_computed_style;
+            __obscura_test_ops.op_computed_style = undefined;
+            try {
+                const a = document.getElementById('a'), b = document.getElementById('b');
+                const first = getComputedStyle(a), second = getComputedStyle(b);
+                a.style.color = 'red';
+                const before = first.color;
+                a.style.removeProperty('color');
+                return [first !== getComputedStyle(a), first !== second, before,
+                    first.color, second.color, first.getPropertyValue('visibility'),
+                    second.getPropertyValue('not-a-property')];
+            } finally { __obscura_test_ops.op_computed_style = native; }
+        })()"#).unwrap(), serde_json::json!([
+            true, true, "red", "rgb(0, 0, 0)", "rgb(0, 0, 0)", "visible", ""
+        ]));
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]

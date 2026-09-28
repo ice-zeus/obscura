@@ -8667,6 +8667,33 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
 // Share the immutable native snapshot behind them. Frameworks routinely call
 // getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
 // several hundred properties for every wrapper dominated real-page startup.
+// Immutable fallback values are shared by declarations in this realm.
+const _computedStyleDefaults = Object.freeze({
+    display: 'block', visibility: 'visible', opacity: '1',
+    position: 'static', overflow: 'visible',
+    transform: 'none', 'transform-origin': '0px 0px',
+    transition: 'none', animation: 'none',
+    float: 'none', clear: 'none',
+    margin: '0px', padding: '0px',
+    'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
+    'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
+    'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
+    'letter-spacing': 'normal',
+    'font-family': 'Times',
+    color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
+    'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
+    'border-top-width': '0px', 'border-right-width': '0px',
+    'border-bottom-width': '0px', 'border-left-width': '0px',
+    'border-radius': '0px',
+    'z-index': 'auto', 'pointer-events': 'auto',
+    'box-sizing': 'content-box', cursor: 'auto',
+    'white-space': 'normal', 'text-align': 'start',
+    'flex-flow': 'row nowrap', 'flex-direction': 'row', 'flex-wrap': 'nowrap', 'align-items': 'normal',
+    'justify-content': 'normal', gap: 'normal',
+    'grid-template-columns': 'none', 'grid-template-rows': 'none',
+    'will-change': 'auto', 'backface-visibility': 'visible',
+  });
+
 const _computedStyleSnapshotCache = new WeakMap();
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
@@ -8722,31 +8749,6 @@ globalThis.getComputedStyle = (el) => {
     return null;
   };
 
-  const defaultsKebab = {
-    display: 'block', visibility: 'visible', opacity: '1',
-    position: 'static', overflow: 'visible',
-    transform: 'none', 'transform-origin': '0px 0px',
-    transition: 'none', animation: 'none',
-    float: 'none', clear: 'none',
-    margin: '0px', padding: '0px',
-    'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
-    'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
-    'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
-    'letter-spacing': 'normal',
-    'font-family': 'Times',
-    color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
-    'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
-    'border-top-width': '0px', 'border-right-width': '0px',
-    'border-bottom-width': '0px', 'border-left-width': '0px',
-    'border-radius': '0px',
-    'z-index': 'auto', 'pointer-events': 'auto',
-    'box-sizing': 'content-box', cursor: 'auto',
-    'white-space': 'normal', 'text-align': 'start',
-    'flex-flow': 'row nowrap', 'flex-direction': 'row', 'flex-wrap': 'nowrap', 'align-items': 'normal',
-    'justify-content': 'normal', gap: 'normal',
-    'grid-template-columns': 'none', 'grid-template-rows': 'none',
-    'will-change': 'auto', 'backface-visibility': 'visible',
-  };
 
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
@@ -8771,8 +8773,8 @@ globalThis.getComputedStyle = (el) => {
     }
     const dim = dimensionFor(kebab);
     if (dim != null) return dim;
-    if (defaultsKebab[rawProp]) return defaultsKebab[rawProp];
-    if (defaultsKebab[kebab]) return defaultsKebab[kebab];
+    if (_computedStyleDefaults[rawProp]) return _computedStyleDefaults[rawProp];
+    if (_computedStyleDefaults[kebab]) return _computedStyleDefaults[kebab];
     return '';
   };
 
