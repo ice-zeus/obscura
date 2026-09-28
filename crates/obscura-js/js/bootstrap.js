@@ -8688,8 +8688,7 @@ globalThis.getComputedStyle = (el) => {
     snapshot.rendered = null;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0));
-        snapshot.rendered = raw ? JSON.parse(raw) : null;
+        snapshot.rendered = __obscuraCore.ops.op_computed_style(String(el._nid | 0)) || null;
       } catch (e) {}
     }
     snapshot.names = snapshot.rendered ? Object.keys(snapshot.rendered) : [];

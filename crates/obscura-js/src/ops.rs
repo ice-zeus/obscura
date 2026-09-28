@@ -7229,28 +7229,30 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 /// call and one use of the retained prepared layout.
 #[cfg(feature = "render")]
 #[op2]
-#[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
+#[serde]
+fn op_computed_style(state: &OpState, #[string] nid_str: String) -> Option<serde_json::Value> {
     let shared = state.borrow::<SharedState>().clone();
-    let nid: u32 = nid_str.parse().unwrap_or(0);
-    let nid = obscura_dom::tree::NodeId::new(nid);
-    let mut gs = shared.borrow_mut();
-    sample_live_document_animations(&mut gs);
-    let Some(prepared) = ensure_prepared_render(&mut gs) else {
-        return String::new();
-    };
-    let Some(snapshot) = prepared.computed_style(nid) else {
-        return String::new();
-    };
-    let custom = prepared.computed_custom_properties(nid).unwrap_or_default();
-    let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len());
-    for (name, value) in snapshot {
-        object.insert(name.to_string(), serde_json::Value::String(value));
-    }
-    for (name, value) in custom {
-        object.insert(name, serde_json::Value::String(value));
-    }
-    serde_json::Value::Object(object).to_string()
+    let nid = obscura_dom::tree::NodeId::new(nid_str.parse::<u32>().unwrap_or(0));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        let prepared = ensure_prepared_render(&mut gs)?;
+        let snapshot = prepared.computed_style(nid)?;
+        let custom = prepared.computed_custom_properties(nid).unwrap_or_default();
+        // Preserve the same map and ordering as the former JSON object. Only
+        // the final JSON text encoding/parsing is removed from this bridge.
+        let mut object = serde_json::Map::with_capacity(snapshot.len() + custom.len());
+        for (name, value) in snapshot {
+            object.insert(name.to_string(), serde_json::Value::String(value));
+        }
+        for (name, value) in custom {
+            object.insert(name, serde_json::Value::String(value));
+        }
+        Some(serde_json::Value::Object(object))
+    })).unwrap_or_else(|_| {
+        tracing::error!("computed style op panicked; returning no snapshot");
+        None
+    })
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

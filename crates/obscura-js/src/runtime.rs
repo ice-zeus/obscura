@@ -12710,6 +12710,27 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[test]
+    fn native_computed_style_snapshot_preserves_values_names_and_live_refresh() {
+        let mut rt = setup_runtime(r#"<style>#box { width:120px; height:30px; color:rgb(1, 2, 3); --z: last; --a: first; }</style><div id="box"></div>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const box = document.getElementById('box');
+            const first = getComputedStyle(box), second = getComputedStyle(box);
+            const native = __obscura_test_ops.op_computed_style(String(box._nid));
+            const names = Array.from({ length: first.length }, (_, i) => first.item(i));
+            const width = first.width;
+            box.style.width = '160px';
+            return [typeof native, Object.values(native).every(value => typeof value === 'string'),
+                JSON.stringify(names) === JSON.stringify(Object.keys(native)),
+                first !== second, width, first.width, second.getPropertyValue('width'),
+                first.getPropertyValue('--a').trim(), first.getPropertyValue('--z').trim(),
+                first.color, __obscura_test_ops.op_computed_style('4294967295')];
+        })()"#).unwrap(), serde_json::json!([
+            "object", true, true, true, "120px", "160px", "160px", "first", "last", "rgb(1, 2, 3)", null
+        ]));
+    }
+
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_batches_unique_clip_graph_into_one_native_layout_read() {
         let dom = parse_html(
