@@ -1,0 +1,70 @@
+<!doctype html>
+<html style="margin:0">
+<meta charset="utf-8">
+<title>IntersectionObserver: real feed transitions</title>
+<body style="margin:0">
+<!-- Each batch moves the sentinel outside the scroll root. Scroll only after
+     the observer confirms that exit. A stationary second target must not fire
+     repeatedly. This exercises intersections instead of expecting a stationary
+     sentinel to deliver five notifications merely because cards were added. -->
+<div id="root" style="width:200px;height:100px;overflow:auto">
+  <div id="feed"></div>
+  <div id="sentinel" style="height:10px;width:200px"></div>
+</div>
+<div id="stationary-root" style="width:200px;height:50px;overflow:auto">
+  <div id="stationary" style="width:20px;height:10px"></div>
+</div>
+<script>
+(() => {
+  const root = document.getElementById('root');
+  const feed = document.getElementById('feed');
+  const sentinel = document.getElementById('sentinel');
+  const transitions = [];
+  let loaded = 0;
+  let stationaryDeliveries = 0;
+  let finished = false;
+  let resolveResult;
+  window.observerTransitionResult = new Promise(resolve => { resolveResult = resolve; });
+  const stationaryObserver = new IntersectionObserver(entries => {
+    stationaryDeliveries += entries.length;
+  }, { root: document.getElementById('stationary-root') });
+  const observer = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      transitions.push(entry.isIntersecting);
+      if (!entry.isIntersecting) {
+        // Deliver the outside state before moving the same target inside again.
+        requestAnimationFrame(() => { root.scrollTop = root.scrollHeight; });
+        continue;
+      }
+      for (let i = 0; i < 10; i++) {
+        const card = document.createElement('div');
+        card.style.height = '20px';
+        card.textContent = 'Item ' + loaded++;
+        feed.appendChild(card);
+      }
+      if (loaded === 50) {
+        observer.disconnect();
+        requestAnimationFrame(() => requestAnimationFrame(() => finish(null)));
+      }
+    }
+  }, { root });
+  function finish(error) {
+    if (finished) return;
+    finished = true;
+    clearTimeout(deadline);
+    observer.disconnect();
+    stationaryObserver.disconnect();
+    const expected = [true, false, true, false, true, false, true, false, true];
+    const passed = !error && loaded === 50 && feed.children.length === 50 &&
+      stationaryDeliveries === 1 && JSON.stringify(transitions) === JSON.stringify(expected);
+    window.__obstacle = passed ? 'io:50' : 'io:failed';
+    resolveResult({ passed, loaded, cards: feed.children.length, transitions,
+      stationaryDeliveries, error });
+  }
+  const deadline = setTimeout(() => finish('missing intersection transition'), 1500);
+  stationaryObserver.observe(document.getElementById('stationary'));
+  observer.observe(sentinel);
+})();
+</script>
+</body>
+</html>

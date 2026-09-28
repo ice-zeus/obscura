@@ -13175,6 +13175,30 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_feed_fixture_requires_real_transitions() {
+        let fixture = include_str!("../../../render-repros/observer-intersection-transitions.html");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(fixture));
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        let script = fixture.split_once("<script>").unwrap().1
+            .split_once("</script>").unwrap().0;
+        rt.execute_script("observer-transition-fixture", script).unwrap();
+        let result = rt.evaluate_for_cdp("observerTransitionResult", true, true)
+            .await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "passed": true,
+            "loaded": 50,
+            "cards": 50,
+            "transitions": [true, false, true, false, true, false, true, false, true],
+            "stationaryDeliveries": 1,
+            "error": null,
+        }));
+        assert_eq!(rt.evaluate("window.__obstacle").unwrap(), serde_json::json!("io:50"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_can_be_reused_after_disconnect() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
