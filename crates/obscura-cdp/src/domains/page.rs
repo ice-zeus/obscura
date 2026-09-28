@@ -937,26 +937,9 @@ pub fn emit_navigation_events(
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
 
-    if ctx.fetch_intercept.enabled {
-        for (i, net_event) in network_events.iter().enumerate() {
-            let rid = &nav_request_ids[i];
-            ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
-                session_id: es.clone(),
-            });
-        }
-    }
+    // These events describe completed requests. A Fetch pause is emitted only
+    // while a real intercepted request has a pending resolver in server.rs;
+    // replaying pauses here ignores patterns and invents unresolvable requests.
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
@@ -3206,6 +3189,34 @@ mod tests {
             !err2.contains("Unknown Page method"),
             "captureSnapshot must NOT fall through: {err2}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_navigation_does_not_fabricate_fetch_pauses() {
+        for patterns in [vec!["*".to_owned()], vec!["*/value/*".to_owned()]] {
+            let mut ctx = CdpContext::new();
+            let page_id = ctx.create_page();
+            let session = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+            ctx.fetch_intercept.enabled = true;
+            ctx.fetch_intercept.patterns = patterns;
+            let url = "https://example.test/";
+            let events = [(url, "Document"), ("https://example.test/image.png", "Image"),
+                ("https://example.test/value/1", "Fetch")].into_iter().enumerate().map(|(index, (url, kind))| {
+                    obscura_browser::NetworkEvent {
+                        request_id: format!("finished-{index}"), url: url.to_owned(),
+                        method: "GET".to_owned(), resource_type: kind.to_owned(), status: 200,
+                        headers: Default::default(), response_headers: Default::default(),
+                        body_size: 10, timestamp: 1.0,
+                    }
+                }).collect::<Vec<_>>();
+            emit_navigation_events(&mut ctx, &session, &page_id, "loader", url, &page_id,
+                &events, WaitUntil::Load, false);
+            assert!(!ctx.pending_events.iter().any(|event| event.method == "Fetch.requestPaused"));
+            assert_eq!(ctx.pending_events.iter().filter(|event| event.method == "Network.requestWillBeSent").count(), 3);
+            assert_eq!(ctx.pending_events.iter().filter(|event| event.method == "Network.responseReceived").count(), 3);
+            assert_eq!(ctx.pending_events.iter().filter(|event| event.method == "Network.loadingFinished").count(), 3);
+        }
     }
 
     #[tokio::test]

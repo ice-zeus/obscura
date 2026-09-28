@@ -2057,6 +2057,29 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_interception_still_emits_one_pause_with_a_live_resolver() {
+        let (resolver, reply) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = std::collections::HashMap::new();
+        super::emit_intercepted_request(obscura_js::ops::InterceptedRequest {
+            request_id: "live-request".to_owned(), url: "https://example.test/value/1".to_owned(),
+            method: "GET".to_owned(), headers: Default::default(), resource_type: "Fetch".to_owned(),
+            resolver,
+        }, "frame", Some("session".to_owned()), &tx, &mut paused);
+        let sent: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(sent["method"], "Network.requestWillBeSent");
+        assert_eq!(event["method"], "Fetch.requestPaused");
+        assert_eq!(event["params"]["requestId"], "live-request");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(paused.len(), 1);
+        assert!(paused.remove("live-request").unwrap().send(obscura_js::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: None,
+        }).is_ok());
+        assert!(matches!(reply.await.unwrap(), obscura_js::ops::InterceptResolution::Continue { .. }));
+    }
+
     use super::{
         bearer_authorized, control_refusal, handle_fetch_resolution, is_navigate_method,
         merge_cookie_delta, parse_cdp_headers, websocket_authority, ControlRefusal,
