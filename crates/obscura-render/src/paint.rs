@@ -80,6 +80,7 @@ enum CachedResource {
     Bytes {
         bytes: Arc<[u8]>,
         intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
+        static_raster: std::sync::OnceLock<bool>,
     },
     Missing(std::time::Instant),
 }
@@ -87,7 +88,7 @@ enum CachedResource {
 impl CachedResource {
     fn image_intrinsic(&self) -> Option<crate::ReplacedIntrinsic> {
         match self {
-            Self::Bytes { bytes, intrinsic } => {
+            Self::Bytes { bytes, intrinsic, .. } => {
                 // Metadata belongs to these immutable bytes. Replacement and
                 // FIFO eviction discard it with the existing bounded entry.
                 *intrinsic.get_or_init(|| image_intrinsic_metadata(bytes))
@@ -603,6 +604,7 @@ impl RenderResourceCache {
         self.entries.insert(url, CachedResource::Bytes {
             bytes,
             intrinsic: std::sync::OnceLock::new(),
+            static_raster: std::sync::OnceLock::new(),
         });
     }
 
@@ -662,9 +664,20 @@ impl RenderResourceCache {
         let size = raster.data().len();
         // Cache only bytes still owned by this page's normal resource cache.
         // This excludes disabled/over-budget caches and ephemeral data URLs.
-        let retained = matches!(self.entries.get(resource_key),
-            Some(CachedResource::Bytes { bytes: current, .. }) if Arc::ptr_eq(current, &bytes));
-        if !retained || size > RASTER_PAINT_CACHE_ENTRY_BYTES || !static_raster_cacheable(&bytes) {
+        if size > RASTER_PAINT_CACHE_ENTRY_BYTES {
+            return Some(raster);
+        }
+        // Inspect animation eligibility only when painting, once per immutable
+        // resource. Different raster sizes and cache eviction reuse the result;
+        // resource replacement drops it along with the original bytes.
+        let cacheable = match self.entries.get(resource_key) {
+            Some(CachedResource::Bytes { bytes: current, static_raster, .. })
+                if Arc::ptr_eq(current, &bytes) => {
+                    *static_raster.get_or_init(|| static_raster_cacheable(&bytes))
+                }
+            _ => false,
+        };
+        if !cacheable {
             return Some(raster);
         }
         while self.raster_paints.len() >= RASTER_PAINT_CACHE_ENTRIES
@@ -10174,9 +10187,20 @@ fn paint_image(
     if !rect_intersects_paint_surface(visible_rect, pixmap, 1.0) {
         return false;
     }
-    let bytes = match profile {
-        Some(profile) => fetch_profiled_image_bytes(src, base_url, cache, profile),
-        None => fetch_bytes(src, base_url, cache),
+    // Resolve once for both the byte lookup and the raster-cache identity.
+    // Data URLs retain their existing uncached decoding path.
+    let resolved = if src.starts_with("data:") {
+        None
+    } else {
+        resolve_resource_url(src, base_url)
+    };
+    let bytes = if src.starts_with("data:") {
+        fetch_bytes(src, base_url, cache)
+    } else {
+        resolved.as_deref().and_then(|url| match profile {
+            Some(profile) => cache.get_or_load_image(url, profile),
+            None => cache.get_or_load(url, false),
+        })
     };
     let Some(bytes) = bytes else {
         return false;
@@ -10211,7 +10235,7 @@ fn paint_image(
     let content = if svg {
         render_svg(&bytes, rw, rh).map(Arc::new)
     } else if !src.starts_with("data:") {
-        let key = resolve_resource_url(src, base_url).map(|url| match profile {
+        let key = resolved.map(|url| match profile {
             Some(profile) => image_resource_key(&url, profile),
             None => network_resource_url(&url),
         });
@@ -13683,6 +13707,59 @@ mod tests {
         let mut encoded = std::io::Cursor::new(Vec::new());
         source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
         Arc::from(encoded.into_inner())
+    }
+
+    #[test]
+    fn cached_raster_relative_urls_preserve_request_profiles_and_pixels() {
+        let url = "https://example.test/images/image.png";
+        let base = "https://example.test/pages/index.html";
+        let rect = crate::Rect { x: 0.0, y: 0.0, width: 12.0, height: 18.0 };
+        for profile in [None, Some(ImageRequestProfile::NoCorsInclude),
+            Some(ImageRequestProfile::CorsSameOrigin), Some(ImageRequestProfile::CorsInclude)] {
+            let mut cache = RenderResourceCache::default();
+            let bytes = raster_cache_fixture();
+            match profile {
+                Some(profile) => cache.seed_image_shared(url.to_owned(), profile, bytes),
+                None => cache.seed_shared(url.to_owned(), bytes),
+            }
+            let draw = |src, cache: &mut RenderResourceCache| {
+                let mut surface = Pixmap::new(12, 18).unwrap();
+                assert!(paint_image(src, Some(base), &rect, &rect, crate::ObjectFit::Fill,
+                    crate::ObjectPosition::default(), &mut surface, cache, profile, None,
+                    crate::ResolvedBorderRadii::default(), None));
+                surface
+            };
+            let relative = draw("../images/image.png", &mut cache);
+            let absolute = draw(url, &mut cache);
+            assert_eq!(relative.data(), absolute.data());
+            assert_eq!(cache.raster_paints.len(), 1);
+            assert_eq!(relative.pixel(0, 0).unwrap().alpha(), 127);
+        }
+    }
+
+    #[test]
+    fn raster_eligibility_is_lazy_and_invalidated_with_resource_bytes() {
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/lazy.png";
+        let bytes = raster_cache_fixture();
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        let eligibility = |cache: &RenderResourceCache| match cache.entries.get(url).unwrap() {
+            CachedResource::Bytes { static_raster, .. } => static_raster.get().copied(),
+            CachedResource::Missing(_) => None,
+        };
+        assert_eq!(eligibility(&cache), None);
+        // Layout/metadata preparation must not initialize paint eligibility.
+        cache.entries.get(url).unwrap().image_intrinsic();
+        assert_eq!(eligibility(&cache), None);
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        assert_eq!(eligibility(&cache), Some(true));
+        cache.raster_paint(url, Arc::clone(&bytes), 6, 9).unwrap();
+        assert_eq!(eligibility(&cache), Some(true));
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        assert_eq!(eligibility(&cache), None);
+        assert!(cache.raster_paints.is_empty());
+        cache.seed_missing(url.to_owned());
+        assert_eq!(eligibility(&cache), None);
     }
 
     #[test]
