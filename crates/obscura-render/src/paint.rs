@@ -146,6 +146,16 @@ struct RememberedContentImageIntrinsic {
     intrinsic: crate::ReplacedIntrinsic,
 }
 
+const RASTER_PAINT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const RASTER_PAINT_CACHE_ENTRIES: usize = 64;
+const RASTER_PAINT_CACHE_ENTRY_BYTES: usize = 2 * 1024 * 1024;
+
+struct CachedRasterPaint {
+    resource_key: String,
+    bytes: Arc<[u8]>,
+    raster: Arc<Pixmap>,
+}
+
 /// Page-scoped raw resource bytes shared by layout preparation and repeated
 /// paints. Entries are FIFO-bounded by both count and retained byte size.
 /// Successful bytes use `Arc` so consumers never clone an image/font body.
@@ -153,6 +163,8 @@ pub struct RenderResourceCache {
     entries: HashMap<String, CachedResource>,
     order: VecDeque<String>,
     retained_bytes: usize,
+    raster_paints: VecDeque<CachedRasterPaint>,
+    raster_paint_bytes: usize,
     max_entries: usize,
     max_bytes: usize,
     content_image_intrinsics: HashMap<obscura_dom::tree::NodeId, RememberedContentImageIntrinsic>,
@@ -198,6 +210,8 @@ impl RenderResourceCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             retained_bytes: 0,
+            raster_paints: VecDeque::new(),
+            raster_paint_bytes: 0,
             max_entries,
             max_bytes,
             content_image_intrinsics: HashMap::new(),
@@ -618,6 +632,52 @@ impl RenderResourceCache {
         if let Some(CachedResource::Bytes { bytes, .. }) = self.entries.remove(url) {
             self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len());
         }
+        self.raster_paints.retain(|entry| {
+            if entry.resource_key == url {
+                self.raster_paint_bytes -= entry.raster.data().len();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn raster_paint(
+        &mut self,
+        resource_key: &str,
+        bytes: Arc<[u8]>,
+        width: u32,
+        height: u32,
+    ) -> Option<Arc<Pixmap>> {
+        if let Some(index) = self.raster_paints.iter().position(|entry| {
+            entry.resource_key == resource_key && Arc::ptr_eq(&entry.bytes, &bytes)
+                && entry.raster.width() == width && entry.raster.height() == height
+        }) {
+            let entry = self.raster_paints.remove(index)?;
+            let raster = Arc::clone(&entry.raster);
+            self.raster_paints.push_back(entry);
+            return Some(raster);
+        }
+        let raster = Arc::new(raster_to_pixmap(&bytes, width, height)?);
+        let size = raster.data().len();
+        // Cache only bytes still owned by this page's normal resource cache.
+        // This excludes disabled/over-budget caches and ephemeral data URLs.
+        let retained = matches!(self.entries.get(resource_key),
+            Some(CachedResource::Bytes { bytes: current, .. }) if Arc::ptr_eq(current, &bytes));
+        if !retained || size > RASTER_PAINT_CACHE_ENTRY_BYTES || !static_raster_cacheable(&bytes) {
+            return Some(raster);
+        }
+        while self.raster_paints.len() >= RASTER_PAINT_CACHE_ENTRIES
+            || self.raster_paint_bytes.saturating_add(size) > RASTER_PAINT_CACHE_BYTES
+        {
+            let oldest = self.raster_paints.pop_front()?;
+            self.raster_paint_bytes -= oldest.raster.data().len();
+        }
+        self.raster_paint_bytes += size;
+        self.raster_paints.push_back(CachedRasterPaint {
+            resource_key: resource_key.to_owned(), bytes, raster: Arc::clone(&raster),
+        });
+        Some(raster)
     }
 
     /// Seed a prior stable `content:url(...)` selection into the ordinary
@@ -7885,6 +7945,17 @@ fn bounded_raster_size(w: u32, h: u32) -> (u32, u32) {
     (rw, rh)
 }
 
+// Formats that cannot animate, plus PNG only after its decoder explicitly
+// excludes APNG. Unknown formats, GIF and WebP retain the existing path.
+fn static_raster_cacheable(bytes: &[u8]) -> bool {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg | image::ImageFormat::Bmp | image::ImageFormat::Ico) => true,
+        Ok(image::ImageFormat::Png) => image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+            .ok().and_then(|decoder| decoder.is_apng().ok()) == Some(false),
+        _ => false,
+    }
+}
+
 /// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
 /// resized to `w`x`h`.
 fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
@@ -10037,9 +10108,18 @@ fn paint_image(
     // result up on draw when the destination is larger.
     let (rw, rh) = bounded_raster_size(dw, dh);
     let content = if svg {
-        render_svg(&bytes, rw, rh)
+        render_svg(&bytes, rw, rh).map(Arc::new)
+    } else if !src.starts_with("data:") {
+        let key = resolve_resource_url(src, base_url).map(|url| match profile {
+            Some(profile) => image_resource_key(&url, profile),
+            None => network_resource_url(&url),
+        });
+        match key {
+            Some(key) => cache.raster_paint(&key, bytes, rw, rh),
+            None => raster_to_pixmap(&bytes, rw, rh).map(Arc::new),
+        }
     } else {
-        raster_to_pixmap(&bytes, rw, rh)
+        raster_to_pixmap(&bytes, rw, rh).map(Arc::new)
     };
     let Some(content) = content else { return false };
 
@@ -10107,7 +10187,7 @@ fn paint_image(
         pixmap.draw_pixmap(
             dest.x as i32,
             dest.y as i32,
-            content.as_ref(),
+            content.as_ref().as_ref(),
             &tiny_skia::PixmapPaint::default(),
             base,
             clip.as_ref(),
@@ -10120,7 +10200,7 @@ fn paint_image(
         let scaled = base
             .pre_translate(dest.x as i32 as f32, dest.y as i32 as f32)
             .pre_scale(dw as f32 / rw as f32, dh as f32 / rh as f32);
-        pixmap.draw_pixmap(0, 0, content.as_ref(), &paint, scaled, clip.as_ref());
+        pixmap.draw_pixmap(0, 0, content.as_ref().as_ref(), &paint, scaled, clip.as_ref());
     }
     true
 }
@@ -13368,6 +13448,122 @@ mod tests {
         assert_eq!(metadata.0, PLACEHOLDER);
         assert_eq!(metadata.2, Some((1.0, 1.0)));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    fn raster_cache_fixture() -> Arc<[u8]> {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2, 3, image::Rgba([20, 40, 60, 127]),
+        ));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        Arc::from(encoded.into_inner())
+    }
+
+    #[test]
+    fn raster_paint_cache_reuses_exact_pixels_and_separates_dimensions_and_profiles() {
+        let mut cache = RenderResourceCache::default();
+        let bytes = raster_cache_fixture();
+        let url = "https://example.test/image.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        let first = cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        let second = cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.data(), raster_to_pixmap(&bytes, 12, 18).unwrap().data());
+        let resized = cache.raster_paint(url, Arc::clone(&bytes), 6, 9).unwrap();
+        assert!(!Arc::ptr_eq(&first, &resized));
+        let cors_key = image_resource_key(url, ImageRequestProfile::CorsInclude);
+        cache.seed_image_shared(url.to_owned(), ImageRequestProfile::CorsInclude, Arc::clone(&bytes));
+        let cors = cache.raster_paint(&cors_key, bytes, 12, 18).unwrap();
+        assert!(!Arc::ptr_eq(&first, &cors));
+        assert_eq!(first.data(), cors.data());
+    }
+
+    #[test]
+    fn raster_paint_cache_drops_replaced_failed_and_evicted_resources() {
+        let mut cache = RenderResourceCache::with_loader_and_limits(HttpResourceLoader, 1, 4096);
+        let bytes = raster_cache_fixture();
+        let url = "https://example.test/a.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        assert!(cache.raster_paint_bytes > 0);
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        assert_eq!(cache.raster_paint_bytes, 0);
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        cache.seed_missing(url.to_owned());
+        assert!(cache.raster_paints.is_empty());
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        cache.raster_paint(url, Arc::clone(&bytes), 12, 18).unwrap();
+        cache.seed_shared("https://example.test/b.png".to_owned(), bytes);
+        assert!(cache.raster_paints.is_empty());
+        assert_eq!(cache.raster_paint_bytes, 0);
+    }
+
+    #[test]
+    fn cached_raster_paint_preserves_cover_clipping_and_transparency() {
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/image.png";
+        cache.seed_shared(url.to_owned(), raster_cache_fixture());
+        let rect = crate::Rect { x: 5.0, y: 5.0, width: 20.0, height: 20.0 };
+        let clip = crate::Rect { x: 10.0, y: 10.0, width: 10.0, height: 10.0 };
+        let draw = |cache: &mut RenderResourceCache| {
+            let mut surface = Pixmap::new(40, 40).unwrap();
+            assert!(paint_image(url, None, &rect, &clip, crate::ObjectFit::Cover,
+                crate::ObjectPosition::default(), &mut surface, cache,
+                Some(ImageRequestProfile::NoCorsInclude), None,
+                crate::ResolvedBorderRadii::default(), None));
+            surface
+        };
+        let cold = draw(&mut cache);
+        assert_eq!(cache.raster_paints.len(), 1);
+        let warm = draw(&mut cache);
+        assert_eq!(cold.data(), warm.data());
+        assert_eq!(warm.pixel(7, 7).unwrap().alpha(), 0);
+        assert_eq!(warm.pixel(15, 15).unwrap().alpha(), 127);
+    }
+
+    #[test]
+    fn raster_paint_cache_excludes_animation_and_unretained_bytes() {
+        use base64::Engine;
+        // A two-frame, 2x3 RGBA APNG with distinct pixel values in each frame.
+        let animated: Arc<[u8]> = Arc::from(base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6BAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAACAAAAAwAAAAAAAAAAAAEAHgAASoAMRAAAABFJREFUeJxjENGwqQdhBgwGAEpDBcvYVzBtAAAAGmZjVEwAAAABAAAAAgAAAAMAAAAAAAAAAAABAB4AANHz5pAAAAAVZmRBVAAAAAJ4nGOw0bCpB2EGDAYAWFMGu+aEKGIAAAAASUVORK5CYII="
+        ).unwrap());
+        assert!(image::codecs::png::PngDecoder::new(std::io::Cursor::new(&*animated))
+            .unwrap().is_apng().unwrap());
+        let mut cache = RenderResourceCache::default();
+        let url = "https://example.test/animated.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&animated));
+        assert!(cache.raster_paint(url, animated, 2, 3).is_some());
+        assert!(cache.raster_paints.is_empty());
+        let static_bytes = raster_cache_fixture();
+        assert!(cache.raster_paint("https://example.test/unretained.png", static_bytes, 2, 3).is_some());
+        assert!(cache.raster_paints.is_empty());
+    }
+
+    #[test]
+    fn raster_paint_cache_enforces_payload_entry_and_count_bounds() {
+        let mut cache = RenderResourceCache::default();
+        let bytes = raster_cache_fixture();
+        let url = "https://example.test/image.png";
+        cache.seed_shared(url.to_owned(), Arc::clone(&bytes));
+        for width in 1..=80 {
+            cache.raster_paint(url, Arc::clone(&bytes), width, 1).unwrap();
+            assert!(cache.raster_paints.len() <= RASTER_PAINT_CACHE_ENTRIES);
+        }
+        for width in 500..510 {
+            cache.raster_paint(url, Arc::clone(&bytes), width, 800).unwrap();
+            assert!(cache.raster_paint_bytes <= RASTER_PAINT_CACHE_BYTES);
+            assert_eq!(cache.raster_paint_bytes,
+                cache.raster_paints.iter().map(|entry| entry.raster.data().len()).sum::<usize>());
+        }
+        let before = cache.raster_paint_bytes;
+        cache.raster_paint(url, Arc::clone(&bytes), 1024, 1024).unwrap();
+        assert_eq!(cache.raster_paint_bytes, before);
+        assert!(!static_raster_cacheable(b"GIF89a"));
+        assert!(!static_raster_cacheable(b"<svg/>"));
+        assert!(!static_raster_cacheable(b"not an image"));
+        cache.remove(url);
+        assert_eq!(cache.raster_paint_bytes, 0);
     }
 
     #[test]
