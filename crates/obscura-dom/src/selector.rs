@@ -627,18 +627,60 @@ impl<'a> Element for DomElement<'a> {
     }
 }
 
-// Thread-local LRU cache of parsed selectors. Without this every
-// querySelector / querySelectorAll re-parses the selector string;
-// for batch-heavy DOM access (agent scraping a table, framework
-// repeatedly polling for elements) the parse cost adds up to tens
-// of ms per page. Cap of 256 entries fits a typical page's distinct
-// selectors without unbounded memory growth.
-thread_local! {
-    static SELECTOR_CACHE: std::cell::RefCell<
-        std::collections::HashMap<String, std::sync::Arc<SelectorList<ObscuraSelector>>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::with_capacity(64));
-}
+// Cache syntax only: every query still matches the current tree. Evict one
+// least-recently-used entry instead of discarding the entire working set.
 const SELECTOR_CACHE_CAP: usize = 256;
+struct ParsedSelectorEntry {
+    parsed: SelectorList<ObscuraSelector>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct ParsedSelectorCache {
+    entries: std::collections::HashMap<String, ParsedSelectorEntry>,
+    clock: u64,
+}
+
+impl ParsedSelectorCache {
+    fn tick(&mut self) -> u64 {
+        if self.clock == u64::MAX {
+            // Rebase recency without losing ordering on counter rollover.
+            let mut ordered: Vec<_> = self.entries.values_mut().collect();
+            ordered.sort_unstable_by_key(|entry| entry.last_used);
+            for (index, entry) in ordered.iter_mut().enumerate() {
+                entry.last_used = index as u64;
+            }
+            self.clock = ordered.len() as u64;
+        }
+        self.clock += 1;
+        self.clock
+    }
+
+    fn get(&mut self, selector: &str) -> Option<SelectorList<ObscuraSelector>> {
+        let tick = self.tick();
+        let entry = self.entries.get_mut(selector)?;
+        entry.last_used = tick;
+        // SelectorList already owns reference-counted immutable syntax.
+        Some(entry.parsed.clone())
+    }
+
+    fn insert(&mut self, selector: &str, parsed: SelectorList<ObscuraSelector>) {
+        let last_used = self.tick();
+        if self.entries.len() >= SELECTOR_CACHE_CAP && !self.entries.contains_key(selector) {
+            let oldest = self.entries.iter().min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(selector.to_owned(), ParsedSelectorEntry { parsed, last_used });
+    }
+}
+
+thread_local! {
+    static SELECTOR_CACHE: std::cell::RefCell<ParsedSelectorCache> =
+        std::cell::RefCell::new(ParsedSelectorCache::default());
+}
 
 fn parse_selector_uncached(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
     let mut parser_input = cssparser::ParserInput::new(selector);
@@ -648,22 +690,11 @@ fn parse_selector_uncached(selector: &str) -> Result<SelectorList<ObscuraSelecto
 }
 
 pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
-    // Hot path: cached. Cold path: parse + insert.
-    if let Some(cached) = SELECTOR_CACHE.with(|c| c.borrow().get(selector).cloned()) {
-        return Ok((*cached).clone());
+    if let Some(cached) = SELECTOR_CACHE.with(|cache| cache.borrow_mut().get(selector)) {
+        return Ok(cached);
     }
     let parsed = parse_selector_uncached(selector)?;
-    let cached = std::sync::Arc::new(parsed.clone());
-    SELECTOR_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        // Crude eviction: if at cap, dump the whole table. A real LRU
-        // would be more memory-friendly but selectors are small and 256
-        // is comfortably above a single page's distinct-selector count.
-        if cache.len() >= SELECTOR_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(selector.to_string(), cached);
-    });
+    SELECTOR_CACHE.with(|cache| cache.borrow_mut().insert(selector, parsed.clone()));
     Ok(parsed)
 }
 
@@ -1270,6 +1301,52 @@ mod tests {
     use crate::tree_sink::parse_html;
 
     use super::{DomElement, SelectorKey};
+
+    #[test]
+    fn parsed_selector_lru_retains_hot_entries_at_capacity() {
+        let mut cache = super::ParsedSelectorCache::default();
+        for n in 0..super::SELECTOR_CACHE_CAP {
+            let selector = format!(".item-{n}");
+            cache.insert(&selector, super::parse_selector_uncached(&selector).unwrap());
+        }
+        assert!(cache.get(".item-0").is_some());
+        cache.insert(".new", super::parse_selector_uncached(".new").unwrap());
+        assert_eq!(cache.entries.len(), super::SELECTOR_CACHE_CAP);
+        assert!(cache.get(".item-0").is_some());
+        assert!(cache.get(".item-1").is_none());
+        assert!(cache.get(".item-2").is_some());
+    }
+
+    #[test]
+    fn parsed_selector_lru_rollover_and_replacement_preserve_recency() {
+        let mut cache = super::ParsedSelectorCache::default();
+        for n in 0..super::SELECTOR_CACHE_CAP {
+            let selector = format!(".item-{n}");
+            cache.insert(&selector, super::parse_selector_uncached(&selector).unwrap());
+        }
+        cache.clock = u64::MAX;
+        assert!(cache.get(".item-0").is_some());
+        cache.insert(".item-1", super::parse_selector_uncached(".item-1").unwrap());
+        assert_eq!(cache.entries.len(), super::SELECTOR_CACHE_CAP);
+        cache.insert(".new", super::parse_selector_uncached(".new").unwrap());
+        assert!(cache.get(".item-0").is_some());
+        assert!(cache.get(".item-1").is_some());
+        assert!(cache.get(".item-2").is_none());
+    }
+
+    #[test]
+    fn parsed_selector_lru_does_not_cache_dom_results_or_errors() {
+        let tree = parse_html("<div id='a'><i class='hit'></i></div><div id='b'></div>");
+        let a = tree.get_element_by_id("a").unwrap();
+        let b = tree.get_element_by_id("b").unwrap();
+        let hit = tree.query_selector_from(a, ".hit").unwrap().unwrap();
+        tree.append_child(b, hit);
+        assert!(tree.query_selector_from(a, ".hit").unwrap().is_none());
+        assert_eq!(tree.query_selector_from(b, ".hit").unwrap(), Some(hit));
+        let first = super::parse_selector("[").unwrap_err();
+        assert_eq!(super::parse_selector("[").unwrap_err(), first);
+        super::SELECTOR_CACHE.with(|cache| assert!(!cache.borrow().entries.contains_key("[")));
+    }
 
     #[test]
     fn streaming_selectors_keep_scope_order_and_see_reparented_matches() {
