@@ -7485,8 +7485,10 @@ globalThis.__obscura_set_screen_override = function(w, h, emulated) {
     _applyScreenSize(w, h, !!emulated);
     return;
   }
-  delete globalThis.__obscura_screen_w;
-  delete globalThis.__obscura_screen_h;
+  // Keep the snapshot's writable, hidden slots when clearing an override.
+  // Deleting them makes page initialization recreate read-only properties.
+  globalThis.__obscura_screen_w = undefined;
+  globalThis.__obscura_screen_h = undefined;
   const fallback = _fp('screen');
   _applyScreenSize(fallback[0], fallback[1], !!emulated);
 };

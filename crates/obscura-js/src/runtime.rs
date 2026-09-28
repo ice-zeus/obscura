@@ -4547,6 +4547,31 @@ mod tests {
     }
 
     #[test]
+    fn screen_override_clear_before_page_init_preserves_mutable_hidden_slots() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_screen_size_override(None, false);
+        rt.set_dom(parse_html("<p>Screen override lifecycle</p>"));
+        rt.set_url("http://example.com/test");
+        rt.run_page_init();
+        for (width, height) in [(1280, 800), (700, 500)] {
+            rt.set_screen_size_override(Some((width as f64, height as f64)), true);
+            assert_eq!(rt.evaluate("[screen.width, screen.height, screen.availWidth, screen.availHeight]").unwrap(),
+                serde_json::json!([width, height, width, height]));
+            assert_eq!(rt.evaluate(r#"(() => {
+                const names = ['__obscura_screen_w', '__obscura_screen_h'];
+                return names.every(name => {
+                    const descriptor = Object.getOwnPropertyDescriptor(window, name);
+                    return descriptor.writable && descriptor.configurable && !descriptor.enumerable
+                        && !Reflect.ownKeys(window).includes(name);
+                });
+            })()"#).unwrap(), serde_json::json!(true));
+            rt.set_screen_size_override(None, false);
+            assert_eq!(rt.evaluate("[__obscura_screen_w, __obscura_screen_h].every(value => value === undefined)").unwrap(),
+                serde_json::json!(true));
+        }
+    }
+
+    #[test]
     fn late_runtime_internal_names_use_the_existing_reflection_registry() {
         let mut rt = setup_runtime("<button id='target'>Click</button>");
         rt.set_viewport(900.0, 700.0);
