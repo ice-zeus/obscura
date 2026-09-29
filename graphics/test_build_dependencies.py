@@ -112,7 +112,8 @@ class DependencyRecipeTests(unittest.TestCase):
         (build / "libEGL.so").write_bytes(b"direct")
         self.assertEqual(recipe.artifact(build, "libEGL.so"), build / "libEGL.so")
 
-    def invoke(self, system="Linux", extra=(), wrong_revision=False, build_error=False, copy_error=False):
+    def invoke(self, system="Linux", extra=(), wrong_revision=False, build_error=False, copy_error=False,
+               machine="arm64", sysroot_error=False):
         argv = ["build_dependencies.py", "--work-dir", str(self.work), "--output", str(self.output), *extra]
         def checkout(directory, pin, env):
             directory.mkdir(parents=True, exist_ok=True)
@@ -120,11 +121,18 @@ class DependencyRecipeTests(unittest.TestCase):
                 (directory / "third_party/SwiftShader").mkdir(parents=True)
                 (directory / "LICENSE").write_text("upstream license\n")
                 (directory / "NOTICE-link").symlink_to(directory / "LICENSE")
+                installer = directory / "build/linux/sysroot_scripts/install-sysroot.py"
+                installer.parent.mkdir(parents=True)
+                installer.write_text("# Mocked pinned installer; never executed by these tests.\n")
+                installer.with_name("sysroots.json").write_text(json.dumps({
+                    "bullseye_arm64": {"Sha256Sum": "a" * 64}, "bullseye_amd64": {"Sha256Sum": "b" * 64}}))
         def run(argv, *, cwd, env, capture=False):
             command = [str(a) for a in argv]
             if command[:2] == ["git", "rev-parse"]:
                 key = {"SwiftShader": "swiftshader", "depot_tools": "depot_tools"}.get(Path(cwd).name, "angle")
                 return "wrong" if wrong_revision and key != "depot_tools" else recipe.PINS[key]["commit"]
+            if len(command) > 1 and Path(command[1]).name == "install-sysroot.py" and sysroot_error:
+                raise subprocess.CalledProcessError(1, command)
             if Path(command[0]).name == "autoninja":
                 if build_error: raise subprocess.CalledProcessError(1, command)
                 build = Path(command[command.index("-C") + 1]); build.mkdir(parents=True)
@@ -134,12 +142,13 @@ class DependencyRecipeTests(unittest.TestCase):
                 (build / "vk_swiftshader_icd.json").write_text(json.dumps({"ICD": {"library_path": "/temporary/path.so"}}))
             return None
         with patch("sys.argv", argv), patch.object(recipe.platform, "system", return_value=system), \
-             patch.object(recipe.platform, "machine", return_value="arm64"), \
-             patch.object(recipe, "checkout", side_effect=checkout), patch.object(recipe, "run", side_effect=run), \
+             patch.object(recipe.platform, "machine", return_value=machine), \
+             patch.object(recipe, "checkout", side_effect=checkout), patch.object(recipe, "run", side_effect=run) as commands, \
              patch("builtins.print"):
             if copy_error:
                 with patch.object(recipe.shutil, "copy2", side_effect=OSError("injected copy failure")): recipe.main()
             else: recipe.main()
+        return [call.args[0] for call in commands.call_args_list]
 
     def test_linux_bundle_records_verified_inputs_relative_icd_and_licenses(self):
         self.invoke()
@@ -156,9 +165,30 @@ class DependencyRecipeTests(unittest.TestCase):
         self.assertIn("pending", manifest["validation"])
 
     def test_macos_bundle_omits_software_libraries(self):
-        self.invoke(system="Darwin")
-        files = json.loads((self.output / "bundle.json").read_text())["files"]
+        commands = self.invoke(system="Darwin", sysroot_error=True)
+        manifest = json.loads((self.output / "bundle.json").read_text())
+        files = manifest["files"]
         self.assertEqual(set(files), {"libEGL.dylib", "libGLESv2.dylib"})
+        self.assertIsNone(manifest["sysroot"])
+        self.assertFalse(any("install-sysroot.py" in str(arg) for command in commands for arg in command))
+
+    def test_linux_sysroot_uses_native_architecture_and_pinned_metadata_before_gn(self):
+        for machine, arch, checksum in [("aarch64", "arm64", "a" * 64), ("x86_64", "amd64", "b" * 64)]:
+            with self.subTest(machine=machine):
+                self.work = self.root / f"work-{machine}"; self.output = self.root / f"bundle-{machine}"
+                commands = self.invoke(machine=machine)
+                installer = self.work / "angle/build/linux/sysroot_scripts/install-sysroot.py"
+                install = [self.work / "depot_tools/python-bin/python3", installer, "--arch", arch]
+                self.assertIn(install, commands)
+                self.assertLess(commands.index(install), next(i for i, command in enumerate(commands) if Path(command[0]).name == "gn"))
+                metadata = json.loads((self.output / "bundle.json").read_text())["sysroot"]
+                self.assertEqual(metadata, {"arch": arch, "tarball_sha256": checksum,
+                    "metadata_sha256": recipe.sha(installer.with_name("sysroots.json")), "installer_sha256": recipe.sha(installer)})
+
+    def test_linux_sysroot_failure_never_publishes_a_bundle(self):
+        with self.assertRaises(subprocess.CalledProcessError): self.invoke(sysroot_error=True)
+        self.assertFalse(self.output.exists())
+        self.assertFalse((self.work / "angle/out").exists())
 
     def test_output_is_immutable_and_unowned_workspace_is_not_modified(self):
         self.output.mkdir(); sentinel = self.output / "keep"; sentinel.write_text("unchanged")
