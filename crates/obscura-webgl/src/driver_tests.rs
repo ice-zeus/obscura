@@ -629,6 +629,7 @@ fn real_new_and_resized_drawing_buffers_never_expose_freed_surface_memory() {
             if version == 2 {
                 gl.enable(glow::RASTERIZER_DISCARD);
             }
+            assert_eq!(gl.get_error(), glow::NO_ERROR);
         }
         context.resize(8, 8).unwrap();
         unsafe {
@@ -648,7 +649,11 @@ fn real_new_and_resized_drawing_buffers_never_expose_freed_surface_memory() {
             assert_eq!(color, [0.25, 0.5, 0.75, 0.5]);
             assert_eq!(gl.get_parameter_f32(glow::DEPTH_CLEAR_VALUE), 0.25);
             assert_eq!(gl.get_parameter_i32(glow::STENCIL_CLEAR_VALUE), 5);
-            assert_eq!(gl.is_enabled(glow::RASTERIZER_DISCARD), version == 2);
+            // RASTERIZER_DISCARD is not an ES2 enum; querying it raises
+            // INVALID_ENUM on WebGL 1 contexts.
+            if version == 2 {
+                assert!(gl.is_enabled(glow::RASTERIZER_DISCARD));
+            }
             assert_eq!(gl.get_error(), glow::NO_ERROR);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.delete_framebuffer(framebuffer.unwrap());
