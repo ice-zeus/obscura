@@ -1094,9 +1094,11 @@ let _rafFrameScheduled = false;
 let _rafRunningFrame = false;
 let _renderOpportunityScheduled = false;
 let _renderOpportunityRunning = false;
+let _canvasPresentationPending = false;
+let _runCanvasPresentation = () => { _canvasPresentationPending = false; };
 
 function _renderOpportunityHasWork() {
-  return _rafFrameScheduled || _resizeRenderCheckpointPending
+  return _canvasPresentationPending || _rafFrameScheduled || _resizeRenderCheckpointPending
     || _intersectionRenderCheckpointPending;
 }
 
@@ -1121,6 +1123,9 @@ function _runRenderingOpportunity() {
   _renderOpportunityScheduled = false;
   _renderOpportunityRunning = true;
   try {
+    // Offscreen snapshots publish before the document's frame callbacks, so
+    // dimensions, observer records and pixels share one rendering boundary.
+    if (_canvasPresentationPending) _runCanvasPresentation();
     if (_rafFrameScheduled) _runAnimationFrameBatch();
     if (_resizeRenderCheckpointPending) _runResizeRenderCheckpoint();
     if (_intersectionRenderCheckpointPending) _runIntersectionRenderCheckpoint();
@@ -3757,6 +3762,8 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     const value = String(v);
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute", this._nid, n) : null;
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (n === "src" && this.localName === "iframe") {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
@@ -3780,7 +3787,7 @@ class Element extends Node {
       if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n, oldValue);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3797,12 +3804,17 @@ class Element extends Node {
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
+    const localName = n.includes(':') ? n.slice(n.indexOf(':') + 1) : n;
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute_ns", this._nid, ns + "\0" + localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (globalThis.__mutationObservers?.length)
+      globalThis.__notifyMutation('attributes', this._nid, [], [], localName, oldValue, ns || null);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -3810,6 +3822,8 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute", this._nid, n) : null;
     _dom("remove_attribute", this._nid, n);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
@@ -3825,6 +3839,8 @@ class Element extends Node {
       if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
+    if (oldValue !== null && globalThis.__mutationObservers?.length)
+      globalThis.__notifyMutation('attributes', this._nid, [], [], n, oldValue);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3839,9 +3855,13 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute_ns", this._nid, ns + "\0" + n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (oldValue !== null && globalThis.__mutationObservers?.length)
+      globalThis.__notifyMutation('attributes', this._nid, [], [], n, oldValue, ns || null);
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -9636,8 +9656,16 @@ globalThis.MutationObserver = class MutationObserver {
     this._records = [];
   }
   observe(target, options) {
-    this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+    const normalized = { ...(options || {}) };
+    if (normalized.attributes === undefined &&
+        (normalized.attributeOldValue !== undefined || normalized.attributeFilter !== undefined))
+      normalized.attributes = true;
+    if (normalized.attributeFilter !== undefined)
+      normalized.attributeFilter = Array.from(normalized.attributeFilter, String);
+    const existing = this._targets.find(entry => entry.target === target);
+    if (existing) existing.options = normalized;
+    else this._targets.push({ target, options: normalized });
+    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
   }
   disconnect() {
     this._targets = [];
@@ -9659,7 +9687,7 @@ globalThis.MutationObserver = class MutationObserver {
     });
   }
 };
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue) {
+globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue, attributeNamespace = null) {
   if (!globalThis.__mutationObservers.length) return;
   // Use `_wrap` (the canonical node-id → wrapper resolver) instead of a
   // direct cache poke. The previous code referenced `globalThis._cache`,
@@ -9677,6 +9705,7 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
     addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     attributeName: attributeName || null,
+    attributeNamespace,
     oldValue: oldValue ?? null,
     previousSibling: null,
     nextSibling: null,
@@ -9687,31 +9716,33 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   // any Element), so subtree=true silently behaved like subtree=false and
   // every nested mutation missed its subscriber.
   for (const obs of globalThis.__mutationObservers) {
-    let matched = false;
+    let matched = false, retainOldValue = false;
     for (const t of obs._targets) {
       const root = t.target;
       if (!root) continue;
-      // Filter by type per the observer options. Default behaviour matches
-      // real MutationObserver: attribute mutations need options.attributes,
-      // characterData mutations need options.characterData, childList
-      // needs options.childList.
       const wantsType =
         (type === 'attributes' && t.options.attributes) ||
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
-      if (root._nid === target_nid) { matched = true; break; }
-      if (t.options.subtree) {
-        // Walk parents until we hit the observed root or run off the tree.
+      if (type === 'attributes' && t.options.attributeFilter &&
+          (attributeNamespace !== null || !t.options.attributeFilter.includes(attributeName))) continue;
+      let inScope = root._nid === target_nid;
+      if (!inScope && t.options.subtree) {
         let cur = target.parentNode;
         while (cur) {
-          if (cur._nid === root._nid) { matched = true; break; }
+          if (cur._nid === root._nid) { inScope = true; break; }
           cur = cur.parentNode;
         }
-        if (matched) break;
       }
+      if (!inScope) continue;
+      matched = true;
+      retainOldValue ||= type === 'attributes' ? !!t.options.attributeOldValue
+        : type === 'characterData' ? !!t.options.characterDataOldValue : false;
     }
-    if (matched) obs._notify([record]);
+    // Each observer receives its own record. One observer's old-value option
+    // must not leak through the record shared with another registration.
+    if (matched) obs._notify([{ ...record, oldValue: retainOldValue ? record.oldValue : null }]);
   }
 };
 
@@ -14069,7 +14100,7 @@ class _Canvas2D {
 }
 
 let _webglCreate = () => null, _webglHas = () => false, _webglResize = () => {}, _webglReadback = () => null;
-let _placeholderHas = () => false, _placeholderPixels = () => null, _placeholderBlob, _transferOffscreen;
+let _placeholderHas = () => false, _placeholderPixels = () => null, _placeholderBlob, _transferOffscreen, _reflectCanvasDimensions;
 /* @obscura-webgl */
 
 class HTMLCanvasElement extends Element {
@@ -14112,6 +14143,21 @@ class HTMLCanvasElement extends Element {
   }
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
+
+const _canvasAttributeSetter = Element.prototype.setAttribute;
+_reflectCanvasDimensions = (canvas, width, height) => {
+  const owner = _requireCanvasOwner(canvas);
+  const dimension = (name, fallback) => {
+    const raw = _domParse('get_attribute', owner.node, name);
+    const parsed = raw === null ? fallback : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  // A changed displayed size replaces both attributes, including a
+  // same-valued opposite axis. Same-sized frames do not mutate attributes.
+  if (dimension('width', 300) === width && dimension('height', 150) === height) return;
+  _canvasAttributeSetter.call(canvas, 'width', width);
+  _canvasAttributeSetter.call(canvas, 'height', height);
+};
 
 HTMLCanvasElement.prototype.getContext = function getContext(type, options = undefined) {
   if (!_canvasDOMOwner(this)) return null;

@@ -161,33 +161,53 @@ const placeholderFinalizer=new FinalizationRegistry(record=>{
 function placeholderOp(s,request,bytes=empty) {
   return __obscuraCore.ops.op_canvas_placeholder(s.frame,s.epoch,request,bytes);
 }
+const pendingPresentations=new Set();
+_runCanvasPresentation=()=>{
+  const batch=Array.from(pendingPresentations);
+  pendingPresentations.clear();_canvasPresentationPending=false;
+  for(const reference of batch){
+    try{presentPlaceholder(reference);}catch(_error){
+      const canvas=reference.deref(),state=canvas&&offscreens.get(canvas);
+      if(state){state.presentationQueued=false;state.presentationFailure='Canvas presentation failed';}
+    }
+  }
+};
 function schedulePlaceholder(canvas) {
   const s=offscreens.get(canvas);
-  if(!s?.placeholder||s.presentationQueued||!s.placeholder.target.deref())return;
+  if(!s?.placeholder||s.mode==='none'||s.presentationQueued||!s.placeholder.target.deref())return;
   s.presentationQueued=true;
   const reference=new NativeWeakRef(canvas);
+  // The posted wake also works for a synchronous embedder which has not
+  // entered Tokio yet. Publication itself belongs to the shared frame phase.
   queueContextTask(s.frame,()=>{
-    const canvas=reference.deref(),current=canvas&&offscreens.get(canvas);
-    if(!current)return;
-    current.presentationQueued=false;
-    if(!current.placeholder?.target.deref())return;
-    let result;
-    if(current.mode==='none'){
-      if(current.width>4294967295||current.height>4294967295){current.presentationFailure='Placeholder dimensions exceed native range';return;}
-      result=placeholderOp(current,{kind:'presentBlank',id:current.placeholder.id,width:current.width,height:current.height});
-    }else if(current.mode==='2d'){
-      const pixels=_canvas2DPixels(current.context);
-      const bytes=new Uint8Array(pixels.bytes.buffer,pixels.bytes.byteOffset,pixels.bytes.byteLength);
-      result=placeholderOp(current,{kind:'presentCpu',id:current.placeholder.id,width:pixels.width,height:pixels.height,origin_clean:pixels.originClean},bytes);
-    }else if(current.mode==='webgl'||current.mode==='webgl2'){
-      result=placeholderOp(current,{kind:'presentGl',id:current.placeholder.id,context:canvases.get(canvas).id});
-    }
-    // Failure preserves the last frame. Retry only after further context activity or a
-    // resize, avoiding a task loop when allocation/backend recovery is needed.
-    if(result&&result.status!=='ready')current.presentationFailure=result.reason;
-    else delete current.presentationFailure;
+    const current=reference.deref(),state=current&&offscreens.get(current);
+    if(!state?.placeholder?.target.deref())return;
+    pendingPresentations.add(reference);_canvasPresentationPending=true;
+    _scheduleRenderingOpportunity();
   });
 }
+function presentPlaceholder(reference) {
+  const canvas=reference.deref(),current=canvas&&offscreens.get(canvas);
+  if(!current)return;
+  current.presentationQueued=false;
+  const target=current.placeholder?.target.deref();
+  if(!target||!_canvasDOMOwner(target))return;
+  let result;
+  if(current.mode==='2d'){
+    const pixels=_canvas2DPixels(current.context);
+    const bytes=new Uint8Array(pixels.bytes.buffer,pixels.bytes.byteOffset,pixels.bytes.byteLength);
+    result=placeholderOp(current,{kind:'presentCpu',id:current.placeholder.id,width:pixels.width,height:pixels.height,origin_clean:pixels.originClean},bytes);
+  }else if(current.mode==='webgl'||current.mode==='webgl2'){
+    result=placeholderOp(current,{kind:'presentGl',id:current.placeholder.id,context:canvases.get(canvas).id});
+  }
+  // Failure preserves the last frame. Retry only after further context
+  // activity or resize, avoiding a task loop during backend recovery.
+  if(result?.status==='ready'){
+    _reflectCanvasDimensions(target,result.width,result.height);
+    delete current.presentationFailure;
+  }else if(result)current.presentationFailure=result.reason;
+}
+
 _placeholderHas=canvas=>placeholders.has(canvas);
 _transferOffscreen=function transferControlToOffscreen(){
   if(!(this instanceof HTMLCanvasElement)||_cache.get(this._nid)!==this)throw new TypeError('Illegal invocation');

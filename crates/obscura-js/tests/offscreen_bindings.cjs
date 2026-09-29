@@ -17,7 +17,7 @@ const htmlCanvas=bootstrap.slice(htmlCanvasStart,htmlCanvasEnd);
 const bindings=read('webgl.js').replace('/* @obscura-imagedata */',read('imagedata.js')).replace('/* @obscura-imagebitmap */',read('imagebitmap.js')).replace('/* @obscura-offscreen */',read('offscreen.js'));
 function fixture(options={}) {
   const imageDataStore=new WeakMap();
-  const calls=[],tasks=[],native=new Map(),presented=new Map(),listeners=new WeakMap(),cache=new Map();let next=1,nextNode=1,nextPlaceholder=1,generation=1;
+  const calls=[],tasks=[],frames=[],native=new Map(),presented=new Map(),listeners=new WeakMap(),cache=new Map();let next=1,nextNode=1,nextPlaceholder=1,generation=1;
   class EventTarget {}
   class Event {constructor(type,init={}){this.type=type;this.cancelable=!!init.cancelable;this.defaultPrevented=false;}preventDefault(){if(this.cancelable)this.defaultPrevented=true;}}
   class HTMLCanvasElement {}
@@ -34,6 +34,9 @@ function fixture(options={}) {
     _cache:cache,atob:globalThis.atob,
     Uint8Array,Uint8ClampedArray,Uint32Array,ArrayBuffer,WeakMap,WeakRef,FinalizationRegistry,queueMicrotask,
     _realmFrameId:7,_hostState:{documentGeneration:generation},_markNative:()=>{},
+    _domParse(command,node,name){assert.equal(command,'get_attribute');return cache.get(node).getAttribute(name);},
+    _canvasPresentationPending:false,_runCanvasPresentation:null,
+    _scheduleRenderingOpportunity(){if(!frames.length)frames.push(()=>sandbox._runCanvasPresentation());},
     _eventTargetAdd(target,type,callback){let list=listeners.get(target);if(!list)listeners.set(target,list=[]);list.push({type,callback});},
     _eventTargetRemove(target,type,callback){const list=listeners.get(target)||[];const i=list.findIndex(x=>x.type===type&&x.callback===callback);if(i>=0)list.splice(i,1);},
     _eventTargetDispatch(target,event){event.target=target;for(const item of [...(listeners.get(target)||[])])if(item.type===event.type)item.callback.call(target,event);return !event.defaultPrevented;},
@@ -119,7 +122,10 @@ function fixture(options={}) {
   vm.createContext(sandbox);vm.runInContext(encoder+'\n'+canvas+'\n'+bindings+'\n'+htmlCanvas+'\n_canvasDocumentEpoch=1;',sandbox);
   return{sandbox,calls,native,presented,tasks,html:(width=2,height=1)=>{const value=new sandbox.HTMLCanvasElement();value.width=width;value.height=height;return value;},create:(...args)=>new sandbox.OffscreenCanvas(...args),
     advance(){sandbox._hostState.documentGeneration=++generation;vm.runInContext('_canvasDocumentEpoch='+generation,sandbox);presented.clear();},
-    drain(){for(let i=0;tasks.length&&i<100;i++)tasks.shift()();assert.equal(tasks.length,0);}};
+    drainTasks(){for(let i=0;tasks.length&&i<100;i++)tasks.shift()();assert.equal(tasks.length,0);},
+    drain(){for(let i=0;(tasks.length||frames.length)&&i<100;i++){
+      while(tasks.length)tasks.shift()();if(frames.length)frames.shift()();
+    }assert.equal(tasks.length+frames.length,0);}};
 }
 async function settle(f,promise) {
   promise.catch(()=>{});
@@ -308,13 +314,14 @@ test('HTML transfer enforces context exclusivity and protects private ownership 
 test('CPU placeholder tasks coalesce and serialization reads only the last presented frame',()=>{
   const f=fixture(),html=f.html(),offscreen=html.transferControlToOffscreen(),ctx=offscreen.getContext('2d');
   const blank=html.toDataURL();ctx.fillStyle='#ff0000';ctx.fillRect(0,0,2,1);ctx.fillRect(0,0,1,1);
-  assert.equal(f.tasks.length,1);assert.equal(html.toDataURL(),blank);f.drain();
+  assert.equal(f.tasks.length,1);assert.equal(html.toDataURL(),blank);f.drainTasks();
+  assert.equal(html.toDataURL(),blank,'posted task must not publish before the frame');f.drain();
   assert.deepEqual(Array.from(f.presented.get(1).bytes),[255,0,0,255,255,0,0,255]);
   const red=html.toDataURL();ctx.fillStyle='#0000ff';ctx.fillRect(0,0,2,1);
   assert.equal(html.toDataURL(),red);assert.equal(f.tasks.length,1);f.drain();assert.notEqual(html.toDataURL(),red);
   assert.equal(f.tasks.length,0);assert.equal(f.calls.filter(c=>c.placeholder==='presentCpu').length,2);
   offscreen.width=3;assert.equal(f.presented.get(1).width,2);f.drain();assert.equal(f.presented.get(1).width,3);
-  assert.equal(html.getAttribute('width'),'2');assert.ok(!f.calls.some(c=>c.domSurface||c.domDamage));
+  assert.equal(html.getAttribute('width'),'3');assert.ok(!f.calls.some(c=>c.domSurface||c.domDamage));
 });
 test('placeholder canvas copies and bitmap transfers use the last presented pixels',async()=>{
   const f=fixture(),html=f.html(1,1),offscreen=html.transferControlToOffscreen(),ctx=offscreen.getContext('2d');
@@ -382,10 +389,10 @@ test('navigation drops queued presentation and prevents old placeholder access t
   assert.throws(()=>{const target=f.create(2,1);target.getContext('2d').drawImage(html,0,0);},{name:'InvalidStateError'});
 });
 
-test('unused offscreen resize presents transparent dimensions without allocating a context',()=>{
+test('unused offscreen resize leaves placeholder dimensions unchanged until a context exists',()=>{
   const f=fixture(),html=f.html(),offscreen=html.transferControlToOffscreen();
-  offscreen.width=3;offscreen.height=2;assert.equal(f.tasks.length,1);f.drain();
-  assert.equal(f.presented.get(1).width,3);assert.equal(f.presented.get(1).height,2);
+  offscreen.width=3;offscreen.height=2;assert.equal(f.tasks.length,0);f.drain();
+  assert.equal(f.presented.get(1).width,2);assert.equal(f.presented.get(1).height,1);
   assert.equal(f.presented.get(1).bytes,null);assert.equal(f.native.size,0);
   assert.equal(html.getAttribute('width'),'2');assert.ok(html.toDataURL().startsWith('data:image/png'));
   assert.ok(offscreen.getContext('webgl'));f.drain();assert.equal(f.presented.get(1).context,1);
@@ -524,4 +531,13 @@ test('placeholder source snapshot failures never submit partial texture pixels',
   const before=f.calls.filter(call=>call.operation?.kind==='textureSource').length;
   assert.throws(()=>gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,html),{name:'InvalidStateError'});
   assert.equal(f.calls.filter(call=>call.operation?.kind==='textureSource').length,before);
+});
+
+test('author dimensions preserve snapshots until dirty presentation replaces both attributes',()=>{
+  const f=fixture(),html=f.html(2,1),off=html.transferControlToOffscreen(),ctx=off.getContext('2d');
+  ctx.fillStyle='#ff0000';ctx.fillRect(0,0,2,1);f.drain();const red=html.toDataURL();
+  html.setAttribute('width','90');assert.equal(off.width,2);assert.equal(html.toDataURL(),red);
+  ctx.fillStyle='#0000ff';ctx.fillRect(0,0,2,1);f.drainTasks();
+  assert.equal(html.width,90);assert.equal(html.toDataURL(),red);
+  f.drain();assert.equal(html.width,2);assert.equal(html.height,1);assert.notEqual(html.toDataURL(),red);
 });

@@ -9753,10 +9753,23 @@ fn collect_image_intrinsics(
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        if let Some(&(width, height)) = cache.canvas_bitmap_sizes.get(&nid) {
-            if tree.with_node(nid, |node| node.as_element()
-                .is_some_and(|name| name.local.as_ref() == "canvas")).unwrap_or(false)
-            {
+        if cache.canvas_bitmap_sizes.contains_key(&nid) {
+            let dimensions = tree.with_node(nid, |node| {
+                if !node.as_element().is_some_and(|name| name.local.as_ref() == "canvas") {
+                    return None;
+                }
+                let axis = |name, fallback| {
+                    let value = node.get_attribute(name)?.trim_start();
+                    let value = value.strip_prefix('+').unwrap_or(value);
+                    let end = value.bytes().take_while(u8::is_ascii_digit).count();
+                    value[..end].parse::<u32>().ok().or(Some(fallback))
+                };
+                Some((axis("width", 300).unwrap_or(300), axis("height", 150).unwrap_or(150)))
+            }).flatten();
+            if let Some((width, height)) = dimensions {
+                // Reflection follows published dimensions, while author
+                // attribute changes can independently resize the displayed
+                // box. Native snapshot pixels keep their own dimensions.
                 out.insert(nid, crate::ReplacedIntrinsic::from_canvas_dimensions(width, height));
                 continue;
             }
@@ -16647,8 +16660,15 @@ mod tests {
         );
     }
 
+    fn reflect_placeholder_size(tree: &DomTree, node: obscura_dom::NodeId, width: u32, height: u32) {
+        tree.with_node_mut(node, |node| {
+            node.set_attribute("width", width.to_string());
+            node.set_attribute("height", height.to_string());
+        });
+    }
+
     #[test]
-    fn placeholder_canvas_bitmap_size_preserves_attributes_and_author_css() {
+    fn placeholder_canvas_published_dimensions_preserve_author_css() {
         for (css, expected) in [
             ("", (40.0, 20.0)),
             ("width:80px", (80.0, 40.0)),
@@ -16667,14 +16687,15 @@ mod tests {
             let mut resources = RenderResourceCache::default();
             assert_eq!(resources.set_canvas_bitmap_size(target, 40, 20), Ok(true));
             assert_eq!(resources.set_canvas_bitmap_size(target, 40, 20), Ok(false));
+            reflect_placeholder_size(&tree, target, 40, 20);
             let prepared = prepare_dom(&tree, (300.0, 150.0), None, &mut resources).unwrap();
             let rect = prepared.document_rect(target).unwrap();
             assert_eq!((rect.width, rect.height), expected, "{css}");
             let rect = prepared.document_rect(ordinary).unwrap();
             assert_eq!((rect.width, rect.height), (13.0, 7.0), "ordinary canvas");
             let node = tree.get_node(target).unwrap();
-            assert_eq!(node.get_attribute("width"), Some("13"));
-            assert_eq!(node.get_attribute("height"), Some("7"));
+            assert_eq!(node.get_attribute("width"), Some("40"));
+            assert_eq!(node.get_attribute("height"), Some("20"));
         }
     }
 
@@ -16697,6 +16718,7 @@ mod tests {
             let target = tree.get_element_by_id("target").unwrap();
             let mut resources = RenderResourceCache::default();
             resources.set_canvas_bitmap_size(target, width, height).unwrap();
+            reflect_placeholder_size(&tree, target, width, height);
             let prepared = prepare_dom(&tree, (300.0, 150.0), None, &mut resources).unwrap();
             let rect = prepared.document_rect(target).unwrap();
             assert_eq!((rect.width, rect.height), expected, "{width}x{height} {css}");
@@ -16726,18 +16748,20 @@ mod tests {
                     assert!(!resources.remove_canvas_bitmap_size(target));
                 }
             }
+            let (width, height) = size.unwrap_or((13, 7));
+            reflect_placeholder_size(&tree, target, width, height);
             case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
             let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
-            let (width, height) = size.unwrap_or((13, 7));
             assert_eq!((rect.width, rect.height), (width as f32, height as f32));
             assert!(std::rc::Rc::ptr_eq(&peer_properties,
                 &case.previous.as_ref().unwrap().layout.custom_properties[&peer]), "clean peer recascaded");
         }
-        // Content attributes remain page-owned and still drive selectors;
-        // they must not replace the presented bitmap dimensions.
+        // Author attributes change displayed geometry without changing the
+        // retained snapshot dimensions or native pixels.
         case.set_attribute(&tree, target, "width", "90", 0.0);
         let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
-        assert_eq!((rect.width, rect.height), (8.0, 4.0));
+        assert_eq!((rect.width, rect.height), (90.0, 4.0));
+        assert_eq!(case.resources.canvas_bitmap_sizes[&target], (8, 4));
     }
 
     #[test]
@@ -16755,16 +16779,20 @@ mod tests {
             for resources in [&mut case.resources, &mut case.oracle_resources] {
                 resources.set_canvas_bitmap_size(target, width, height).unwrap();
             }
+            reflect_placeholder_size(&tree, target, width, height);
             case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
             let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
-            assert!((rect.width - 100.0).abs() < 0.01);
-            assert!((rect.height - 100.0 * height as f32 / width as f32).abs() < 0.01,
+            assert_eq!(rect.width, 100.0);
+            // document_rect returns Taffy's rounded paint layout. Chromium's
+            // fractional CSSOM result is a separate compatibility surface.
+            assert_eq!(rect.height, (100.0 * height as f32 / width as f32).round(),
                 "bitmap {width}x{height} produced {}x{}", rect.width, rect.height);
         }
         case.set_attribute(&tree, target, "hidden", "", 0.0);
         for resources in [&mut case.resources, &mut case.oracle_resources] {
             resources.set_canvas_bitmap_size(target, 50, 40).unwrap();
         }
+        reflect_placeholder_size(&tree, target, 50, 40);
         case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
         tree.with_node_mut(target, |node| node.remove_attribute_ns("", "hidden"));
         case.flush(&tree, &[crate::dom::AttributeStyleMutation { node: target,
@@ -16791,6 +16819,7 @@ mod tests {
             let surface = Surface { node: target, bytes: [255, 0, 0, 255].repeat(8) };
             let mut resources = RenderResourceCache::default();
             resources.set_canvas_bitmap_size(target, 4, 2).unwrap();
+            reflect_placeholder_size(&tree, target, 4, 2);
             let mut prepared = prepare_dom(&tree, (12.0, 12.0), None, &mut resources).unwrap();
             let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
             let pixels = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
@@ -16801,6 +16830,48 @@ mod tests {
             let white = pixels.pixel(white_pixel.0, white_pixel.1).unwrap();
             assert_eq!((white.red(), white.green(), white.blue(), white.alpha()), (255, 255, 255, 255), "{css}");
         }
+    }
+
+    #[test]
+    fn placeholder_author_dimensions_preserve_snapshot_pixels_and_object_fit() {
+        struct Surface { node: obscura_dom::NodeId, bytes: Vec<u8> }
+        impl CanvasSurfaceSource for Surface {
+            fn surface(&self, node: obscura_dom::NodeId) -> Option<CanvasSurface<'_>> {
+                (node == self.node).then(|| CanvasSurface::from_rgba8(4, 2, &self.bytes)).flatten()
+            }
+        }
+        let tree = parse_html(r#"<!doctype html><body style="margin:0;background:white">
+            <canvas id=target width=4 height=2 style="display:block;object-fit:contain"></canvas></body>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let surface = Surface { node: target, bytes: [255, 0, 0, 255].repeat(8) };
+        let mut resources = RenderResourceCache::default();
+        resources.set_canvas_bitmap_size(target, 4, 2).unwrap();
+        for (attribute, expected) in [
+            (Some("8"), 8.0), (None, 300.0), (Some("invalid"), 300.0),
+            (Some(""), 300.0), (Some("0"), 0.0), (Some("  +8tail"), 8.0),
+        ] {
+            tree.with_node_mut(target, |node| {
+                if let Some(value) = attribute { node.set_attribute("width", value.into()); }
+                else { node.remove_attribute_ns("", "width"); }
+            });
+            let prepared = prepare_dom(&tree, (320.0, 10.0), None, &mut resources).unwrap();
+            let rect = prepared.document_rect(target).unwrap();
+            assert_eq!((rect.width, rect.height), (expected, 2.0), "{attribute:?}");
+            assert_eq!(resources.canvas_bitmap_sizes[&target], (4, 2));
+            assert_eq!(surface.bytes, [255, 0, 0, 255].repeat(8));
+        }
+        // A wider author box contains the original 4x2 surface without
+        // stretching its object-fit ratio or changing its readback pixels.
+        tree.with_node_mut(target, |node| node.set_attribute("width", "8".into()));
+        let mut prepared = prepare_dom(&tree, (12.0, 4.0), None, &mut resources).unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0,0.0), &HashMap::new());
+        let pixels = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree, &mut prepared, &mut resources, &scroll, [255;4], &surface,
+        ).unwrap();
+        let red = pixels.pixel(3,1).unwrap();
+        let white = pixels.pixel(0,1).unwrap();
+        assert_eq!((red.red(),red.green(),red.blue(),red.alpha()),(255,0,0,255));
+        assert_eq!((white.red(),white.green(),white.blue(),white.alpha()),(255,255,255,255));
     }
 
     #[test]
