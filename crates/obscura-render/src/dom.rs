@@ -4523,12 +4523,13 @@ pub fn computed_style_without_layout(
     let mut pointer_events = false;
     let shadow_sheets = HashMap::new();
     let mut timeline = crate::AnimationTimelineState::default();
+    let mut ancestor_display_none = false;
     for &node in &path {
         let (next_props, next_padding, next_dark, element) = cascade_node_style(
             tree, node, &sheet, &sheet, &shadow_sheets, &mut matcher,
             &mut styles, &mut custom_properties, &props, &mut None, quirks,
             viewport, crate::AnimationSample::default(), &mut timeline,
-            cell_padding, dark, None,
+            cell_padding, dark, None, ancestor_display_none,
         )?;
         props = next_props;
         cell_padding = next_padding;
@@ -4536,6 +4537,7 @@ pub fn computed_style_without_layout(
         if !element { continue; }
         matcher.push_ancestor(tree, node);
         let style = styles.get_mut(&node)?;
+        ancestor_display_none |= style.display == crate::Display::None;
         // Display inheritance and live effects retain the complete normalization
         // path. A query cannot become active without a query container on this
         // ancestor path, including named normal/style containers.
@@ -17825,6 +17827,42 @@ mod tests {
             assert_eq!(can_retain_layout_for_metadata(&tree, viewport, &mut cache, &[mutation]),
                 name != "data-state", "linked CSS dependency: {name}");
             assert_eq!(cache.miss_count(), misses, "metadata probe replaced the full stylesheet cache");
+        }
+    }
+
+    #[test]
+    fn retained_preflights_share_cssom_rules_with_full_layout() {
+        let tree = parse_html("<style id=sheet>#target { width: 80px }</style><p id=target>text</p><img id=image>");
+        let owner = tree.get_element_by_id("sheet").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let image = tree.get_element_by_id("image").unwrap();
+        let viewport = (500.0, 300.0);
+        let mut cache = crate::css::StylesheetCache::default();
+        for (css, dependent) in [
+            ("p { width: 80px }", false),
+            ("[data-state] { width: 160px } img[src] { width: 70px }", true),
+            ("p { width: 90px }", false),
+        ] {
+            assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![css.into()], true));
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree, viewport, &HashMap::new(), &[], &mut cache,
+            );
+            let misses = cache.miss_count();
+            let metadata = AttributeStyleMutation {
+                node: target, name: "data-state".into(), old_value: None,
+                new_value: Some("ready".into()),
+            };
+            assert_eq!(can_retain_layout_for_metadata(
+                &tree, viewport, &mut cache, &[metadata.into()],
+            ), !dependent, "CSSOM metadata dependency: {css}");
+            let source = AttributeStyleMutation {
+                node: image, name: "src".into(), old_value: None,
+                new_value: Some("new.png".into()),
+            };
+            assert_eq!(image_source_updates_without_style_damage(
+                &tree, viewport, &mut cache, &[source.into()],
+            ), (!dependent).then_some(vec![image]), "CSSOM image dependency: {css}");
+            assert_eq!(cache.miss_count(), misses, "preflight must retain the complete CSSOM cache key");
         }
     }
 

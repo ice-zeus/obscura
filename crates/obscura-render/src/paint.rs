@@ -12427,6 +12427,7 @@ mod tests {
             #flex { display:flex }
             #contents { display:contents }
             #item { display:inline-flex; background-color:green; opacity:.4 }
+            #suppressed { display:none }
             #float { float:left; display:inline; position:relative; z-index:3 }
             #inherit { display:inherit }
             #animated { animation:fade 1s infinite }
@@ -12435,6 +12436,7 @@ mod tests {
             @container (min-width:1px) { #query { color:green } }
         </style><body>
             <div id=flex><div id=contents><span id=item>label</span></div></div>
+            <section id=suppressed><span id=suppressed-child>hidden ancestor</span></section>
             <span id=float>floating</span><div id=inherit>inherited</div>
             <input id=hidden type=" HIDDEN "><div id=animated>animated</div>
             <div id=container><span id=query>query</span></div>
@@ -12449,7 +12451,7 @@ mod tests {
         for active in ["yes", "no"] {
             tree.with_node_mut(body, |node| node.set_attribute("data-active", active.into()));
             let full = prepare_dom(&tree, viewport, None, &mut resources).unwrap();
-            for name in ["flex", "contents", "item", "float"] {
+            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child"] {
                 let id = tree.get_element_by_id(name).unwrap();
                 let fast = crate::dom::computed_style_without_layout(
                     &tree, id, viewport, crate::CssMediaType::Screen, &cache, "color",
