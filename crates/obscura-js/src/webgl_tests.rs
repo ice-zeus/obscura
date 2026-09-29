@@ -604,7 +604,7 @@ async fn queued_loss_from_a_replaced_document_does_not_reach_the_new_document() 
 async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
     require_driver();
     let mut runtime = page();
-    runtime.execute_script("<fixture-setup>", "window.topLosses=0;document.getElementById('c').addEventListener('webglcontextlost',()=>topLosses++)").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.topLosses=0;document.getElementById('c').addEventListener('webglcontextlost',()=>topLosses++);window.lossMessages=[];addEventListener('message',e=>lossMessages.push([e.data,e.origin,e.isTrusted]))").unwrap();
     let frame = crate::frame::FrameRealm::new(
         &mut runtime,
         91,
@@ -625,7 +625,16 @@ async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
     let messages = runtime.take_pending_frame_messages();
     assert_eq!(messages.len(), 1);
     assert_eq!((messages[0].source_frame_id, messages[0].target_frame_id), (91, 0));
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&messages[0].data_json).unwrap(), json!("webglcontextlost"));
+    // Host messages contain a structured-clone envelope. Deliver it through
+    // the same bridge as the browser and assert the page-visible payload.
+    runtime.execute_script("<frame-message>", &format!(
+        "globalThis.__obscura_deliverMessage({}, {}, {});",
+        serde_json::to_string(&messages[0].data_json).unwrap(),
+        serde_json::to_string(&messages[0].origin).unwrap(),
+        messages[0].source_frame_id,
+    )).unwrap();
+    assert_eq!(runtime.evaluate("lossMessages").unwrap(),
+        json!([["webglcontextlost", "https://graphics.example", true]]));
     let retired = crate::frame::FrameRealm::new(
         &mut runtime,
         92,
@@ -651,6 +660,8 @@ async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
     assert_eq!(frame.evaluate(&mut runtime, "frameLosses").unwrap(), json!(1));
     assert_eq!(runtime.evaluate("topLosses").unwrap().as_f64(), Some(0.0));
     assert!(runtime.take_pending_frame_messages().is_empty());
+    assert_eq!(runtime.evaluate("lossMessages").unwrap(),
+        json!([["webglcontextlost", "https://graphics.example", true]]));
 }
 
 #[test]
