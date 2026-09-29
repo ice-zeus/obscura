@@ -1536,14 +1536,13 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
         .map(|page| page.id.clone())
         .collect();
     for page_id in live_ids {
-        let Some(session_id) = ctx
+        // Completion retention must drain even after the last session detaches.
+        // Routing below still delivers only to enabled attached subscribers.
+        let session_id = ctx
             .sessions
             .iter()
             .find(|(_, pid)| *pid == &page_id)
-            .map(|(session_id, _)| Some(session_id.clone()))
-        else {
-            continue;
-        };
+            .map(|(session_id, _)| session_id.clone());
         let (frame_id, page_url, network_events, same_document_navigation, pending_network) = {
             let Some(page) = ctx.get_page_mut(&page_id) else {
                 continue;
@@ -1561,7 +1560,9 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
                 page.has_pending_script_network_requests(),
             )
         };
-        if same_document_navigation {
+        // Page events still need an attached session; only network
+        // retention continues after the last one detaches.
+        if same_document_navigation && session_id.is_some() {
             crate::domains::page::emit_same_document_navigation(
                 ctx, &session_id, &frame_id, &page_url,
             );
