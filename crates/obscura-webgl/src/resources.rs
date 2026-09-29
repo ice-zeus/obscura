@@ -66,10 +66,28 @@ unsafe fn copy_buffer_mapping(
     map: impl FnOnce() -> *const u8,
     unmap: impl FnOnce() -> bool,
 ) -> Result<(), u32> {
+    copy_buffer_mapping_with_allocator(destination, map, unmap, |length| {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|_| glow::OUT_OF_MEMORY)?;
+        bytes.resize(length, 0);
+        Ok(bytes)
+    })
+}
+unsafe fn copy_buffer_mapping_with_allocator(
+    destination: &mut [u8],
+    map: impl FnOnce() -> *const u8,
+    unmap: impl FnOnce() -> bool,
+    allocate: impl FnOnce(usize) -> Result<Vec<u8>, u32>,
+) -> Result<(), u32> {
     if destination.is_empty() { return Ok(()); }
+    if destination.len() > MAX_TRANSFER_BYTES { return Err(glow::OUT_OF_MEMORY); }
+    // Reserve the destination-sized transactional copy before acquiring native
+    // mapping ownership. Allocation failure cannot strand a mapped buffer.
+    let mut bytes = allocate(destination.len())?;
+    if bytes.len() != destination.len() { return Err(glow::OUT_OF_MEMORY); }
     let pointer = map();
     if pointer.is_null() { return Err(glow::INVALID_OPERATION); }
-    let bytes = std::slice::from_raw_parts(pointer,destination.len()).to_vec();
+    bytes.copy_from_slice(std::slice::from_raw_parts(pointer,destination.len()));
     if !unmap() { return Err(glow::INVALID_OPERATION); }
     destination.copy_from_slice(&bytes);
     Ok(())
@@ -631,6 +649,20 @@ mod tests {
             assert_eq!(destination,source);assert_eq!(unmapped.get(),2);
             assert_eq!(copy_buffer_mapping(&mut [], || panic!("empty read mapped"),
                 || panic!("empty read unmapped")),Ok(()));
+        }
+    }
+    #[test]
+    fn buffer_readback_allocation_failure_never_maps_or_changes_destination() {
+        let mut destination = [19; 4];
+        unsafe {
+            assert_eq!(copy_buffer_mapping_with_allocator(&mut destination,
+                || panic!("allocation failure mapped native memory"),
+                || panic!("allocation failure unmapped unacquired memory"),
+                |length| { assert_eq!(length, 4); Err(glow::OUT_OF_MEMORY) }), Err(glow::OUT_OF_MEMORY));
+            assert_eq!(destination, [19; 4]);
+            assert_eq!(copy_buffer_mapping_with_allocator(&mut [],
+                || panic!("empty read mapped"), || panic!("empty read unmapped"),
+                |_| panic!("empty read allocated")), Ok(()));
         }
     }
     #[test]

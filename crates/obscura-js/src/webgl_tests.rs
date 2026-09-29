@@ -327,8 +327,8 @@ fn real_offscreen_gl_transfer_clears_pixels_preserving_graphics_state() {
       const pixel=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);
       return [Array.from(target.getImageData(0,0,1,1).data),Array.from(pixel),binding,mask,clear,scissor,gl.getError()];
     })"#).unwrap(),json!([
-        [[255,0,0,255],[0,0,0,0],true,[false,true,false,true],[0.0,1.0,0.0,1.0],true,0],
-        [[255,0,0,255],[0,0,0,0],true,[false,true,false,true],[0.0,1.0,0.0,1.0],true,0]
+        [[255,0,0,255],[0,0,0,0],true,[false,true,false,true],[0,1,0,1],true,0],
+        [[255,0,0,255],[0,0,0,0],true,[false,true,false,true],[0,1,0,1],true,0]
     ]));
 }
 
@@ -380,8 +380,8 @@ async fn real_webgl_gc_releases_unbound_resources_without_collecting_bound_buffe
       return gl.getError();
     })()"#
             )
-            .unwrap(),
-        json!(0)
+            .unwrap().as_f64(),
+        Some(0.0)
     );
     async fn collect(runtime: &mut ObscuraJsRuntime, expected: usize) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -604,7 +604,7 @@ async fn queued_loss_from_a_replaced_document_does_not_reach_the_new_document() 
 async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
     require_driver();
     let mut runtime = page();
-    runtime.execute_script("<fixture-setup>", "window.frameLosses=0;window.topLosses=0;document.getElementById('c').addEventListener('webglcontextlost',()=>topLosses++)").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.topLosses=0;document.getElementById('c').addEventListener('webglcontextlost',()=>topLosses++)").unwrap();
     let frame = crate::frame::FrameRealm::new(
         &mut runtime,
         91,
@@ -613,15 +613,19 @@ async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
         "<canvas id='c'></canvas>",
     )
     .unwrap();
-    frame.execute_script(&mut runtime,"const canvas=document.getElementById('c');const gl=canvas.getContext('webgl');if(!gl)throw Error('frame WebGL unavailable');canvas.addEventListener('webglcontextlost',()=>parent.frameLosses++);gl.getExtension('WEBGL_lose_context').loseContext();").unwrap();
+    frame.execute_script(&mut runtime,"const canvas=document.getElementById('c');const gl=canvas.getContext('webgl');if(!gl)throw Error('frame WebGL unavailable');window.frameLosses=0;canvas.addEventListener('webglcontextlost',()=>{frameLosses++;parent.postMessage('webglcontextlost','*')});gl.getExtension('WEBGL_lose_context').loseContext();").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        runtime.evaluate("[frameLosses,topLosses]").unwrap(),
-        json!([1, 0])
-    );
+    // Observe the event in its own realm. The inherited RemoteWindow stub
+    // transports messages but does not forward arbitrary parent properties.
+    assert_eq!(frame.evaluate(&mut runtime, "frameLosses").unwrap(), json!(1));
+    assert_eq!(runtime.evaluate("topLosses").unwrap().as_f64(), Some(0.0));
+    let messages = runtime.take_pending_frame_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].source_frame_id, messages[0].target_frame_id), (91, 0));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&messages[0].data_json).unwrap(), json!("webglcontextlost"));
     let retired = crate::frame::FrameRealm::new(
         &mut runtime,
         92,
@@ -630,7 +634,7 @@ async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
         "<canvas id='c'></canvas>",
     )
     .unwrap();
-    retired.execute_script(&mut runtime,"const canvas=document.getElementById('c');const gl=canvas.getContext('webgl');if(!gl)throw Error('frame WebGL unavailable');canvas.addEventListener('webglcontextlost',()=>parent.frameLosses++);gl.getExtension('WEBGL_lose_context').loseContext();").unwrap();
+    retired.execute_script(&mut runtime,"const canvas=document.getElementById('c');const gl=canvas.getContext('webgl');if(!gl)throw Error('frame WebGL unavailable');window.frameLosses=0;canvas.addEventListener('webglcontextlost',()=>{frameLosses++;parent.postMessage('webglcontextlost','*')});gl.getExtension('WEBGL_lose_context').loseContext();").unwrap();
     let retained_state = {
         let op_state = runtime.js_runtime.op_state();
         let op_state = op_state.borrow();
@@ -644,10 +648,9 @@ async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        runtime.evaluate("[frameLosses,topLosses]").unwrap(),
-        json!([1, 0])
-    );
+    assert_eq!(frame.evaluate(&mut runtime, "frameLosses").unwrap(), json!(1));
+    assert_eq!(runtime.evaluate("topLosses").unwrap().as_f64(), Some(0.0));
+    assert!(runtime.take_pending_frame_messages().is_empty());
 }
 
 #[test]
