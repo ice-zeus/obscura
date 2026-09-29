@@ -464,6 +464,72 @@ fn real_webgl_one_and_two_draw_shaders_and_serialize_canvas_pixels() {
             [2, [255, 0, 0, 255], true, 0, null, [], []]
         ])
     );
+    // Without runtime stealth both versions report the driver identity. With
+    // it, a new document reports its seeded Windows GPU profile and Chrome
+    // version strings, stable across versions, contexts and repeated reads.
+    let plain = webgl_identity_rows(&mut runtime);
+    let (driver_vendor, driver_renderer) = webgl_driver_identity(&runtime);
+    for (row, version) in plain.iter().zip([1, 2, 1, 2]) {
+        assert_eq!(row["unmasked"], json!([driver_vendor, driver_renderer]), "{row}");
+        assert_eq!(row["strings"], json!(["WebKit", "WebKit WebGL",
+            if version == 1 { "WebGL 1.0 (OpenGL ES 2.0)" } else { "WebGL 2.0 (OpenGL ES 3.0)" },
+            if version == 1 { "WebGL GLSL ES 1.00" } else { "WebGL GLSL ES 3.00" }]), "{row}");
+    }
+    runtime.set_stealth(true);
+    runtime.set_platform("Win32", "Windows", "15.0.0");
+    runtime.set_dom(parse_html("<html><body><canvas id='c' width='8' height='8'></canvas></body></html>"));
+    runtime.run_page_init();
+    let masked = webgl_identity_rows(&mut runtime);
+    let (_, driver_renderer) = webgl_driver_identity(&runtime);
+    let profile = masked[0]["unmasked"].clone();
+    let (vendor, renderer) = (profile[0].as_str().unwrap(), profile[1].as_str().unwrap());
+    let gpu = renderer.strip_prefix("ANGLE (").and_then(|rest| rest.split(',').next()).unwrap_or_default();
+    assert!(matches!(gpu, "NVIDIA" | "Intel" | "AMD"), "{renderer}");
+    assert!(renderer.ends_with(" Direct3D11 vs_5_0 ps_5_0, D3D11)"), "{renderer}");
+    assert_eq!(vendor, format!("Google Inc. ({gpu})"));
+    assert_ne!(renderer, driver_renderer);
+    for (row, version) in masked.iter().zip([1, 2, 1, 2]) {
+        assert_eq!(row["unmasked"], profile, "{row}");
+        assert_eq!(row["strings"], json!(["WebKit", "WebKit WebGL",
+            if version == 1 { "WebGL 1.0 (OpenGL ES 2.0 Chromium)" } else { "WebGL 2.0 (OpenGL ES 3.0 Chromium)" },
+            if version == 1 {
+                "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)"
+            } else {
+                "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)"
+            }]), "{row}");
+    }
+    // The extension stays listed, and the disabled-extension query keeps its
+    // null result and INVALID_ENUM in both modes.
+    for row in plain.iter().chain(masked.iter()) {
+        assert_eq!(row["hidden"], json!([null, 1280]), "{row}");
+        assert_eq!(row["listed"], true, "{row}");
+        assert_eq!(row["repeated"], row["unmasked"], "{row}");
+        assert_eq!(row["error"], 0, "{row}");
+    }
+}
+fn webgl_identity_rows(runtime: &mut ObscuraJsRuntime) -> Vec<serde_json::Value> {
+    let rows = runtime.evaluate(r#"(()=>[1,2,1,2].map(version=>{
+      const canvas=document.createElement('canvas');canvas.width=2;canvas.height=2;
+      const gl=canvas.getContext(version===1?'webgl':'webgl2');
+      if(!gl)throw new Error('real WebGL '+version+' unavailable');
+      const hidden=[gl.getParameter(0x9246),gl.getError()];
+      const listed=gl.getSupportedExtensions().includes('WEBGL_debug_renderer_info');
+      const ext=gl.getExtension('WEBGL_debug_renderer_info');
+      const read=()=>[gl.getParameter(ext.UNMASKED_VENDOR_WEBGL),gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)];
+      const unmasked=read();
+      return {hidden,listed,unmasked,repeated:read(),
+        strings:[gl.VENDOR,gl.RENDERER,gl.VERSION,gl.SHADING_LANGUAGE_VERSION].map(name=>gl.getParameter(name)),
+        error:gl.getError()};
+    }))()"#).unwrap();
+    rows.as_array().unwrap().clone()
+}
+fn webgl_driver_identity(runtime: &ObscuraJsRuntime) -> (String, String) {
+    let state = runtime.state.borrow();
+    let mut identities = state.webgl.entries.values()
+        .map(|entry| (entry.context.diagnostics.vendor.clone(), entry.context.diagnostics.renderer.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(identities.len(), 1, "{identities:?}");
+    identities.pop_first().unwrap()
 }
 #[test]
 #[ignore = "mandatory real-driver buffer bounds, ownership, texture and FBO validation"]

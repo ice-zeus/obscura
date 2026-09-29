@@ -4084,11 +4084,12 @@ async fn stealth_fetch_all(
     };
 
     let completion = script_network_completion(
-        response_request_id.clone(), intercepted, current_url.clone(), current_method,
+        response_request_id, intercepted, current_url.clone(), current_method,
         status, resp_headers, &resp_bytes, &resp_body,
     );
+    // The request identity stays in the owned completion for CDP. Unlike the
+    // inherited ordinary path, stealth responses expose no engine property.
     let result = serde_json::json!({
-        "requestId": response_request_id,
         "status": if opaque { 0 } else { status },
         "body": if opaque { String::new() } else { resp_body },
         "bodyBase64": if opaque { String::new() } else { resp_body_base64 },

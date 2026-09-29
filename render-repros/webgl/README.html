@@ -33,9 +33,11 @@ Inspect paired browser screenshots: the quad has four distinct quadrants; the
 triangle center is green over blue; red alpha blends over white; resize remains
 blue; the author-resized placeholder retains red pixels and the SVG is blue at
 300×150. Compare PNG content and screenshot placement before acceptance. Color
-checks permit two byte values for active stealth pixel perturbation; randomness
-is never disabled. The placeholder height records the known fractional CSSOM
-versus device-pixel layout difference rather than claiming exact geometry parity.
+checks allow up to two byte values per channel for rasterization and conversion
+rounding. Stealth applies no WebGL or canvas pixel perturbation, so this
+tolerance is not fingerprint noise, and the harness never disables randomness.
+The placeholder height records the known fractional CSSOM versus device-pixel
+layout difference rather than claiming exact geometry parity.
 This is bounded render evidence, not Khronos, IDL, fingerprint-distribution or
 performance conformance. Generated output belongs outside the repository.
 </pre></html>
