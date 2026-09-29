@@ -629,7 +629,7 @@ impl StealthHttpClient {
         if let Some(user_agent) = self.user_agent_override.read().await.as_ref() {
             headers.insert("user-agent".to_string(), user_agent.clone());
         }
-        crate::client::merge_request_headers(&mut headers, &self.extra_headers.read().await);
+        crate::client::merge_request_headers(&mut headers, &*self.extra_headers.read().await);
         headers
     }
 

@@ -1176,7 +1176,7 @@ impl ObscuraHttpClient {
         if !language.is_empty() {
             headers.insert("accept-language".to_string(), language);
         }
-        merge_request_headers(&mut headers, &self.extra_headers.read().await);
+        merge_request_headers(&mut headers, &*self.extra_headers.read().await);
         headers
     }
 
