@@ -26,6 +26,8 @@ fn replacing_a_document_does_not_reuse_cached_wrappers_or_page_owned_state() {
     })()"#,
         )
         .unwrap();
+    runtime.execute_script("<fixture-hostile-init>",
+        "window.__obscura_init=()=>{throw Error('page-owned initializer');};").unwrap();
     runtime.set_dom(parse_html(markup));
     runtime.run_page_init();
     assert_eq!(runtime.evaluate(r#"(()=>{
@@ -42,6 +44,8 @@ fn repeated_initialization_of_the_same_document_preserves_node_wrappers() {
             r#"(()=>{
       window.savedNode=document.getElementById('target');savedNode.owned=42;window.probes=0;
       savedNode.addEventListener('probe',()=>probes++);
+      window.savedIdentity=[navigator.hardwareConcurrency,navigator.deviceMemory,screen.width,screen.height,performance.timeOrigin];
+      window.__obscura_init=()=>{throw Error('page-owned initializer');};
     })()"#,
         )
         .unwrap();
@@ -51,11 +55,12 @@ fn repeated_initialization_of_the_same_document_preserves_node_wrappers() {
             .evaluate(
                 r#"(()=>{
       const node=document.getElementById('target');node.dispatchEvent(new Event('probe'));
-      return [node===savedNode,node.owned,probes];
+      return [node===savedNode,node.owned,probes,JSON.stringify(savedIdentity)===JSON.stringify(
+        [navigator.hardwareConcurrency,navigator.deviceMemory,screen.width,screen.height,performance.timeOrigin])];
     })()"#
             )
             .unwrap(),
-        json!([true, 42, 1])
+        json!([true, 42, 1, true])
     );
 }
 
@@ -103,7 +108,7 @@ fn replaced_canvas_wrappers_cannot_resize_or_create_contexts_for_reused_node_ids
     let markup = "<canvas id=c width=1 height=1></canvas><canvas id=unused width=1 height=1></canvas>";
     runtime.set_dom(parse_html(markup));
     runtime.run_page_init();
-    runtime.evaluate("window.oldCanvas=document.getElementById('c');window.oldUnused=document.getElementById('unused');window.oldContext=oldCanvas.getContext('2d');oldContext.fillStyle='red';oldContext.fillRect(0,0,1,1)").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.oldCanvas=document.getElementById('c');window.oldUnused=document.getElementById('unused');window.oldContext=oldCanvas.getContext('2d');oldContext.fillStyle='red';oldContext.fillRect(0,0,1,1)").unwrap();
     runtime.set_dom(parse_html(markup));
     runtime.run_page_init();
     assert_eq!(runtime.evaluate(r#"(()=>{
@@ -120,7 +125,7 @@ fn replaced_canvas_wrappers_cannot_resize_or_create_contexts_for_reused_node_ids
 #[test]
 fn canvas_native_ownership_ignores_replaced_node_ids_and_survives_same_document_init() {
     let mut runtime = page();
-    runtime.evaluate("window.first=document.createElement('canvas');first.width=1;first.height=1;window.second=document.createElement('canvas');second.width=2;window.ctx=first.getContext('2d');window.original=first._nid;first._nid=second._nid").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.first=document.createElement('canvas');first.width=1;first.height=1;window.second=document.createElement('canvas');second.width=2;window.ctx=first.getContext('2d');window.original=first._nid;first._nid=second._nid").unwrap();
     assert_eq!(runtime.evaluate(r#"(()=>{
       let rejected=false;try{first.width=8;}catch(e){rejected=e.name==='InvalidStateError';}
       const missing=first.getContext('2d')===null;first._nid=original;
@@ -160,7 +165,7 @@ const PRIVATE_NAMES: &str = r#"[
     '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
     '__obscura_viewport_w', '__obscura_viewport_h', '__obscura_mouse_down',
     '__obscura_mouse_over_target', '__obscura_host_state_handoff',
-    '__obscura_set_screen_override'
+    '__obscura_set_screen_override', '__obscura_init'
 ]"#;
 
 #[test]
@@ -285,7 +290,7 @@ async fn cdp_evaluation_keeps_rejections_private_and_preserves_global_scope() {
         .await
         .unwrap();
     assert!(!result.thrown);
-    assert_eq!(result.value, Some(json!(7)));
+    assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(7.0));
     assert_eq!(
         runtime
             .evaluate("[pageGlobal, window.__obscura_await_rejected, typeof __hostState]")

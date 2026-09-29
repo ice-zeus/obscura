@@ -2577,12 +2577,12 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
-    /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
+    /// Run the private initializer after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_host_expression(
             "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
+            "__hostState.initializeDocument()".to_string(),
         );
     }
 

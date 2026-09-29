@@ -17006,14 +17006,18 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
-globalThis.__obscura_init = function() {
+_hostState.initializeDocument = globalThis.__obscura_init = function() {
+  // The host sets __obscura_frameId on a frame realm before calling this.
+  _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  const documentGeneration = _dom("document_generation");
+  // The public bootstrap hook is deleted after first use. Keep the host's
+  // initializer private so replacement documents still retire old wrappers.
+  // Repeated setup of the same document must preserve its state and entropy.
+  if (_hostState.documentGeneration === documentGeneration) return;
   _hostState.clickTarget = null;
   _hostState.mouseDown = null;
   _hostState.mouseOverTarget = null;
   _hostState.awaitRejected = false;
-  // The host sets __obscura_frameId on a frame realm before calling this.
-  _realmFrameId = globalThis.__obscura_frameId >>> 0;
-  const documentGeneration = _dom("document_generation");
   if (_hostState.documentGeneration !== documentGeneration) {
     // Native node IDs are reused by a newly installed DOM. Its wrappers must
     // not inherit old canvas contexts, event listeners or page-owned fields.

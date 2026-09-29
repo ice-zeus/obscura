@@ -6205,6 +6205,7 @@ mod tests {
                 request_tx.send(path.clone()).unwrap();
                 let (status, body) = match path.as_str() {
                     "/app/before.js" => ("200 OK", "export const value = 'before-first-module';"),
+                    "/app/number.js" => ("200 OK", "export default 7;"),
                     "/app/later.js" => ("200 OK", "export const value = 'later-map';"),
                     "/app/async.js" => (
                         "200 OK",
@@ -7277,11 +7278,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn parser_nomodule_is_boolean_and_does_not_suppress_modules_or_import_maps() {
-        let mut page = import_map_test_page("nomodule-types", "https://nomodule.example", r#"
+        // Use the existing HTTP module path: data: module fetching is an
+        // inherited loader limitation, unrelated to the nomodule decision.
+        let (base, requests) = spawn_parser_import_map_server(1);
+        let mut page = import_map_test_page("nomodule-types", &base, r#"
             <html><head><script>globalThis.runs = [];</script>
             <script id="legacy" nomodule="false">runs.push('legacy')</script>
             <script type="text/javascript" nomodule>runs.push('typed-legacy')</script>
-            <script nomodule type="importmap">{"imports":{"number":"data:text/javascript,export default 7"}}</script>
+            <script nomodule type="importmap">{"imports":{"number":"./number.js"}}</script>
             <script nomodule type="module">import n from 'number'; runs.push(n);</script>
             <script>runs.push('classic')</script></head><body></body></html>"#);
         page.execute_scripts().await;
@@ -7292,6 +7296,7 @@ mod tests {
             document.body.appendChild(s); return runs;
         })()"#).unwrap(), serde_json::json!(["classic", 7]),
             "parser-skipped legacy scripts must remain already started when moved");
+        assert_eq!(requests.try_iter().collect::<Vec<_>>(), vec!["/app/number.js"]);
     }
 
     #[tokio::test(flavor = "current_thread")]

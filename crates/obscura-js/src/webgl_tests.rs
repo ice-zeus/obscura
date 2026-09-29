@@ -195,7 +195,7 @@ fn missing_graphics_libraries_return_null_without_disabling_canvas_2d() {
 #[test]
 fn stale_canvas_epochs_reject_webgl_and_placeholder_creation_before_backend_loading() {
     let mut runtime = page();
-    runtime.evaluate("window.oldCanvas=document.getElementById('c');window.offscreen=new OffscreenCanvas(1,1);window.oldEpoch=__obscura_test_ops.op_canvas_document_epoch(0)").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.oldCanvas=document.getElementById('c');window.offscreen=new OffscreenCanvas(1,1);window.oldEpoch=__obscura_test_ops.op_canvas_document_epoch(0)").unwrap();
     runtime.set_dom(parse_html("<canvas id=c width=1 height=1></canvas>"));runtime.run_page_init();
     assert_eq!(runtime.evaluate(r#"(()=>{
       const ops=__obscura_test_ops,node=document.getElementById('c')._nid;
@@ -498,7 +498,7 @@ fn real_webgl_contexts_drop_on_repeated_document_replacement() {
     let mut runtime = page();
     let mut previous_id=0;
     for _ in 0..32 {
-        assert_eq!(runtime.evaluate(r#"(()=>{const c=document.getElementById('c'),g=c.getContext('webgl2');if(!g)throw Error('WebGL unavailable');for(let i=0;i<16;i++){const b=g.createBuffer();g.bindBuffer(g.ARRAY_BUFFER,b);g.bufferData(g.ARRAY_BUFFER,65536,g.STATIC_DRAW);}return g.getError();})()"#).unwrap(),json!(0));
+        assert_eq!(runtime.evaluate(r#"(()=>{const c=document.getElementById('c'),g=c.getContext('webgl2');if(!g)throw Error('WebGL unavailable');for(let i=0;i<16;i++){const b=g.createBuffer();g.bindBuffer(g.ARRAY_BUFFER,b);g.bufferData(g.ARRAY_BUFFER,65536,g.STATIC_DRAW);}return g.getError();})()"#).unwrap().as_f64(),Some(0.0));
         let current_id=*runtime.state.borrow().webgl.entries.keys().next().unwrap();
         assert!(current_id>previous_id);previous_id=current_id;
         runtime.set_dom(parse_html(
@@ -582,7 +582,7 @@ async fn queued_loss_from_a_replaced_document_does_not_reach_the_new_document() 
         "<html><body><canvas id='c' width='4' height='4'></canvas></body></html>",
     ));
     runtime.run_page_init();
-    runtime.evaluate("window.newGL=document.getElementById('c').getContext('webgl');if(!newGL)throw Error('new context unavailable')").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.newGL=document.getElementById('c').getContext('webgl');if(!newGL)throw Error('new context unavailable')").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop())
         .await
         .unwrap()
@@ -601,7 +601,7 @@ async fn queued_loss_from_a_replaced_document_does_not_reach_the_new_document() 
 async fn frame_loss_delivery_is_scoped_and_teardown_discards_pending_events() {
     require_driver();
     let mut runtime = page();
-    runtime.evaluate("window.frameLosses=0;window.topLosses=0;document.getElementById('c').addEventListener('webglcontextlost',()=>topLosses++)").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.frameLosses=0;window.topLosses=0;document.getElementById('c').addEventListener('webglcontextlost',()=>topLosses++)").unwrap();
     let frame = crate::frame::FrameRealm::new(
         &mut runtime,
         91,
@@ -893,7 +893,7 @@ async fn placeholder_cpu_presentation_updates_layout_without_attribute_mutations
     assert!(obscura_render::image_pixels::decode_image_rgba(&png, &mut pixels));
     assert_eq!(&pixels[(16+2)*4..(16+2)*4+4], &[255,0,0,255]);
     assert_eq!(&pixels[(16+5)*4..(16+5)*4+4], &[255,255,255,255]);
-    runtime.evaluate("placeholder.setAttribute('width','90');offscreen.width=0").unwrap();
+    runtime.execute_script("<fixture-setup>", "placeholder.setAttribute('width','90');offscreen.width=0").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
     assert_eq!(runtime.evaluate(r#"(()=>{const r=placeholder.getBoundingClientRect();return [r.width,r.height,
       placeholder.width,placeholder.toDataURL(),attributeRecords.length];})()"#).unwrap(), json!([0,2,90,"data:,",1]));
@@ -937,9 +937,9 @@ async fn placeholder_navigation_and_frame_teardown_release_snapshots_and_pending
     assert!(retained.borrow().webgl_surfaces.is_empty());
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
     assert!(retained.borrow().webgl_surfaces.is_empty());
-    assert_eq!(runtime.evaluate("latePlaceholderBlob").unwrap(), json!(0));
+    assert_eq!(runtime.evaluate("latePlaceholderBlob").unwrap().as_f64(), Some(0.0));
     for _ in 0..3 {
-        runtime.evaluate("window.oldPlaceholder=document.getElementById('c');window.oldOffscreen=oldPlaceholder.transferControlToOffscreen();oldOffscreen.getContext('2d').fillRect(0,0,1,1)").unwrap();
+        runtime.execute_script("<fixture-setup>", "window.oldPlaceholder=document.getElementById('c');window.oldOffscreen=oldPlaceholder.transferControlToOffscreen();oldOffscreen.getContext('2d').fillRect(0,0,1,1)").unwrap();
         runtime.set_dom(parse_html("<canvas id=c width=3 height=2></canvas>"));
         runtime.run_page_init();
         tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
@@ -1021,7 +1021,7 @@ async fn real_placeholder_keeps_presented_pixels_after_its_gl_owner_is_collected
         tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
         assert_eq!(runtime.state.borrow().webgl.entries.len(),1);
         assert_eq!(runtime.state.borrow().webgl_surfaces.len(),1);
-        runtime.evaluate("window.presentedPNG=placeholder.toDataURL();window.offscreen=null").unwrap();
+        runtime.execute_script("<fixture-setup>", "window.presentedPNG=placeholder.toDataURL();window.offscreen=null").unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 {
@@ -1093,7 +1093,7 @@ fn image_data_private_color_state_and_canvas_conversion_need_no_graphics_context
 #[test]
 fn image_data_private_brand_survives_a_same_origin_realm_boundary() {
     let mut runtime=page();
-    runtime.evaluate("window.parentPixels=new ImageData(new Uint8ClampedArray([128,64,32,255]),1,1,{colorSpace:'display-p3'});Object.defineProperty(parentPixels,'data',{get(){throw Error('page getter');}})").unwrap();
+    runtime.execute_script("<fixture-setup>", "window.parentPixels=new ImageData(new Uint8ClampedArray([128,64,32,255]),1,1,{colorSpace:'display-p3'});Object.defineProperty(parentPixels,'data',{get(){throw Error('page getter');}})").unwrap();
     let frame=crate::frame::FrameRealm::new(&mut runtime,71,0,"https://graphics.example/frame","<html><body></body></html>").unwrap();
     assert_eq!(frame.evaluate(&mut runtime,r#"(()=>{
       const ctx=new OffscreenCanvas(1,1).getContext('2d');ctx.putImageData(parent.parentPixels,0,0);
