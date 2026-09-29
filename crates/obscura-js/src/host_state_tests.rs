@@ -390,3 +390,38 @@ fn fresh_navigation_runtime_does_not_retain_a_previous_click_target() {
         json!("undefined")
     );
 }
+
+#[test]
+fn attribute_mutation_records_preserve_old_values_filters_namespaces_and_single_delivery() {
+    let mut runtime = page();
+    assert_eq!(runtime.evaluate(r#"(() => {
+      const parent=document.createElement('div'),target=document.createElement('span');
+      parent.appendChild(target);document.body.appendChild(parent);
+      target.setAttribute('data-present','old');
+      const old=new MutationObserver(()=>{}),fresh=new MutationObserver(()=>{});
+      const filtered=new MutationObserver(()=>{}),overlap=new MutationObserver(()=>{});
+      old.observe(target,{attributes:true,attributeOldValue:true});
+      fresh.observe(target,{attributes:true,attributeOldValue:false});
+      filtered.observe(target,{attributeOldValue:true,attributeFilter:['data-a']});
+      overlap.observe(parent,{attributes:true,subtree:true,attributeOldValue:true});
+      overlap.observe(target,{attributes:true});
+      target.setAttribute('data-present','new');
+      target.setAttribute('data-a','');target.setAttribute('data-a','');target.setAttribute('data-a','next');
+      target.removeAttribute('data-a');target.removeAttribute('data-a');
+      target.setAttributeNS('urn:fixture','p:item','one');target.setAttributeNS('urn:fixture','q:item','two');
+      target.removeAttributeNS('urn:fixture','item');target.removeAttributeNS('urn:fixture','item');
+      target.setAttributeNS(null,'data-a','v');target.removeAttributeNS(null,'data-a');
+      const a=old.takeRecords(),b=fresh.takeRecords(),c=filtered.takeRecords(),d=overlap.takeRecords();
+      return [a.map(r=>[r.attributeName,r.attributeNamespace,r.oldValue]),
+        b.map(r=>r.oldValue),c.map(r=>r.oldValue),d.map(r=>r.oldValue),a.every((r,i)=>r!==b[i]),
+        [old,fresh,filtered,overlap].every(o=>o.takeRecords().length===0)];
+    })()"#).unwrap(), json!([
+        [["data-present",null,"old"],["data-a",null,null],["data-a",null,""],
+         ["data-a",null,""],["data-a",null,"next"],["item","urn:fixture",null],
+         ["item","urn:fixture","one"],["item","urn:fixture","two"],
+         ["data-a",null,null],["data-a",null,"v"]],
+        [null,null,null,null,null,null,null,null,null,null],
+        [null,"","","next",null,"v"],
+        ["old",null,"","","next",null,"one","two",null,"v"],true,true
+    ]));
+}

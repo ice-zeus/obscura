@@ -871,7 +871,7 @@ async fn bitmap_taint_propagates_through_canvas_copies_and_resets_only_with_pixe
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn placeholder_cpu_presentation_updates_layout_without_attribute_mutations() {
+async fn placeholder_cpu_presentation_updates_layout_and_attributes_at_frame_boundary() {
     let mut runtime = page();
     runtime.set_viewport(16.0, 16.0);
     assert_eq!(runtime.evaluate(r#"(()=>{
@@ -886,17 +886,23 @@ async fn placeholder_cpu_presentation_updates_layout_without_attribute_mutations
     })()"#).unwrap(), json!([2,1,2,1]));
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
     assert_eq!(runtime.evaluate(r#"(()=>{const rect=placeholder.getBoundingClientRect();return [rect.width,rect.height,
-      placeholder.getAttribute('width'),placeholder.getAttribute('height'),attributeRecords.length];})()"#).unwrap(), json!([4,2,"2","1",0]));
+      placeholder.getAttribute('width'),placeholder.getAttribute('height'),attributeRecords.length];})()"#).unwrap(), json!([4,2,"4","2",2]));
     let png = runtime.screenshot_unprepared_with_retained_resources((16.0,16.0),
         Some("https://graphics.example/"), (0.0,0.0), Default::default(), [255;4]).unwrap();
     let mut pixels = vec![0;16*16*4];
     assert!(obscura_render::image_pixels::decode_image_rgba(&png, &mut pixels));
     assert_eq!(&pixels[(16+2)*4..(16+2)*4+4], &[255,0,0,255]);
     assert_eq!(&pixels[(16+5)*4..(16+5)*4+4], &[255,255,255,255]);
-    runtime.execute_script("<fixture-setup>", "placeholder.setAttribute('width','90');offscreen.width=0").unwrap();
+    assert_eq!(runtime.evaluate(r#"(()=>{
+      const pixels=placeholder.toDataURL(),before=Array.from(offscreen2d.getImageData(0,0,1,1).data);
+      placeholder.setAttribute('width','90');
+      return [placeholder.width,offscreen.width,placeholder.toDataURL()===pixels,
+        Array.from(offscreen2d.getImageData(0,0,1,1).data),before];
+    })()"#).unwrap(),json!([90,4,true,[255,0,0,255],[255,0,0,255]]));
+    runtime.execute_script("<fixture-setup>", "offscreen.width=0").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
     assert_eq!(runtime.evaluate(r#"(()=>{const r=placeholder.getBoundingClientRect();return [r.width,r.height,
-      placeholder.width,placeholder.toDataURL(),attributeRecords.length];})()"#).unwrap(), json!([0,2,90,"data:,",1]));
+      placeholder.width,placeholder.toDataURL(),attributeRecords.length];})()"#).unwrap(), json!([0,2,0,"data:,",5]));
     assert!(runtime.state.borrow().canvas_surfaces.is_empty());
 }
 
@@ -1152,4 +1158,48 @@ async fn real_placeholder_color_preserves_source_gamut_across_presentation_and_l
     assert_eq!(runtime.evaluate("widePlaceholders.map(item=>item.canvas.toDataURL()===item.png)").unwrap(),json!([true,true]));
     assert!(runtime.state.borrow().webgl_surfaces.values().all(|(_,_,pixels)|pixels==&[255,0,0,255]));
     runtime.set_dom(parse_html("<body></body>"));assert!(runtime.state.borrow().webgl_surfaces.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn placeholder_publication_waits_for_a_frame_and_preserves_author_attributes_until_damage() {
+    let mut runtime=page();
+    runtime.execute_script("<placeholder-frame-fixture>",r#"
+      window.frameResults=null;
+      (async()=>{
+        const results=[];
+        for(const mode of ['none','context-only','draw']){
+          const c=document.createElement('canvas');c.width=13;c.height=7;document.body.appendChild(c);
+          const off=c.transferControlToOffscreen(),records=[];
+          const observer=new MutationObserver(batch=>records.push(...batch.map(r=>[r.attributeName,r.oldValue])));
+          observer.observe(c,{attributes:true,attributeOldValue:true});
+          const ctx=mode==='none'?null:off.getContext('2d');
+          const checkpoints=[];
+          const snapshot=()=>[c.width,c.height,off.width,off.height,records.slice()];
+          off.width=30;off.height=10;if(mode==='draw')ctx.fillRect(0,0,1,1);
+          checkpoints.push(snapshot());await Promise.resolve();checkpoints.push(snapshot());
+          await new Promise(resolve=>setTimeout(resolve,0));checkpoints.push(snapshot());
+          await new Promise(requestAnimationFrame);checkpoints.push(snapshot());
+          c.setAttribute('width','90');await Promise.resolve();checkpoints.push(snapshot());
+          if(ctx)ctx.fillRect(0,0,1,1);
+          await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);checkpoints.push(snapshot());
+          if(ctx){off.width=30;await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);}
+          checkpoints.push(snapshot());
+          let setter;try{c.width=91;setter='allowed';}catch(e){setter=e.name;}
+          results.push([mode,checkpoints,setter]);observer.disconnect();
+        }
+        frameResults=results;
+      })().catch(error=>{frameResults=String(error);});
+    "#).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),runtime.run_event_loop()).await.unwrap().unwrap();
+    let mut expected=Vec::new();
+    for mode in ["none","context-only","draw"] {
+        let initial=json!([13,7,30,10,[]]);
+        let first=if mode=="none" {initial.clone()} else {json!([30,10,30,10,[["width","13"],["height","7"]]])};
+        let author=if mode=="none" {json!([90,7,30,10,[["width","13"]]])}
+          else {json!([90,10,30,10,[["width","13"],["height","7"],["width","30"]]])};
+        let redrawn=if mode=="none" {author.clone()}
+          else {json!([30,10,30,10,[["width","13"],["height","7"],["width","30"],["width","90"],["height","10"]]])};
+        expected.push(json!([mode,[initial.clone(),initial.clone(),initial,first,author,redrawn.clone(),redrawn],"InvalidStateError"]));
+    }
+    assert_eq!(runtime.evaluate("frameResults").unwrap(),json!(expected));
 }

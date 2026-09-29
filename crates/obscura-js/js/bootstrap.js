@@ -1096,9 +1096,11 @@ let _rafFrameScheduled = false;
 let _rafRunningFrame = false;
 let _renderOpportunityScheduled = false;
 let _renderOpportunityRunning = false;
+let _canvasPresentationPending = false;
+let _runCanvasPresentation = () => { _canvasPresentationPending = false; };
 
 function _renderOpportunityHasWork() {
-  return _rafFrameScheduled || _resizeRenderCheckpointPending
+  return _canvasPresentationPending || _rafFrameScheduled || _resizeRenderCheckpointPending
     || _intersectionRenderCheckpointPending;
 }
 
@@ -1123,6 +1125,9 @@ function _runRenderingOpportunity() {
   _renderOpportunityScheduled = false;
   _renderOpportunityRunning = true;
   try {
+    // Offscreen snapshots publish before the document's frame callbacks, so
+    // dimensions, observer records and pixels share one rendering boundary.
+    if (_canvasPresentationPending) _runCanvasPresentation();
     if (_rafFrameScheduled) _runAnimationFrameBatch();
     if (_resizeRenderCheckpointPending) _runResizeRenderCheckpoint();
     if (_intersectionRenderCheckpointPending) _runIntersectionRenderCheckpoint();
@@ -14856,7 +14861,7 @@ class _Canvas2D {
 }
 
 let _webglCreate = () => null, _webglHas = () => false, _webglResize = () => {}, _webglReadback = () => null;
-let _placeholderHas = () => false, _placeholderPixels = () => null, _placeholderBlob, _transferOffscreen;
+let _placeholderHas = () => false, _placeholderPixels = () => null, _placeholderBlob, _transferOffscreen, _reflectCanvasDimensions;
 /* @obscura-webgl */
 
 class HTMLCanvasElement extends Element {
@@ -14899,6 +14904,21 @@ class HTMLCanvasElement extends Element {
   }
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
+
+const _canvasAttributeSetter = Element.prototype.setAttribute;
+_reflectCanvasDimensions = (canvas, width, height) => {
+  const owner = _requireCanvasOwner(canvas);
+  const dimension = (name, fallback) => {
+    const raw = _domParse('get_attribute', owner.node, name);
+    const parsed = raw === null ? fallback : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  // A changed displayed size replaces both attributes, including a
+  // same-valued opposite axis. Same-sized frames do not mutate attributes.
+  if (dimension('width', 300) === width && dimension('height', 150) === height) return;
+  _canvasAttributeSetter.call(canvas, 'width', width);
+  _canvasAttributeSetter.call(canvas, 'height', height);
+};
 
 HTMLCanvasElement.prototype.getContext = function getContext(type, options = undefined) {
   if (!_canvasDOMOwner(this)) return null;
