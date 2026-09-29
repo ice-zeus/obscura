@@ -21,7 +21,8 @@ class DependencyRecipeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Match the production CLI's canonical work/output paths on macOS too.
+        self.root = Path(self.temp.name).resolve()
         self.work, self.output = self.root / "work", self.root / "bundle"
 
     def test_gn_backends_have_explicit_headless_and_platform_gates(self):
