@@ -124,7 +124,32 @@
   }
   function call(s, kind, value, bytes = empty) {
     const operation = value === undefined ? {kind} : {kind, value};
+    let sharedDestination = null;
+    if (bytes !== empty) {
+      try { arrayBufferLength.call(byteBuffer.call(bytes)); }
+      catch {
+        // Never expose concurrently shared storage as a Rust mutable slice.
+        // Check the native budget before allocating; ordinary buffers stay zero-copy.
+        if (byteLength.call(bytes) > maxTransferBytes) { error(s,0x0505); return {type:'none'}; }
+        if (kind === 'readPixels' || kind === 'bufferRead') sharedDestination = bytes;
+        try { bytes = new NativeBytes(bytes); }
+        catch { error(s,0x0505); return {type:'none'}; }
+      }
+    }
     const reply = __obscuraCore.ops.op_webgl_call(s.frame, s.id, operation, bytes);
+    if (sharedDestination && !reply.lost) {
+      // A failed read has no copyback, including a concurrent writer's changes.
+      // Pixel packing also leaves skipped rows, padding and trailing bytes alone.
+      if (kind === 'bufferRead' && reply.value?.type === 'boolean' && reply.value.value === true)
+        byteSet.call(sharedDestination,bytes);
+      if (kind === 'readPixels' && reply.value?.type === 'pixelRead' && reply.value.value) {
+        const {start,stride,rows,row_bytes} = reply.value.value;
+        for (let row=0;row<rows;row++) {
+          const offset=start+row*stride;
+          byteSet.call(sharedDestination,byteSubarray.call(bytes,offset,offset+row_bytes),offset);
+        }
+      }
+    }
     if (reply.lost) notifyLoss(s);
     s.lost = reply.lost;
     if (reply.lost) return lostReply(s, kind, value);
@@ -330,14 +355,20 @@
   function query(s, method, args) { return retainedQuery(s, method, args, call(s, 'query', {method,args}).value); }
   function resource(s, method, args, bytes) { call(s, 'resource', {command:{method,args},has_data:bytes !== undefined}, bytes || empty); }
   const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get;
-  const sharedBufferLength = typeof SharedArrayBuffer === 'function'
-    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype,'byteLength').get : null;
+  const NativeDataView = DataView, NativeBytes = Uint8Array;
+  const bytePrototype = Object.getPrototypeOf(Uint8Array.prototype);
+  const byteBuffer = Object.getOwnPropertyDescriptor(bytePrototype,'buffer').get;
+  const byteLength = Object.getOwnPropertyDescriptor(bytePrototype,'byteLength').get;
+  const byteSet = bytePrototype.set, byteSubarray = bytePrototype.subarray;
+  const maxTransferBytes = 256 * 1024 * 1024; // Same bound as native pixels::MAX_TRANSFER_BYTES.
   function isBuffer(value) {
     if (value === null || typeof value !== 'object') return false;
     // Intrinsic getters test internal slots across realms, without trusting
     // instanceof or a page-controlled Symbol.toStringTag.
     try { arrayBufferLength.call(value); return true; } catch {}
-    if (sharedBufferLength) { try { sharedBufferLength.call(value); return true; } catch {} }
+    // SharedArrayBuffer may be exposed only after restoring the V8 snapshot.
+    // DataView checks buffer internal slots without invoking user coercion.
+    try { new NativeDataView(value,0,0); return true; } catch {}
     return false;
   }
   function bufferSize(value, unsigned = false) {

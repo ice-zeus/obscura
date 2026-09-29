@@ -50,6 +50,15 @@ pub struct ReadPixels {
     pub data_type: u32,
 }
 
+/// Bounded copyback receipt for shared destinations; excludes pack padding.
+#[derive(Debug, serde::Serialize)]
+pub struct PixelReadLayout {
+    pub start: usize,
+    pub stride: usize,
+    pub rows: usize,
+    pub row_bytes: usize,
+}
+
 pub(crate) fn pixel_size(format: u32, data_type: u32, version: u8) -> Result<usize, u32> {
     let channels = match format {
         glow::ALPHA | glow::LUMINANCE => 1,
@@ -527,11 +536,16 @@ impl CanvasContext {
         Ok(())
     }
     pub fn read_pixels(&mut self, request: ReadPixels, destination: &mut [u8]) {
+        let _ = self.read_pixels_with_layout(request, destination);
+    }
+    /// Internal bridge completion receipt; caller errors stay observable.
+    #[doc(hidden)]
+    pub fn read_pixels_with_layout(&mut self, request: ReadPixels, destination: &mut [u8]) -> Option<PixelReadLayout> {
         if !self.activate() {
-            return;
+            return None;
         }
-        if self.drawing_storage.is_some() { self.retain_driver_errors(); }
-        if self.is_lost() { return; }
+        self.retain_driver_errors();
+        if self.is_lost() { return None; }
         let result = (|| {
             let ReadPixels {
                 x,
@@ -549,7 +563,7 @@ impl CanvasContext {
             } else {
                 self.pixel_size(format, data_type)?
             };
-            let (_, end, _) = self.transfer_bounds(width, height, 1, bpp, true, false)?;
+            let (start, end, stride) = self.transfer_bounds(width, height, 1, bpp, true, false)?;
             if destination.len() < end {
                 return Err(glow::INVALID_OPERATION);
             }
@@ -574,11 +588,14 @@ impl CanvasContext {
                     data_type,
                     PixelPackData::Slice(Some(destination)),
                 );
+                let error = gl.get_error();
+                if error != glow::NO_ERROR { return Err(error); }
             }
-            Ok(())
+            Ok(PixelReadLayout { start, stride, rows: if width == 0 { 0 } else { height as usize }, row_bytes: width as usize * bpp })
         })();
-        if let Err(error) = result {
-            self.graphics_error(error);
+        match result {
+            Ok(layout) => Some(layout),
+            Err(error) => { self.graphics_error(error); None }
         }
     }
     pub fn read_pixels_to_buffer(&mut self, request: ReadPixels, offset: u32) {
