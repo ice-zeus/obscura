@@ -839,3 +839,57 @@ test('ImageData from another realm retains private branding and real typed-array
   const upload=bitmapUpload(second,image);assert.deepEqual(upload.data,[13,27,41,255]);assert.equal(upload.operation.value.source_space,'display-p3');
   const copy=await bitmap(second,image);assert.deepEqual(bitmapUpload(second,copy).data,[13,27,41,255]);copy.close();
 });
+
+test('bufferData numeric overload follows WebIDL coercion and propagates exceptions',()=>{
+  const f=fixture();
+  for(const version of [1,2]){
+    const gl=version===1?f.gl:f.sandbox._webglCreate(new f.sandbox.HTMLCanvasElement(),'webgl2',{});
+    for(const [value,size] of [['4',4],['5.8',5],[[42],42],[[42,64],0],[{},0],[true,1],[NaN,0],[Infinity,0],[-Infinity,0],[2**64,0],[-(2**64),0],[{valueOf(){return 6;}},6]]){
+      gl.bufferData(gl.ARRAY_BUFFER,value,gl.STATIC_DRAW);
+      assert.equal(f.calls.at(-1).operation.value.command.args.size,size);
+      assert.deepEqual(f.calls.at(-1).data,[]);
+    }
+    const before=f.calls.length;gl.bufferData(gl.ARRAY_BUFFER,2**63,gl.STATIC_DRAW);
+    assert.equal(gl.getError(),gl.INVALID_VALUE);
+    assert.equal(f.calls.slice(before).filter(call=>call.operation?.kind==='resource').length,0);
+    gl.bufferData(gl.ARRAY_BUFFER,2**64-2048,gl.STATIC_DRAW);
+    assert.equal(f.calls.at(-1).operation.value.command.args.size,-2048);
+    const order=[];gl.bufferData({valueOf(){order.push('target');return gl.ARRAY_BUFFER;}},{valueOf(){order.push('data');return 4;}},{valueOf(){order.push('usage');return gl.STATIC_DRAW;}});
+    assert.deepEqual(order,['target','data','usage']);
+    for(const value of [Symbol(),4n])assert.throws(()=>gl.bufferData(gl.ARRAY_BUFFER,value,gl.STATIC_DRAW),{name:'TypeError'});
+    const failure=new RangeError('fixture coercion');assert.throws(()=>gl.bufferData(gl.ARRAY_BUFFER,{valueOf(){throw failure;}},gl.STATIC_DRAW),error=>error===failure);
+    for(const value of [null,undefined]){gl.bufferData(gl.ARRAY_BUFFER,value,gl.STATIC_DRAW);assert.equal(gl.getError(),gl.INVALID_VALUE);}
+  }
+});
+test('bufferData accepts intrinsic cross-realm and shared buffers without trusting tags',()=>{
+  const f=fixture();
+  const foreign=vm.runInNewContext('new Uint8Array([9,8,7]).buffer');
+  const shared=new SharedArrayBuffer(3);new Uint8Array(shared).set([6,5,4]);
+  for(const value of [foreign,shared,new Uint8Array(shared),new DataView(shared)]){
+    f.gl.bufferData(f.gl.ARRAY_BUFFER,value,f.gl.STATIC_DRAW);
+    assert.deepEqual(f.calls.at(-1).data,Array.from(new Uint8Array(value.buffer||value,value.byteOffset||0,value.byteLength)));
+    f.gl.bufferSubData(f.gl.ARRAY_BUFFER,0,value);assert.equal(f.calls.at(-1).data.length,3);
+  }
+  f.gl.bufferData(f.gl.ARRAY_BUFFER,{[Symbol.toStringTag]:'ArrayBuffer',valueOf(){return 4;}},f.gl.STATIC_DRAW);
+  assert.equal(f.calls.at(-1).operation.value.command.args.size,4);assert.deepEqual(f.calls.at(-1).data,[]);
+});
+test('bufferData selects WebGL2 range overload by argument count and WebGL1 ignores extras',()=>{
+  const f=fixture(),g=f.sandbox._webglCreate(new f.sandbox.HTMLCanvasElement(),'webgl2',{});
+  const bytes=new Uint8Array([1,2,3,4]);
+  for(const value of [4,'4',bytes.buffer,bytes]){
+    f.gl.bufferData(f.gl.ARRAY_BUFFER,value,f.gl.STATIC_DRAW,1,1);
+    assert.equal(f.calls.at(-1).operation.value.command.args.size,4);
+  }
+  for(const value of [4,'4',bytes.buffer,null,undefined]){
+    assert.throws(()=>g.bufferData(g.ARRAY_BUFFER,value,g.STATIC_DRAW,undefined),{name:'TypeError'});
+  }
+  g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,1,2);assert.deepEqual(f.calls.at(-1).data,[2,3]);
+  g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,undefined);assert.deepEqual(f.calls.at(-1).data,[1,2,3,4]);
+  g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,99);assert.equal(g.getError(),g.INVALID_VALUE);
+  const order=[];
+  g.bufferData({valueOf(){order.push('target');return g.ARRAY_BUFFER;}},bytes,{valueOf(){order.push('usage');return g.STATIC_DRAW;}},{valueOf(){order.push('offset');return 1;}},{valueOf(){order.push('length');return 2;}});
+  assert.deepEqual(order,['target','usage','offset','length']);assert.deepEqual(f.calls.at(-1).data,[2,3]);
+  assert.throws(()=>g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,1n),{name:'TypeError'});
+  g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,2**64);assert.deepEqual(f.calls.at(-1).data,[1,2,3,4]);
+  g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,-1);assert.equal(g.getError(),g.INVALID_VALUE);
+});
