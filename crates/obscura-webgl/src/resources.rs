@@ -58,6 +58,23 @@ pub(crate) fn checked_range(offset: i64, length: usize, size: i64) -> Result<(),
     }
 }
 
+// A failed mapping must not dereference a null pointer, unmap somebody else's
+// mapping, or modify the caller's destination. Publish bytes only after the
+// driver's successful unmap confirms that the mapped contents remained valid.
+unsafe fn copy_buffer_mapping(
+    destination: &mut [u8],
+    map: impl FnOnce() -> *const u8,
+    unmap: impl FnOnce() -> bool,
+) -> Result<(), u32> {
+    if destination.is_empty() { return Ok(()); }
+    let pointer = map();
+    if pointer.is_null() { return Err(glow::INVALID_OPERATION); }
+    let bytes = std::slice::from_raw_parts(pointer,destination.len()).to_vec();
+    if !unmap() { return Err(glow::INVALID_OPERATION); }
+    destination.copy_from_slice(&bytes);
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(
     tag = "method",
@@ -542,6 +559,9 @@ impl CanvasContext {
         if !self.activate() {
             return;
         }
+        // Preserve older page errors before checking internal mapping errors.
+        self.retain_driver_errors();
+        if self.is_lost() { return; }
         let result = (|| {
             if self.version != 2 {
                 return Err(glow::INVALID_OPERATION);
@@ -549,17 +569,41 @@ impl CanvasContext {
             if !valid_buffer_target(target, 2) {
                 return Err(glow::INVALID_ENUM);
             }
-            let gl = &self.driver.as_ref().unwrap().gl;
+            let driver = self.driver.as_ref().unwrap();
+            let gl = &driver.gl;
             unsafe {
-                checked_range(
-                    offset,
-                    destination.len(),
-                    i64::from(gl.get_buffer_parameter_i32(target, glow::BUFFER_SIZE)),
-                )?;
-                if offset > i32::MAX as i64 {
+                let binding = match target {
+                    glow::ARRAY_BUFFER => glow::ARRAY_BUFFER_BINDING,
+                    glow::ELEMENT_ARRAY_BUFFER => glow::ELEMENT_ARRAY_BUFFER_BINDING,
+                    glow::COPY_READ_BUFFER => glow::COPY_READ_BUFFER_BINDING,
+                    glow::COPY_WRITE_BUFFER => glow::COPY_WRITE_BUFFER_BINDING,
+                    glow::PIXEL_PACK_BUFFER => glow::PIXEL_PACK_BUFFER_BINDING,
+                    glow::PIXEL_UNPACK_BUFFER => glow::PIXEL_UNPACK_BUFFER_BINDING,
+                    glow::TRANSFORM_FEEDBACK_BUFFER => glow::TRANSFORM_FEEDBACK_BUFFER_BINDING,
+                    glow::UNIFORM_BUFFER => glow::UNIFORM_BUFFER_BINDING,
+                    _ => unreachable!("validated buffer target"),
+                };
+                if gl.get_parameter_buffer(binding).is_none() {
+                    return Err(glow::INVALID_OPERATION);
+                }
+                checked_range(offset, destination.len(),
+                    i64::from(gl.get_buffer_parameter_i32(target, glow::BUFFER_SIZE)))?;
+                if offset > i32::MAX as i64 || destination.len() > i32::MAX as usize {
                     return Err(glow::INVALID_VALUE);
                 }
-                gl.get_buffer_sub_data(target, offset as i32, destination);
+                // glGetBufferSubData is desktop GL, not GLES. WebGL2 reads use
+                // GLES3 mapping while leaving the page's target binding intact.
+                type Map = unsafe extern "C" fn(u32,isize,isize,u32) -> *const u8;
+                type Unmap = unsafe extern "C" fn(u32) -> u8;
+                let map: Map = driver.entry(c"glMapBufferRange")?;
+                let unmap: Unmap = driver.entry(c"glUnmapBuffer")?;
+                let length = destination.len();
+                if let Err(fallback) = copy_buffer_mapping(destination,
+                    || map(target,offset as isize,length as isize,glow::MAP_READ_BIT),
+                    || unmap(target) != 0) {
+                    let error = gl.get_error();
+                    return Err(if error == glow::NO_ERROR {fallback} else {error});
+                }
             }
             Ok(())
         })();
@@ -571,6 +615,24 @@ impl CanvasContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffer_mapping_failures_preserve_destination_and_only_unmap_acquired_memory() {
+        use std::cell::Cell;
+        let source=[1,2,3,4];let mut destination=[9;4];let unmapped=Cell::new(0);
+        unsafe {
+            assert_eq!(copy_buffer_mapping(&mut destination, std::ptr::null,
+                || {unmapped.set(unmapped.get()+1);true}),Err(glow::INVALID_OPERATION));
+            assert_eq!(destination,[9;4]);assert_eq!(unmapped.get(),0);
+            assert_eq!(copy_buffer_mapping(&mut destination, || source.as_ptr(),
+                || {unmapped.set(unmapped.get()+1);false}),Err(glow::INVALID_OPERATION));
+            assert_eq!(destination,[9;4]);assert_eq!(unmapped.get(),1);
+            assert_eq!(copy_buffer_mapping(&mut destination, || source.as_ptr(),
+                || {unmapped.set(unmapped.get()+1);true}),Ok(()));
+            assert_eq!(destination,source);assert_eq!(unmapped.get(),2);
+            assert_eq!(copy_buffer_mapping(&mut [], || panic!("empty read mapped"),
+                || panic!("empty read unmapped")),Ok(()));
+        }
+    }
     #[test]
     fn buffer_ranges_reject_overflow_and_allow_empty_end_slice() {
         assert_eq!(checked_range(4, 0, 4), Ok(()));

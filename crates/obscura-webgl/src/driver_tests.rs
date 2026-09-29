@@ -419,6 +419,9 @@ unsafe fn pixel(context: &Context) -> [u8; 4] {
 fn real_webgl1_and_webgl2_buffers_start_zero_and_render_clear() {
     for version in [1, 2] {
         let context = context(version);
+        assert!(context.proc_address(c"glGetBufferSubData").is_null(),
+            "desktop GL symbols must not escape ANGLE's procedure table");
+        assert!(!context.proc_address(c"glClear").is_null());
         unsafe {
             assert_eq!(pixel(&context), [0, 0, 0, 0]);
             context.gl.clear_color(0.0, 1.0, 0.0, 1.0);
