@@ -13190,13 +13190,14 @@ mod tests {
             #left {width:200px;--size:20px;color:red}
             #right {width:70px;--size:40px;color:blue}
             #item {width:var(--size);height:20px;background:currentColor}
-            @container (min-width:100px) {#item {width:100px}}
+            @container (min-width:100px) {#item, #kept {width:100px}}
             </style><div id=left class=container><div id=item><span id=leaf>text</span></div></div>
-            <div id=right class=container></div>"#);
+            <div id=right class=container><div id=kept></div></div>"#);
         let left = tree.get_element_by_id("left").unwrap();
         let right = tree.get_element_by_id("right").unwrap();
         let item = tree.get_element_by_id("item").unwrap();
         let leaf = tree.get_element_by_id("leaf").unwrap();
+        let kept = tree.get_element_by_id("kept").unwrap();
         let mut case = QuerySeedCase::new(Default::default(), Default::default());
         case.flush(&tree, &[], 0.0);
         assert!(case.previous.as_ref().unwrap().query_seed.is_some());
@@ -13217,6 +13218,23 @@ mod tests {
         let current = case.previous.as_ref().unwrap();
         assert_eq!(current.layout.styles[&item].width, crate::Dimension::Px(100.0));
         assert_eq!(current.query_seed.as_ref().unwrap().styles[&item].width, crate::Dimension::Px(20.0));
+
+        // With the last matching subject removed, upstream skips the query
+        // passes entirely. No retained seed is needed on that path.
+        tree.remove_child(kept);
+        tree.remove_child(item);
+        case.flush(&tree, &[
+            crate::dom::TreeStyleMutation::Remove {node:kept, old_parent:right}.into(),
+            crate::dom::TreeStyleMutation::Remove {node:item, old_parent:left}.into(),
+        ], 4.0);
+        assert!(case.previous.as_ref().unwrap().query_seed.is_none());
+        tree.append_child(right, item);
+        case.flush(&tree, &[crate::dom::TreeStyleMutation::Insert {
+            node:item, old_parent:None, new_parent:right,
+        }.into()], 5.0);
+        let current = case.previous.as_ref().unwrap();
+        assert_eq!(current.layout.styles[&item].width, crate::Dimension::Px(40.0));
+        assert_eq!(current.query_seed.as_ref().unwrap().styles[&item].width, crate::Dimension::Px(40.0));
     }
 
     #[test]
