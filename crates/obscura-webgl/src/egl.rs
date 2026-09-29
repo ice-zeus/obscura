@@ -39,6 +39,7 @@ egl_functions! {
     create_pbuffer: "eglCreatePbufferSurface" (Handle,Handle,*const Int) -> Handle;
     destroy_surface: "eglDestroySurface" (Handle,Handle) -> u32;
     make_current: "eglMakeCurrent" (Handle,Handle,Handle,Handle) -> u32;
+    swap_buffers: "eglSwapBuffers" (Handle,Handle) -> u32;
     query_string: "eglQueryString" (Handle,Int) -> *const c_char;
     get_error: "eglGetError" () -> Int;
 }
@@ -87,6 +88,7 @@ impl Libraries {
 }
 
 struct Display {
+    backend: Backend,
     libraries: Arc<Libraries>,
     handle: usize,
 }
@@ -148,6 +150,7 @@ impl Display {
                 }
             }
             let display = Arc::new(Self {
+                backend,
                 libraries,
                 handle: handle as usize,
             });
@@ -250,6 +253,7 @@ unsafe fn allocate_context<'a>(
     config: Handle,
     context_attrs: &[Int],
     surface_attrs: &[Int],
+    backend: Backend,
     error: impl Fn(&str) -> String,
 ) -> Result<PendingContext<'a>, String> {
     let context = (f.create_context)(display, config, ptr::null_mut(), context_attrs.as_ptr());
@@ -269,6 +273,13 @@ unsafe fn allocate_context<'a>(
     if (f.make_current)(display, pending.surface, pending.surface, context) == 0 {
         return Err(error("activate WebGL context"));
     }
+    // Pinned ANGLE Metal allocates pbuffer attachments lazily. Its robust
+    // initialization path can clear them before allocation. A pbuffer swap
+    // allocates those attachments without exposing or reading their contents.
+    // Keep robust initialization enabled for both the context and surface.
+    if backend == Backend::Metal && (f.swap_buffers)(display, pending.surface) == 0 {
+        return Err(error("initialize Metal WebGL drawing buffer"));
+    }
     Ok(pending)
 }
 unsafe fn replace_surface(
@@ -278,6 +289,7 @@ unsafe fn replace_surface(
     context: Handle,
     previous: Handle,
     attrs: &[Int],
+    backend: Backend,
     error: impl Fn(&str) -> String,
 ) -> Result<Handle, String> {
     let replacement = (f.create_pbuffer)(display, config, attrs.as_ptr());
@@ -286,6 +298,19 @@ unsafe fn replace_surface(
     }
     if (f.make_current)(display, replacement, replacement, context) == 0 {
         let reason = error("activate resized WebGL buffer");
+        (f.destroy_surface)(display, replacement);
+        return Err(reason);
+    }
+    if backend == Backend::Metal && (f.swap_buffers)(display, replacement) == 0 {
+        let mut reason = error("initialize resized Metal WebGL buffer");
+        // The replacement is current, but the old surface is still owned.
+        // Restore it before discarding the failed allocation. If restoration
+        // also fails, release the current binding and report both failures.
+        if (f.make_current)(display, previous, previous, context) == 0 {
+            reason.push_str("; ");
+            reason.push_str(&error("restore previous WebGL buffer"));
+            (f.make_current)(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        }
         (f.destroy_surface)(display, replacement);
         return Err(reason);
     }
@@ -405,7 +430,7 @@ impl Context {
                 TRUE,
                 NONE,
             ];
-            let mut pending = allocate_context(f, d, config, &attributes, &surface_attrs, |op| {
+            let mut pending = allocate_context(f, d, config, &attributes, &surface_attrs, backend, |op| {
                 display.libraries.error(op)
             })?;
             let gl = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -484,6 +509,7 @@ impl Context {
                 self.context as Handle,
                 self.surface as Handle,
                 &attrs,
+                self.display.backend,
                 |op| self.display.libraries.error(op),
             )?;
             self.surface = replacement as usize;
@@ -518,12 +544,15 @@ mod tests {
         Context,
         Surface,
         Activate,
+        Prime,
+        PrimeAndRestore,
         Destroy,
     }
     #[derive(Default)]
     struct FakeEgl {
         failure: Failure,
         calls: Vec<(&'static str, usize)>,
+        current_surfaces: Vec<usize>,
     }
     thread_local! { static FAKE:RefCell<FakeEgl>=RefCell::new(FakeEgl::default()); }
     fn reset(failure: Failure) {
@@ -531,6 +560,7 @@ mod tests {
             *f.borrow_mut() = FakeEgl {
                 failure,
                 calls: Vec::new(),
+                current_surfaces: Vec::new(),
             }
         });
     }
@@ -558,9 +588,15 @@ mod tests {
             20usize as Handle
         }
     }
-    unsafe extern "C" fn make_current(_: Handle, _: Handle, _: Handle, context: Handle) -> u32 {
+    unsafe extern "C" fn make_current(_: Handle, surface: Handle, _: Handle, context: Handle) -> u32 {
         let failure = record("make_current", context as usize);
-        u32::from(context.is_null() || failure != Failure::Activate)
+        FAKE.with(|f| f.borrow_mut().current_surfaces.push(surface as usize));
+        u32::from(context.is_null() || (failure != Failure::Activate
+            && !(failure == Failure::PrimeAndRestore && surface as usize == 30)))
+    }
+    unsafe extern "C" fn swap_buffers(_: Handle, surface: Handle) -> u32 {
+        let failure = record("swap_buffers", surface as usize);
+        u32::from(!matches!(failure, Failure::Prime | Failure::PrimeAndRestore))
     }
     unsafe extern "C" fn destroy_context(_: Handle, context: Handle) -> u32 {
         u32::from(record("destroy_context", context as usize) != Failure::Destroy)
@@ -611,6 +647,7 @@ mod tests {
             create_pbuffer: create_surface,
             destroy_surface,
             make_current,
+            swap_buffers,
             query_string,
             get_error,
         }
@@ -622,6 +659,7 @@ mod tests {
             2usize as Handle,
             &[NONE],
             &[NONE],
+            Backend::Vulkan,
             str::to_owned,
         )
     }
@@ -739,6 +777,7 @@ mod tests {
                     10usize as Handle,
                     30usize as Handle,
                     &[NONE],
+                    Backend::Vulkan,
                     str::to_owned,
                 )
             };
@@ -747,6 +786,53 @@ mod tests {
             if let Ok(surface) = replacement {
                 assert_eq!(surface as usize, 20);
             }
+        }
+    }
+    #[test]
+    fn metal_pbuffer_initialization_precedes_gl_and_releases_failed_allocations() {
+        let f = functions();
+        for failure in [Failure::None, Failure::Prime] {
+            reset(failure);
+            let result = unsafe { allocate_context(&f, 1usize as Handle, 2usize as Handle,
+                &[NONE], &[NONE], Backend::Metal, str::to_owned) };
+            assert_eq!(result.is_ok(), failure == Failure::None);
+            if failure == Failure::Prime {
+                assert_eq!(result.as_ref().err().map(String::as_str),
+                    Some("initialize Metal WebGL drawing buffer"));
+            }
+            drop(result);
+            assert_eq!(calls(), vec![("create_context",10),("create_surface",20),
+                ("make_current",10),("swap_buffers",20),("make_current",0),
+                ("destroy_context",10),("destroy_surface",20)]);
+        }
+    }
+    #[test]
+    fn metal_resize_initializes_before_retiring_old_surface_and_rolls_back_failures() {
+        let f = functions();
+        for failure in [Failure::None, Failure::Prime, Failure::PrimeAndRestore] {
+            reset(failure);
+            let result = unsafe { replace_surface(&f, 1usize as Handle, 2usize as Handle,
+                10usize as Handle, 30usize as Handle, &[NONE], Backend::Metal, str::to_owned) };
+            assert_eq!(result.is_ok(), failure == Failure::None);
+            let mut expected = vec![("create_surface",20),("make_current",10),("swap_buffers",20)];
+            let mut surfaces = vec![20];
+            if failure == Failure::None {
+                assert_eq!(result.unwrap() as usize,20);
+                expected.push(("destroy_surface",30));
+            } else {
+                let reason = result.unwrap_err();
+                assert!(reason.starts_with("initialize resized Metal WebGL buffer"));
+                expected.push(("make_current",10));
+                surfaces.push(30);
+                if failure == Failure::PrimeAndRestore {
+                    assert!(reason.contains("restore previous WebGL buffer"));
+                    expected.push(("make_current",0));
+                    surfaces.push(0);
+                }
+                expected.push(("destroy_surface",20));
+            }
+            assert_eq!(calls(), expected);
+            FAKE.with(|f| assert_eq!(f.borrow().current_surfaces, surfaces));
         }
     }
     #[test]
