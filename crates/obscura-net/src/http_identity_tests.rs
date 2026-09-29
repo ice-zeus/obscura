@@ -1,5 +1,3 @@
-/Users/iulian/Desktop/Cursor/Scraping/out/obscura-compatibility-20260928/contribution/crates/obscura-net/src/http_identity_tests.rs:
-
 //! Offline wire regressions for page identity settings and form transport.
 use crate::{CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo};
 use std::collections::HashMap;

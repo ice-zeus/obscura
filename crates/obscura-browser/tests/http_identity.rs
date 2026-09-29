@@ -1,5 +1,3 @@
-/Users/iulian/Desktop/Cursor/Scraping/out/obscura-compatibility-20260928/contribution/crates/obscura-browser/tests/http_identity.rs:
-
 use obscura_browser::{BrowserContext, Page};
 use obscura_js::frame::FrameRealm;
 use std::collections::HashMap;
