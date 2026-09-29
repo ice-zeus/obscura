@@ -354,7 +354,10 @@ test('placeholder Blob serialization snapshots at invocation and queues the real
   let offset=8,compressed=[];while(offset<data.length){const length=new DataView(data.buffer).getUint32(offset),name=Buffer.from(data.slice(offset+4,offset+8)).toString();if(name==='IDAT')compressed.push(data.slice(offset+8,offset+8+length));offset+=length+12;}
   assert.deepEqual(Array.from(zlib.inflateSync(Buffer.concat(compressed))).slice(1),[255,0,0,255]);
   assert.throws(()=>html.toBlob(null),{name:'TypeError'});
-  offscreen.width=0;f.drain();blob=undefined;html.toBlob(value=>{blob=value;});assert.equal(blob,undefined);f.drain();assert.equal(blob,null);
+  const prior=html.toDataURL();offscreen.width=0;f.drain();blob=undefined;
+  html.toBlob(value=>{blob=value;});assert.equal(blob,undefined);f.drain();
+  assert.equal(blob.type,'image/png');assert.equal(html.toDataURL(),prior);
+  const empty=f.html(0,1);blob=undefined;empty.toBlob(value=>{blob=value;});f.drain();assert.equal(blob,null);
 });
 test('placeholder WebGL binding presents dirty frames once and preserves prior captures',()=>{
   for(const preserveDrawingBuffer of [false,true]){
@@ -540,4 +543,19 @@ test('author dimensions preserve snapshots until dirty presentation replaces bot
   ctx.fillStyle='#0000ff';ctx.fillRect(0,0,2,1);f.drainTasks();
   assert.equal(html.width,90);assert.equal(html.toDataURL(),red);
   f.drain();assert.equal(html.width,2);assert.equal(html.height,1);assert.notEqual(html.toDataURL(),red);
+});
+
+test('empty offscreen frames retain placeholder pixels and author attributes until nonzero resize',()=>{
+  for(const mode of ['2d','webgl','webgl2'])for(const axis of ['width','height']){
+    const f=fixture(),html=f.html(2,1),off=html.transferControlToOffscreen(),ctx=off.getContext(mode,{preserveDrawingBuffer:true});
+    const draw=()=>{if(mode==='2d'){ctx.fillStyle='#ff0000';ctx.fillRect(0,0,off.width,off.height);}else ctx.clear(ctx.COLOR_BUFFER_BIT);};
+    draw();f.drain();const png=html.toDataURL(),revision=f.presented.get(1).revision;
+    const calls=f.calls.filter(call=>call.placeholder==='presentCpu'||call.placeholder==='presentGl').length;
+    html.setAttribute(axis,'90');off[axis]=0;f.drain();draw();f.drain();
+    assert.equal(html.toDataURL(),png);assert.equal(html.getAttribute(axis),'90');
+    assert.equal(f.presented.get(1).revision,revision);assert.equal(f.tasks.length,0);
+    assert.equal(f.calls.filter(call=>call.placeholder==='presentCpu'||call.placeholder==='presentGl').length,calls);
+    off[axis]=3;f.drain();assert.equal(html.getAttribute(axis),'3');
+    assert.ok(f.presented.get(1).revision>revision);assert.equal(f.tasks.length,0);
+  }
 });

@@ -51,6 +51,8 @@ impl Fixture {
                     }
                     Err(error) => panic!("fixture accept: {error}"),
                 };
+                // Accepted sockets can inherit the listener's nonblocking flag on macOS.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -126,7 +128,13 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap();
+        if let Err(error) = self.thread.take().unwrap().join() {
+            if std::thread::panicking() {
+                eprintln!("HTTP fixture worker also failed during test cleanup");
+            } else {
+                std::panic::resume_unwind(error);
+            }
+        }
     }
 }
 fn ordinary() -> ObscuraHttpClient {
