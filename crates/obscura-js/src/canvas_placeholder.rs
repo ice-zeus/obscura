@@ -412,6 +412,9 @@ fn commit(
     color_space: ColorSpace,
     pixels: Vec<u8>,
 ) -> serde_json::Value {
+    if width == 0 || height == 0 {
+        return failure("canvas has no presentable pixels");
+    }
     if pixel_bytes(width, height) != Some(pixels.len()) {
         return failure("canvas snapshot dimensions do not match pixels");
     }
@@ -572,6 +575,42 @@ mod tests {
         assert_eq!(retained_size(usize::MAX,ColorSpace::DisplayP3),None);assert_eq!(retained_size(usize::MAX,ColorSpace::Srgb),Some(usize::MAX));
         let p=state.webgl.placeholders.entries[&id];commit(&mut state,id,p,2,1,true,Source::Cpu,ColorSpace::DisplayP3,vec![19;8]);
         clear(&mut state);assert!(state.webgl.placeholders.source_pixels.is_empty());assert_eq!(state.webgl.placeholders.retained_bytes,0);
+    }
+    #[test]
+    fn empty_frames_preserve_snapshot_revision_and_budget_until_resume_or_retirement() {
+        for color in [ColorSpace::Srgb, ColorSpace::DisplayP3] {
+            for retire in [false, true] {
+                let (mut state, node) = state();
+                let id = register(&mut state, node, 2, 1);
+                let initial = state.webgl.placeholders.entries[&id];
+                assert_eq!(commit(&mut state, id, initial, 2, 1, false, Source::Cpu, color, vec![9; 8])["status"], "ready");
+                let previous = state.webgl.placeholders.entries[&id];
+                let display = state.webgl_surfaces[&node].clone();
+                let source = state.webgl.placeholders.source_pixels.get(&id).cloned();
+                let charged = state.webgl.placeholders.retained_bytes;
+                let generation = state.activity_generation;
+                for (width, height) in [(0, 1), (2, 0), (0, 0)] {
+                    assert_eq!(commit(&mut state, id, previous, width, height, true, Source::Cpu, ColorSpace::Srgb, vec![])["status"], "failed");
+                    assert_eq!(state.webgl_surfaces[&node], display);
+                    assert_eq!(state.webgl.placeholders.source_pixels.get(&id), source.as_ref());
+                    assert_eq!(state.webgl.placeholders.retained_bytes, charged);
+                    assert_eq!(state.webgl.placeholders.entries[&id].revision, previous.revision);
+                    assert!(!state.webgl.placeholders.entries[&id].origin_clean);
+                    assert_eq!(state.activity_generation, generation);
+                }
+                assert_eq!(commit(&mut state, id, previous, 3, 1, true, Source::Cpu, ColorSpace::Srgb, vec![7; 12])["status"], "ready");
+                assert_eq!(state.webgl.placeholders.retained_bytes, 12);
+                assert_eq!(state.webgl.placeholders.entries[&id].revision, previous.revision + 1);
+                assert!(state.webgl.placeholders.source_pixels.is_empty());
+                assert_eq!(state.webgl_surfaces[&node].2, [7; 12]);
+                if retire { dispatch(&mut state, Request::Retire { id }, &mut []); }
+                else { clear(&mut state); }
+                assert!(state.webgl_surfaces.is_empty());
+                assert!(state.webgl.placeholders.entries.is_empty());
+                assert!(state.webgl.placeholders.source_pixels.is_empty());
+                assert_eq!(state.webgl.placeholders.retained_bytes, 0);
+            }
+        }
     }
     #[test]
     fn placeholder_raw_read_failure_preserves_destination_and_display_snapshot() {

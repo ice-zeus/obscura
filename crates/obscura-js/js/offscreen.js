@@ -192,6 +192,9 @@ function presentPlaceholder(reference) {
   current.presentationQueued=false;
   const target=current.placeholder?.target.deref();
   if(!target||!_canvasDOMOwner(target))return;
+  // An empty offscreen bitmap cannot publish a frame. Keep the last presented
+  // pixels and author attributes until a later nonempty resize or draw.
+  if(!current.width||!current.height)return;
   let result;
   if(current.mode==='2d'){
     const pixels=_canvas2DPixels(current.context);

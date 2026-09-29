@@ -911,7 +911,7 @@ async fn placeholder_cpu_presentation_updates_layout_and_attributes_at_frame_bou
     assert_eq!(&pixels[(16+2)*4..(16+2)*4+4], &[255,0,0,255]);
     assert_eq!(&pixels[(16+5)*4..(16+5)*4+4], &[255,255,255,255]);
     assert_eq!(runtime.evaluate(r#"(()=>{
-      const pixels=placeholder.toDataURL(),before=Array.from(offscreen2d.getImageData(0,0,1,1).data);
+      const pixels=placeholder.toDataURL(),before=Array.from(offscreen2d.getImageData(0,0,1,1).data);window.presentedBeforeZero=pixels;
       placeholder.setAttribute('width','90');
       return [placeholder.width,offscreen.width,placeholder.toDataURL()===pixels,
         Array.from(offscreen2d.getImageData(0,0,1,1).data),before];
@@ -919,8 +919,69 @@ async fn placeholder_cpu_presentation_updates_layout_and_attributes_at_frame_bou
     runtime.execute_script("<fixture-setup>", "offscreen.width=0").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
     assert_eq!(runtime.evaluate(r#"(()=>{const r=placeholder.getBoundingClientRect();return [r.width,r.height,
-      placeholder.width,placeholder.toDataURL(),attributeRecords.length];})()"#).unwrap(), json!([0,2,0,"data:,",5]));
+      placeholder.width,placeholder.toDataURL()===presentedBeforeZero,attributeRecords.length];})()"#).unwrap(), json!([90,2,90,true,3]));
+    assert_eq!(runtime.state.borrow().webgl_surfaces.len(), 1);
+    runtime.set_dom(parse_html("<body></body>"));
+    assert!(runtime.state.borrow().webgl_surfaces.is_empty());
     assert!(runtime.state.borrow().canvas_surfaces.is_empty());
+}
+
+async fn check_empty_placeholder_frames(modes: &[&str]) {
+    let mut runtime = page();
+    for mode in modes {
+        for axis in ["width", "height"] {
+            runtime.evaluate(&format!(r#"(()=>{{
+              const c=document.getElementById('c');c.width=2;c.height=1;
+              const off=c.transferControlToOffscreen(),ctx=off.getContext('{mode}',{{antialias:false,preserveDrawingBuffer:true}});
+              if(!ctx)throw Error('Context unavailable');
+              const records=[];new MutationObserver(batch=>records.push(...batch.map(r=>r.attributeName))).observe(c,{{attributes:true}});
+              window.trial={{c,off,ctx,records,axis:'{axis}',mode:'{mode}'}};
+              off.width=4;off.height=2;
+              if('{mode}'==='2d'){{ctx.fillStyle='#ff0000';ctx.fillRect(0,0,4,2);}}
+              else{{ctx.clearColor(1,0,0,1);ctx.clear(ctx.COLOR_BUFFER_BIT);}}
+            }})()"#)).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
+            assert_eq!(runtime.evaluate(r#"(()=>{const {c,records}=trial;trial.png=c.toDataURL();return c.width===4&&c.height===2&&records.join(',')==='width,height';})()"#).unwrap(),json!(true));
+            assert_eq!(runtime.state.borrow().webgl_surfaces.len(), 1);
+            let original = runtime.state.borrow().webgl_surfaces.values().next().unwrap().clone();
+            assert_eq!((original.0, original.1, original.2.len()), (4, 2, 32));
+            runtime.execute_script("<fixture-zero>", "trial.c.setAttribute(trial.axis,'90');trial.off[trial.axis]=0").unwrap();
+            for draw_while_zero in [false, true] {
+                if draw_while_zero {
+                    runtime.execute_script("<fixture-zero-draw>", "if(trial.mode==='2d'){trial.ctx.fillStyle='#0000ff';trial.ctx.fillRect(0,0,4,2);}else{trial.ctx.clearColor(0,0,1,1);trial.ctx.clear(trial.ctx.COLOR_BUFFER_BIT);}").unwrap();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
+                assert_eq!(runtime.evaluate(r#"(()=>{const {c,off,png,records,axis,ctx,mode}=trial;return off[axis]===0&&c[axis]===90&&c.toDataURL()===png&&records.join(',')==='width,height,'+axis&&(mode==='2d'||ctx.getError()===0);})()"#).unwrap(),json!(true));
+                assert_eq!(runtime.state.borrow().webgl_surfaces.values().next().unwrap(), &original);
+            }
+            runtime.execute_script("<fixture-resume>", "trial.off[trial.axis]=3").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
+            assert_eq!(runtime.evaluate(r#"(()=>{const {c,off,png,records,axis}=trial;return c.width===off.width&&c.height===off.height&&c[axis]===3&&c.toDataURL()!==png&&records.join(',')==='width,height,'+axis+',width,height';})()"#).unwrap(),json!(true));
+            let restored = runtime.state.borrow().webgl_surfaces.values().next().unwrap().clone();
+            assert_eq!((restored.0,restored.1), if axis=="width" {(3,2)} else {(4,3)});
+            assert!(restored.2.iter().all(|value| *value==0));
+            runtime.execute_script("<fixture-blue>", "if(trial.mode==='2d'){trial.ctx.fillStyle='#0000ff';trial.ctx.fillRect(0,0,trial.off.width,trial.off.height);}else{trial.ctx.clearColor(0,0,1,1);trial.ctx.clear(trial.ctx.COLOR_BUFFER_BIT);}").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop()).await.unwrap().unwrap();
+            assert_eq!(runtime.evaluate("trial.records.length===5").unwrap(),json!(true));
+            assert!(runtime.state.borrow().webgl_surfaces.values().next().unwrap().2.chunks_exact(4).all(|rgba| rgba==[0,0,255,255]));
+            runtime.set_dom(parse_html("<canvas id=c width=4 height=3></canvas>"));
+            runtime.run_page_init();
+            assert!(runtime.state.borrow().webgl_surfaces.is_empty());
+            assert!(runtime.state.borrow().webgl.entries.is_empty());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn empty_cpu_placeholder_frames_preserve_pixels_and_resume_on_nonzero_resize() {
+    check_empty_placeholder_frames(&["2d"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "mandatory actual WebGL zero-sized placeholder retention and resumption"]
+async fn real_empty_webgl_placeholder_frames_preserve_pixels_and_resume_on_nonzero_resize() {
+    require_driver();
+    check_empty_placeholder_frames(&["webgl", "webgl2"]).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
