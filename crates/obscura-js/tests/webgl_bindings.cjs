@@ -147,7 +147,9 @@ test('uniform vector offsets and matrix dimensions reach the typed native bounda
 test('native readback fills the exact canvas-sized destination',()=>{
   const f=fixture();const image=f.sandbox._webglReadback(f.canvas);
   assert.equal(image.bytes.length,48);assert.equal(image.bytes[47],42);
-  f.canvas.width=0;const empty=f.sandbox._webglReadback(f.canvas);assert.equal(empty.bytes.length,0);
+  // This bare Canvas stub needs the resize notification sent by the DOM setter.
+  f.canvas.width=0;f.sandbox._webglResize(f.canvas);
+  const empty=f.sandbox._webglReadback(f.canvas);assert.equal(empty.bytes.length,0);
 });
 test('pixel views must match the GL type before the driver sees their bytes',()=>{
   const f=fixture();f.gl.readPixels(0,0,1,1,f.gl.RGBA,f.gl.UNSIGNED_BYTE,new Float32Array(4));

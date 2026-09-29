@@ -10,7 +10,10 @@ const read=name=>fs.readFileSync(path.join(__dirname,'../js',name),'utf8');
 const bootstrap=read('bootstrap.js');
 const png=bootstrap.slice(bootstrap.indexOf('function _encodePNG('),bootstrap.indexOf('globalThis.__ariaQuerySelector ='));
 const canvas=bootstrap.slice(bootstrap.indexOf('const _MAX_CANVAS_DIMENSION'),bootstrap.indexOf('/* @obscura-webgl */'));
-const htmlCanvas=bootstrap.slice(bootstrap.indexOf('class HTMLCanvasElement extends Element'),bootstrap.indexOf('Element.prototype.getBBox'));
+const htmlCanvasStart=bootstrap.indexOf('class HTMLCanvasElement extends Element');
+const htmlCanvasEnd=bootstrap.indexOf('Element.prototype.getBBox =',htmlCanvasStart);
+assert.ok(htmlCanvasStart>=0&&htmlCanvasEnd>htmlCanvasStart,'HTML canvas fixture boundaries must include the implementation');
+const htmlCanvas=bootstrap.slice(htmlCanvasStart,htmlCanvasEnd);
 const bindings=read('webgl.js').replace('/* @obscura-imagedata */',read('imagedata.js')).replace('/* @obscura-imagebitmap */',read('imagebitmap.js')).replace('/* @obscura-offscreen */',read('offscreen.js'));
 function fixture(options={}) {
   const imageDataStore=new WeakMap();
