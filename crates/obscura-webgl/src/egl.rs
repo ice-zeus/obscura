@@ -53,6 +53,11 @@ struct Libraries {
 impl Libraries {
     fn open() -> Result<Self, String> {
         let bundle = Bundle::discover()?;
+        if cfg!(target_os = "linux") {
+            // ANGLE opens this dependency internally from its module directory.
+            // Verify it before loading native code, just like EGL and GLES.
+            bundle.verify_vulkan_loader()?;
+        }
         let suffix = if cfg!(target_os = "macos") {
             "dylib"
         } else {

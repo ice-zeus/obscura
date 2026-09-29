@@ -56,6 +56,15 @@ impl Bundle {
             manifest,
         })
     }
+    pub fn verify_vulkan_loader(&self) -> Result<(), String> {
+        self.library("libvulkan.so.1")?;
+        // ANGLE tries the unversioned name first. A locally installed alias
+        // must not bypass verification of the mandatory versioned library.
+        if self.directory.join("libvulkan.so").exists() {
+            self.library("libvulkan.so")?;
+        }
+        Ok(())
+    }
     pub fn library(&self, name: &str) -> Result<PathBuf, String> {
         // The caller supplies a fixed basename. Never honor manifest paths or
         // search the working directory/system library path for substitute GL.
@@ -154,6 +163,28 @@ mod tests {
         assert!(Bundle::open(&f.0).is_err());
         std::fs::remove_file(f.0.join("bundle.json")).unwrap();
         assert!(Bundle::open(&f.0).is_err());
+    }
+    #[test]
+    fn vulkan_loader_and_any_priority_alias_are_verified_before_native_loading() {
+        let f = fixture();
+        assert!(Bundle::open(&f.0).unwrap().verify_vulkan_loader().unwrap_err().contains("omits"));
+        let manifest_path = f.0.join("bundle.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let digest = format!("{:x}",Sha256::digest(b"pinned loader"));
+        manifest["files"]["libvulkan.so.1"] = serde_json::json!(digest);
+        std::fs::write(&manifest_path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(f.0.join("libvulkan.so.1"),b"pinned loader").unwrap();
+        assert!(Bundle::open(&f.0).unwrap().verify_vulkan_loader().is_ok());
+        std::fs::write(f.0.join("libvulkan.so.1"),b"corrupt loader").unwrap();
+        assert!(Bundle::open(&f.0).unwrap().verify_vulkan_loader().unwrap_err().contains("checksum"));
+        std::fs::write(f.0.join("libvulkan.so.1"),b"pinned loader").unwrap();
+        std::fs::write(f.0.join("libvulkan.so"),b"pinned loader").unwrap();
+        assert!(Bundle::open(&f.0).unwrap().verify_vulkan_loader().unwrap_err().contains("omits"));
+        manifest["files"]["libvulkan.so"] = serde_json::json!(digest);
+        std::fs::write(&manifest_path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(Bundle::open(&f.0).unwrap().verify_vulkan_loader().is_ok());
+        std::fs::write(f.0.join("libvulkan.so"),b"corrupt alias").unwrap();
+        assert!(Bundle::open(&f.0).unwrap().verify_vulkan_loader().unwrap_err().contains("checksum"));
     }
     #[test]
     fn paths_cannot_escape_bundle() {
