@@ -158,8 +158,10 @@ class DependencyRecipeTests(unittest.TestCase):
         self.assertFalse(self.work.exists())
 
     def test_dependency_revision_and_build_failures_never_publish_a_bundle(self):
-        for flag in ["wrong_revision", "build_error"]:
-            with self.subTest(flag=flag), self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+        for flag, expected in [("wrong_revision", RuntimeError), ("build_error", subprocess.CalledProcessError)]:
+            # Each injected failure needs its own mocked checkout and build state.
+            self.work = self.root / flag
+            with self.subTest(flag=flag), self.assertRaises(expected):
                 self.invoke(**{flag: True})
             self.assertFalse(self.output.exists())
 
