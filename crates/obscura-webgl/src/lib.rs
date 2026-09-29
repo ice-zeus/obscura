@@ -19,3 +19,11 @@ pub mod resources;
 pub mod selection;
 pub mod transfers;
 pub mod uniforms;
+
+#[cfg(test)]
+mod creation_test_faults {
+    thread_local! {
+        pub static ACTIVATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub static CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+}
