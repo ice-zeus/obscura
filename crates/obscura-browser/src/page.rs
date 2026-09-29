@@ -301,6 +301,7 @@ pub struct Page {
     /// to the entry instead of appending a new one.
     pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
+    navigation_exchanges: Vec<Vec<obscura_net::client::NavigationExchange>>,
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
@@ -1130,6 +1131,7 @@ impl Page {
             document_history_start: 0,
             pending_history_traversal: std::sync::Mutex::new(None),
             network_events: Vec::new(),
+            navigation_exchanges: Vec::new(),
             response_bodies: std::collections::HashMap::new(),
             response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
@@ -1767,12 +1769,24 @@ impl Page {
         }
     }
 
-    async fn do_post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
+    /// Consume transport-observed navigation hops for the CDP bridge.
+    #[doc(hidden)]
+    pub fn take_navigation_exchanges(&mut self) -> Vec<Vec<obscura_net::client::NavigationExchange>> {
+        std::mem::take(&mut self.navigation_exchanges)
+    }
+
+    async fn do_navigation_fetch(&mut self, url: &Url, method: &str, body: &str) -> Result<Response, ObscuraNetError> {
+        let form=(method=="POST").then_some(body);
         #[cfg(feature = "stealth")]
-        if let Some(client) = &self.stealth_client {
-            return client.post_form_with_callbacks(url, body, Some(&self.callbacks)).await;
-        }
-        self.http_client.post_form_with_callbacks(url, body, Some(&self.callbacks)).await
+        let (result,trace)=if let Some(client)=&self.stealth_client {
+            client.fetch_navigation_with_trace(url,form,Some(&self.callbacks)).await
+        } else {
+            self.http_client.fetch_navigation_with_trace(url,form,Some(&self.callbacks)).await
+        };
+        #[cfg(not(feature = "stealth"))]
+        let (result,trace)=self.http_client.fetch_navigation_with_trace(url,form,Some(&self.callbacks)).await;
+        if let Some(chain) = self.navigation_exchanges.last_mut() { *chain = trace; }
+        result
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -3339,6 +3353,7 @@ impl Page {
         body: &str,
         initial_referrer: &str,
     ) -> Result<(), PageError> {
+        self.navigation_exchanges.clear();
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
         // tools) ends up here, so the context's opt-in is enforced once
@@ -3349,6 +3364,8 @@ impl Page {
                 "file:// navigation is disabled for this browser context: {url_str}"
             )));
         }
+        // Keep every server redirect chain until this entire client-navigation
+        // chain completes or fails. A CDP drain consumes it exactly once.
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
@@ -3426,6 +3443,9 @@ impl Page {
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
         self.network_events.clear();
+        // Even a data/file/fulfilled document owns a boundary. An empty trace
+        // must not inherit the previous document's POST or loader identity.
+        self.navigation_exchanges.push(Vec::new());
 
         if self.context.obey_robots {
             if url.scheme() == "http" || url.scheme() == "https" {
@@ -3499,10 +3519,8 @@ impl Page {
                 body: body_bytes,
                 redirected_from: Vec::new(),
             })
-        } else if method == "POST" {
-            self.do_post_form(&url, body).await
         } else {
-            self.do_fetch(&url).await
+            self.do_navigation_fetch(&url, method, body).await
         }
         .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
@@ -3516,14 +3534,24 @@ impl Page {
         // Report the document the page actually loaded: the final URL after
         // redirects, and the method of that final request. CDP matches the
         // navigation response by this URL, so recording the original URL of a
-        // redirected POST left clients without a navigation response. A POST
-        // is followed with GET after 301/302/303, which the response does not
-        // distinguish from 307/308, so a redirected navigation reports GET.
-        let document_method = if response.redirected_from.is_empty() {
-            method.to_ascii_uppercase()
-        } else {
-            "GET".to_string()
-        };
+        // redirected POST left clients without a navigation response. The
+        // transport trace records the method of every hop, so a 307/308 that
+        // keeps POST reports POST. Without a trace (data:, file:, a fulfilled
+        // request), a POST is followed with GET after 301/302/303, which the
+        // response does not distinguish from 307/308, so a redirected
+        // navigation reports GET.
+        let document_method = self
+            .navigation_exchanges
+            .last()
+            .and_then(|chain| chain.last())
+            .map(|hop| hop.request.method.clone())
+            .unwrap_or_else(|| {
+                if response.redirected_from.is_empty() {
+                    method.to_ascii_uppercase()
+                } else {
+                    "GET".to_string()
+                }
+            });
         self.record_network_event_with_body(
             response.url.as_str(),
             &document_method,

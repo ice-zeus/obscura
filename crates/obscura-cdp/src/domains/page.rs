@@ -877,6 +877,110 @@ fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
                 .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
 }
 
+// Network subscriptions belong to attached sessions, not to the session that
+// happened to evaluate a form submission. Page/Runtime events retain their routes.
+fn route_network_events(ctx: &mut CdpContext, page_id: &str, start: usize) {
+    let sessions = ctx.network_sessions_for_page(page_id);
+    let events = ctx.pending_events.split_off(start);
+    for event in events {
+        if event.method.starts_with("Network.") {
+            for session in &sessions {
+                ctx.pending_events.push(CdpEvent {
+                    method: event.method.clone(),
+                    params: event.params.clone(),
+                    session_id: Some(session.clone()),
+                });
+            }
+        } else {
+            ctx.pending_events.push(event);
+        }
+    }
+}
+
+fn transport_response(hop: &obscura_net::client::NavigationExchange) -> Value {
+    json!({"url": hop.request.url.as_str(), "status": hop.status, "statusText": "",
+        "headers": hop.response_headers, "mimeType": hop.response_headers.get("content-type").cloned().unwrap_or_default()})
+}
+
+// Each vector is one HTTP redirect chain. Client-side navigation starts a new
+// loader; the last chain is the document committed by emit_navigation_events.
+fn transport_navigation_events(
+    chains: &[Vec<obscura_net::client::NavigationExchange>],
+    frame_id: &str,
+    loader_id: &str,
+    last_is_document: bool,
+) -> (Vec<CdpEvent>, Vec<CdpEvent>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for (index, chain) in chains.iter().enumerate() {
+        let last_chain = last_is_document && index + 1 == chains.len();
+        let id = if last_chain {
+            loader_id.to_string()
+        } else {
+            format!("{loader_id}-navigation-{index}")
+        };
+        for (hop_index, hop) in chain.iter().enumerate() {
+            let mut request = json!({"url": hop.request.url.as_str(), "method": hop.request.method,
+                "headers": hop.request.headers, "hasPostData": hop.has_post_data});
+            if let Some(body) = &hop.post_data {
+                request["postData"] = json!(body);
+            }
+            let mut params = json!({"requestId": id, "loaderId": id, "documentURL": hop.request.url.as_str(),
+                "request": request, "timestamp": hop.timestamp, "wallTime": hop.timestamp,
+                "initiator": {"type":"other"}, "type":"Document", "frameId":frame_id});
+            if hop_index > 0 && chain[hop_index - 1].status.is_some() {
+                params["redirectResponse"] = transport_response(&chain[hop_index - 1]);
+                params["redirectHasExtraInfo"] = json!(false);
+            }
+            before.push(CdpEvent {
+                method: "Network.requestWillBeSent".into(),
+                params,
+                session_id: None,
+            });
+        }
+        if let Some(last) = chain.last() {
+            let destination = if last_chain { &mut after } else { &mut before };
+            if last.status.is_some() {
+                destination.push(CdpEvent {
+                    method: "Network.responseReceived".into(),
+                    params: json!({"requestId":id,"loaderId":id,"timestamp":last.timestamp,
+                        "type":"Document","response":transport_response(last),"frameId":frame_id}),
+                    session_id: None,
+                });
+            }
+            if last.failed {
+                destination.push(CdpEvent {
+                    method: "Network.loadingFailed".into(),
+                    params: json!({"requestId":id,"timestamp":last.timestamp,"type":"Document",
+                        "errorText":"net::ERR_FAILED","canceled":false}),
+                    session_id: None,
+                });
+            } else if let Some(bytes) = last.response_body_size {
+                destination.push(CdpEvent {method:"Network.loadingFinished".into(),
+                    params:json!({"requestId":id,"timestamp":last.timestamp,"encodedDataLength":bytes}),session_id:None});
+            }
+        }
+    }
+    (before, after)
+}
+
+pub(crate) fn emit_failed_navigation_events(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    frame_id: &str,
+    loader_id: &str,
+) {
+    let chains = ctx
+        .get_page_mut(page_id)
+        .map(|page| page.take_navigation_exchanges())
+        .unwrap_or_default();
+    let (before, after) = transport_navigation_events(&chains, frame_id, loader_id, true);
+    let start = ctx.pending_events.len();
+    ctx.pending_events.extend(before);
+    ctx.pending_events.extend(after);
+    route_network_events(ctx, page_id, start);
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -892,6 +996,12 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    let event_start = ctx.pending_events.len();
+    let chains = ctx.get_page_mut(page_id).map(|page|page.take_navigation_exchanges()).unwrap_or_default();
+    let has_transport_trace = chains.last().and_then(|chain|chain.last())
+        .is_some_and(|hop|hop.request.url.as_str()==page_url);
+    let (transport_before, transport_after) = transport_navigation_events(&chains,frame_id,loader_id,has_transport_trace);
+    ctx.pending_events.extend(transport_before);
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
@@ -941,7 +1051,7 @@ pub fn emit_navigation_events(
 
     // Playwright needs `Network.requestWillBeSent` for the main document to
     // arrive BEFORE `Page.frameNavigated` (issue #190).
-    if let Some(idx) = nav_idx {
+    if let Some(idx) = nav_idx.filter(|_| !has_transport_trace) {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
@@ -1025,7 +1135,9 @@ pub fn emit_navigation_events(
         }
     }
 
+    ctx.pending_events.extend(transport_after);
     for (i, net_event) in network_events.iter().enumerate() {
+        if has_transport_trace && Some(i) == nav_idx { continue; }
         let rid = &nav_request_ids[i];
         if Some(i) != nav_idx && !net_event.intercepted {
             ctx.pending_events.push(CdpEvent {
@@ -1102,6 +1214,7 @@ pub fn emit_navigation_events(
             }
         }),
     ));
+    route_network_events(ctx,page_id,event_start);
 }
 
 pub(crate) fn emit_same_document_navigation(
@@ -1132,6 +1245,7 @@ pub(crate) fn emit_runtime_network_events(
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
 ) {
+    let event_start = ctx.pending_events.len();
     if network_events.is_empty() {
         return;
     }
@@ -1194,6 +1308,7 @@ pub(crate) fn emit_runtime_network_events(
             session_id: session_id.clone(),
         });
     }
+    route_network_events(ctx,page_id,event_start);
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1275,14 +1390,15 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
-                .await
-                .map_err(|e| e.to_string())?;
+        let result = if nav_method == "POST" {
+            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await
         } else {
-            page.navigate_with_wait(url, wait_until)
-                .await
-                .map_err(|e| e.to_string())?;
+            page.navigate_with_wait(url, wait_until).await
+        };
+        if let Err(error) = result {
+            let page_id=page.id.clone();
+            emit_failed_navigation_events(ctx,&page_id,&frame_id,&loader_id);
+            return Err(error.to_string());
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
@@ -2063,6 +2179,7 @@ mod tests {
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
             .insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.network_enabled_sessions.insert(session_id.clone().unwrap());
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
@@ -3699,3 +3816,7 @@ mod tests {
         assert_eq!(info["canAccessOpener"], json!(false));
     }
 }
+
+#[cfg(test)]
+#[path = "navigation_network_tests.rs"]
+mod navigation_network_tests;
