@@ -675,6 +675,12 @@ pub struct RealmStates {
 }
 
 impl RealmStates {
+    pub(crate) fn set_http_client(&self, client: Arc<ObscuraHttpClient>) {
+        for (_, _, state) in &self.entries {
+            state.borrow_mut().http_client = Some(client.clone());
+        }
+    }
+
     pub fn register(
         &mut self,
         context: v8::Global<v8::Context>,
@@ -2784,7 +2790,7 @@ fn sanitize_redirect_headers(
         headers.retain(|name, _| {
             !matches!(
                 name.to_ascii_lowercase().as_str(),
-                "authorization" | "proxy-authorization" | "cookie"
+                "authorization" | "proxy-authorization" | "cookie" | "host"
             )
         });
     }
@@ -3357,6 +3363,27 @@ async fn op_fetch_url(
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
 
+    // Resolve browser/CDP settings once. Only script-provided headers below
+    // participate in the CORS unsafe-header calculation.
+    #[cfg(feature = "stealth")]
+    let stealth = {
+        let st = state.borrow();
+        let gs = st.borrow::<SharedState>().clone();
+        let client = gs.borrow().stealth_client.clone();
+        client
+    };
+    let mut effective_headers = match &http_client {
+        Some(client) => client.request_headers().await,
+        None => HashMap::from([("user-agent".to_string(),
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string())]),
+    };
+    #[cfg(feature = "stealth")]
+    if let Some(client) = &stealth {
+        effective_headers = client.request_headers().await;
+    }
+    obscura_net::client::merge_request_headers(&mut effective_headers, &custom_headers);
+    effective_headers.remove("origin");
+
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
     // circuit earlier). on_request/on_response previously fired only for
@@ -3367,7 +3394,7 @@ async fn op_fetch_url(
                 let info = RequestInfo {
                     url: parsed,
                     method: method.clone(),
-                    headers: custom_headers.clone(),
+                    headers: effective_headers.clone(),
                     resource_type: ResourceType::Fetch,
                 };
                 cbs.fire_request(&info).await;
@@ -3464,18 +3491,12 @@ async fn op_fetch_url(
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
     {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
-                custom_headers.clone(),
+                effective_headers.clone(),
                 body.clone(),
                 page_origin.clone(),
                 mode.clone(),
@@ -3497,7 +3518,7 @@ async fn op_fetch_url(
     let mut current_body = body;
     // A mutable copy applied per hop: credential headers are dropped when a
     // redirect crosses origin, and body headers when the method downgrades.
-    let mut current_headers = custom_headers.clone();
+    let mut current_headers = effective_headers;
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
@@ -3533,19 +3554,6 @@ async fn op_fetch_url(
                     }
                 }
             }
-        }
-
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
-        if !current_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("user-agent"))
-        {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
         }
 
         for (k, v) in &current_headers {
@@ -3734,7 +3742,7 @@ async fn op_fetch_url(
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: current_method.as_str().to_string(),
-                headers: resp_headers.clone(),
+                headers: current_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
             cbs.fire_response(&info, &resp).await;
@@ -3899,7 +3907,7 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_with_context(
+            .send_single_with_resolved_headers(
                 &current_method,
                 &parsed_current,
                 &req_headers,
@@ -4023,7 +4031,7 @@ async fn stealth_fetch_all(
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: current_method.clone(),
-                headers: resp_headers.clone(),
+                headers: current_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
             cbs.fire_response(&info, &resp).await;

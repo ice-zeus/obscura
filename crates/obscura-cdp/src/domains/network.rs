@@ -44,21 +44,21 @@ pub async fn handle(
         }
         "setExtraHTTPHeaders" => {
             let headers = params.get("headers").and_then(|v| v.as_object());
-            if let Some(page) = ctx.get_session_page(session_id) {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
                 if let Some(headers) = headers {
                     let header_map: std::collections::HashMap<String, String> = headers
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map).await;
+                    page.set_http_extra_headers(header_map).await;
                 }
             }
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
             let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page(session_id) {
-                page.http_client.set_user_agent(ua).await;
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_http_user_agent_override(ua).await;
             }
             Ok(json!({}))
         }

@@ -116,6 +116,32 @@ impl Response {
     }
 }
 
+/// Merge field names case-insensitively. Request-local values take precedence.
+/// Callers snapshot settings once so redirects cannot re-add removed secrets.
+pub fn merge_request_headers(
+    headers: &mut HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+) {
+    for (name, value) in overrides {
+        headers.retain(|known, _| !known.eq_ignore_ascii_case(name));
+        headers.insert(name.to_ascii_lowercase(), value.clone());
+    }
+}
+
+pub(crate) fn strip_navigation_redirect_headers(
+    headers: &mut HashMap<String, String>,
+    from: &Url,
+    to: &Url,
+    discard_body: bool,
+) {
+    let cross_origin = from.origin() != to.origin();
+    headers.retain(|name, _| {
+        let name = name.to_ascii_lowercase();
+        !(cross_origin && matches!(name.as_str(), "authorization" | "proxy-authorization" | "cookie" | "host"))
+            && !(discard_body && matches!(name.as_str(), "content-encoding" | "content-language" | "content-location" | "content-type" | "content-length"))
+    });
+}
+
 /// Fold one response header line into the collected header map.
 ///
 /// A plain `HashMap` insert keeps only the *last* value when a response repeats
@@ -835,17 +861,18 @@ async fn read_reqwest_body_limited(
 }
 
 pub struct ObscuraHttpClient {
-    client: tokio::sync::OnceCell<Client>,
+    client: Arc<tokio::sync::OnceCell<Client>>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
     pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    interceptor_parent: Option<Arc<ObscuraHttpClient>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -864,6 +891,7 @@ struct ResourceCacheKey {
     initiator: Option<String>,
     referrer: Option<String>,
     user_agent: String,
+    accept_language: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
 }
@@ -1047,7 +1075,7 @@ impl ObscuraHttpClient {
         allow_private_network: bool,
     ) -> Self {
         ObscuraHttpClient {
-            client: tokio::sync::OnceCell::new(),
+            client: Arc::new(tokio::sync::OnceCell::new()),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
@@ -1056,10 +1084,11 @@ impl ObscuraHttpClient {
             accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
+            interceptor_parent: None,
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
         }
     }
@@ -1090,6 +1119,65 @@ impl ObscuraHttpClient {
 
             builder.build().expect("failed to build HTTP client")
         }).await
+    }
+
+    /// Fork mutable page identity while retaining context-owned transport,
+    /// cookies, interception, resource cache and in-flight accounting.
+    pub async fn fork_request_settings(self: &Arc<Self>) -> Self {
+        Self {
+            client: self.client.clone(),
+            proxy_url: self.proxy_url.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            user_agent: RwLock::new(self.user_agent.read().await.clone()),
+            accept_language: RwLock::new(self.accept_language.read().await.clone()),
+            extra_headers: RwLock::new(self.extra_headers.read().await.clone()),
+            interceptor: RwLock::new(None),
+            interceptor_parent: Some(self.clone()),
+            timeout: self.timeout,
+            in_flight: self.in_flight.clone(),
+            block_trackers: self.block_trackers,
+            resource_loader: self.resource_loader.clone(),
+            allow_private_network: self.allow_private_network,
+        }
+    }
+
+    async fn has_interceptor(&self) -> bool {
+        let mut client = self;
+        loop {
+            if client.interceptor.read().await.is_some() {
+                return true;
+            }
+            match client.interceptor_parent.as_deref() {
+                Some(parent) => client = parent,
+                None => return false,
+            }
+        }
+    }
+
+    async fn intercept_request(&self, request: &RequestInfo) -> InterceptAction {
+        let mut client = self;
+        loop {
+            if let Some(interceptor) = client.interceptor.read().await.as_ref() {
+                return interceptor.intercept(request).await;
+            }
+            match client.interceptor_parent.as_deref() {
+                Some(parent) => client = parent,
+                None => return InterceptAction::Continue,
+            }
+        }
+    }
+
+    /// Explicit browser settings, merged once before request-local headers.
+    pub async fn request_headers(&self) -> HashMap<String, String> {
+        let mut headers = HashMap::from([
+            ("user-agent".to_string(), self.user_agent.read().await.clone()),
+        ]);
+        let language = self.accept_language.read().await.clone();
+        if !language.is_empty() {
+            headers.insert("accept-language".to_string(), language);
+        }
+        merge_request_headers(&mut headers, &self.extra_headers.read().await);
+        headers
     }
 
     /// Clone the request client owned by this browser context.
@@ -1181,7 +1269,7 @@ impl ObscuraHttpClient {
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
-            || self.interceptor.read().await.is_some()
+            || self.has_interceptor().await
         {
             return None;
         }
@@ -1218,6 +1306,7 @@ impl ObscuraHttpClient {
             initiator: request.initiator.as_ref().map(ToString::to_string),
             referrer: request.referrer.as_ref().map(ToString::to_string),
             user_agent: self.user_agent.read().await.clone(),
+            accept_language: self.accept_language.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
         })
@@ -1360,7 +1449,7 @@ impl ObscuraHttpClient {
         let request_info = RequestInfo {
             url: url.clone(),
             method: Method::GET.to_string(),
-            headers: self.extra_headers.read().await.clone(),
+            headers: self.request_headers().await,
             resource_type: request.resource_type,
         };
         callbacks.fire_request(&request_info).await;
@@ -1400,6 +1489,9 @@ impl ObscuraHttpClient {
         }
 
         let mut current_url = url.clone();
+        let mut request_headers = self.request_headers().await;
+        let ua = request_headers.get("user-agent").cloned().unwrap_or_default();
+        let accept_language = request_headers.get("accept-language").cloned().unwrap_or_default();
         let mut redirects = Vec::new();
         // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
         // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
@@ -1412,15 +1504,15 @@ impl ObscuraHttpClient {
 
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
-            let request_info = RequestInfo {
+            let mut request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: request_headers.clone(),
                 resource_type: request.resource_type.clone(),
             };
 
-            if let Some(interceptor) = self.interceptor.read().await.as_ref() {
-                match interceptor.intercept(&request_info).await {
+            {
+                match self.intercept_request(&request_info).await {
                     InterceptAction::Continue => {}
                     InterceptAction::Block => {
                         return Err(ObscuraNetError::Blocked(current_url.to_string()));
@@ -1430,19 +1522,12 @@ impl ObscuraHttpClient {
                     }
                     InterceptAction::ModifyHeaders(headers) => {
                         let mut extra = self.extra_headers.write().await;
-                        extra.extend(headers);
+                        extra.extend(headers.clone());
+                        merge_request_headers(&mut request_headers, &headers);
                     }
                 }
             }
 
-            if !request_callback_fired {
-                if let Some(cbs) = callbacks {
-                    cbs.fire_request(&request_info).await;
-                }
-                request_callback_fired = true;
-            }
-
-            let ua = self.user_agent.read().await.clone();
             let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
@@ -1490,7 +1575,6 @@ impl ObscuraHttpClient {
                 }
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-            let accept_language = self.accept_language.read().await.clone();
             if let Ok(value) = HeaderValue::from_str(&accept_language) {
                 if !accept_language.is_empty() {
                     headers.insert(reqwest::header::ACCEPT_LANGUAGE, value);
@@ -1539,7 +1623,7 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            for (k, v) in &request_headers {
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -1555,6 +1639,19 @@ impl ObscuraHttpClient {
                 }
             } else {
                 headers.remove(reqwest::header::ORIGIN);
+            }
+
+            if body.is_some() && method == Method::POST {
+                headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+            }
+            request_info.headers = headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str().to_string(), value.to_string()))
+            }).collect();
+            if !request_callback_fired {
+                if let Some(cbs) = callbacks {
+                    cbs.fire_request(&request_info).await;
+                }
+                request_callback_fired = true;
             }
 
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
@@ -1612,12 +1709,13 @@ impl ObscuraHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    let discard_body = status == reqwest::StatusCode::MOVED_PERMANENTLY
+                        || status == reqwest::StatusCode::FOUND
+                        || status == reqwest::StatusCode::SEE_OTHER;
+                    strip_navigation_redirect_headers(&mut request_headers, &current_url, &next_url, discard_body);
                     redirects.push(current_url.clone());
                     current_url = next_url;
-                    if status == reqwest::StatusCode::MOVED_PERMANENTLY
-                        || status == reqwest::StatusCode::FOUND
-                        || status == reqwest::StatusCode::SEE_OTHER
-                    {
+                    if discard_body {
                         method = Method::GET;
                         body = None;
                     }
