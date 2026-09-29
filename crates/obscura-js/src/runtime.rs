@@ -20125,6 +20125,58 @@ mod tests {
         assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "arrived");
     }
 
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_response_exposes_no_engine_request_identity() {
+        let mut rt = redirect_chain_runtime(2);
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+        )));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    const own = Object.getOwnPropertyNames(response).sort();
+                    const reference = Object.getOwnPropertyNames(
+                        new Response("arrived", { status: 200 })
+                    ).sort();
+                    return {
+                        own,
+                        reference,
+                        symbols: Object.getOwnPropertySymbols(response).length,
+                        engine: own.filter((name) => name.startsWith("__obscura")),
+                        reachable: "__obscuraRequestId" in response,
+                        redirected: response.redirected,
+                        text: await response.text(),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        // Chrome's Response has no own properties. The inherited Response shim
+        // keeps its state in own fields, so compare with a page-constructed
+        // Response: a stealth fetch must not add any engine property.
+        assert_eq!(value["own"], value["reference"], "{value}");
+        assert_eq!(value["symbols"], 0);
+        assert_eq!(value["engine"], serde_json::json!([]));
+        assert_eq!(value["reachable"], false);
+        assert_eq!(value["redirected"], true);
+        assert_eq!(value["text"], "arrived");
+        // CDP still receives the identity through the retained completion.
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].request_id.starts_with("fetch-"), "{:?}", events[0].request_id);
+        assert!(!events[0].intercepted);
+        assert!(events[0].url.ends_with("/hop/0"));
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "arrived");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn xhr_response_url_reports_the_final_redirect_url() {
         let mut rt = redirect_chain_runtime(2);

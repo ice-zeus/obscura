@@ -69,7 +69,7 @@ Default UA matches a recent Chrome on the build platform.
 
 ## Browser profile, timezone, and geolocation
 
-The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all.
+The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them. Default builds have no WebGL: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all. Builds with the optional `webgl` feature create real ANGLE contexts. Without `--stealth`, `WEBGL_debug_renderer_info` reports the actual driver strings. With `--stealth`, it reports a vendor/renderer pair drawn per document from a built-in pool for the stealth platform, and `VERSION`/`SHADING_LANGUAGE_VERSION` use Chrome's format. Limits, extensions, shader precision and pixels still come from the actual backend (for example SwiftShader), so they are not guaranteed to match the reported GPU.
 
 A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
 

@@ -438,7 +438,21 @@
   method('isContextLost',0,s=>call(s,'isLost').value);
   method('getError',0,s=>call(s,'getError').value);
   method('getSupportedExtensions',0,s=>call(s,'supportedExtensions').value);
-  method('getParameter',1,(s,name)=>query(s,'getParameter',{name:uint(name)}));
+  // Runtime stealth presents the page's browser identity, not the host driver.
+  // The unmasked strings reuse the document's seeded GPU pool (_fp), shared by
+  // both context versions; version strings use Chrome's format. Null replies
+  // (disabled extension, lost context) and non-stealth driver strings pass through.
+  function identityParameter(s, name, value) {
+    if (typeof value !== 'string' || !globalThis.__obscura_stealth) return value;
+    switch (name) {
+      case 0x9245: return _fp('gpuVendor');
+      case 0x9246: return _fp('gpu');
+      case 0x1F02: return s.version === 2 ? 'WebGL 2.0 (OpenGL ES 3.0 Chromium)' : 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
+      case 0x8B8C: return s.version === 2 ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)' : 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
+      default: return value;
+    }
+  }
+  method('getParameter',1,(s,name)=>{const n=uint(name);return identityParameter(s,n,query(s,'getParameter',{name:n}));});
   method('isEnabled',1,(s,cap)=>query(s,'isEnabled',{cap:uint(cap)}));
   for (const [kind,suffix,version] of [['buffer','Buffer',1],['texture','Texture',1],['shader','Shader',1],['program','Program',1],['framebuffer','Framebuffer',1],['renderbuffer','Renderbuffer',1],['vertexArray','VertexArray',2],['query','Query',2],['sampler','Sampler',2],['transformFeedback','TransformFeedback',2]]) {
     method('create'+suffix,kind==='shader'?1:0,(s,type)=>wrapper(s,kind,call(s,'create',{kind,shader_type:kind==='shader'?uint(type):0}).value),version);

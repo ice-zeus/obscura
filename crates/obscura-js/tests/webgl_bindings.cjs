@@ -82,6 +82,8 @@ function fixture(options={}) {
     }}
   };
   if(options.lateSharedBuffer)sandbox.SharedArrayBuffer=undefined;
+  // Runtime stealth flag and the bootstrap's seeded fingerprint accessor.
+  if(options.stealth){sandbox.__obscura_stealth=true;sandbox._fp=key=>options.stealth[key];}
   if(options.failSharedCopy)sandbox.Uint8Array=new Proxy(Uint8Array,{construct(ctor,args){if(ArrayBuffer.isView(args[0]))throw new RangeError('fixture copy allocation');return Reflect.construct(ctor,args);}});
   vm.createContext(sandbox);vm.runInContext(source,sandbox);
   if(options.lateSharedBuffer)sandbox.SharedArrayBuffer=SharedArrayBuffer;
@@ -935,4 +937,37 @@ test('shared readback copies only successful written ranges and bounds staging a
   const huge=new Uint8Array(new SharedArrayBuffer(256*1024*1024+1));
   const bounded=fixture();bounded.gl.bufferData(bounded.gl.ARRAY_BUFFER,huge,bounded.gl.STATIC_DRAW);
   assert.equal(bounded.gl.getError(),bounded.gl.OUT_OF_MEMORY);assert.equal(bounded.calls.some(row=>row.operation?.kind==='resource'),false);
+});
+test('runtime stealth reports the seeded GPU profile and Chrome version strings in both versions',()=>{
+  const driver={7936:'WebKit',7937:'WebKit WebGL',7938:'WebGL 1.0 (OpenGL ES 2.0)',35724:'WebGL GLSL ES 1.00',
+    0x9245:'Google Inc. (Google)',0x9246:'ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)'};
+  const profile={gpuVendor:'Google Inc. (NVIDIA)',gpu:'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'};
+  function setup(stealth){
+    const debug={enabled:false};
+    // Native replies model the driver: unmasked strings exist only after the
+    // page enables WEBGL_debug_renderer_info; numeric limits are not strings.
+    const query=({method,args})=>{
+      if(method!=='getParameter')return {type:'null'};
+      if(args.name===0x0D33)return {type:'int',value:8192};
+      if((args.name===0x9245||args.name===0x9246)&&!debug.enabled)return {type:'null'};
+      return args.name in driver?{type:'string',value:driver[args.name]}:{type:'null'};
+    };
+    const f=fixture({query,stealth});
+    return {...f,debug,gl2:f.sandbox._webglCreate(new f.sandbox.HTMLCanvasElement(),'webgl2',{})};
+  }
+  const read=gl=>[gl.VENDOR,gl.RENDERER,gl.VERSION,gl.SHADING_LANGUAGE_VERSION,0x9245,0x9246,0x0D33].map(name=>gl.getParameter(name));
+  const plain=setup();
+  assert.equal(plain.gl.getParameter(0x9246),null);
+  assert.equal(plain.gl.getExtension('WEBGL_debug_renderer_info').UNMASKED_RENDERER_WEBGL,0x9246);plain.debug.enabled=true;
+  for(const gl of [plain.gl,plain.gl2])assert.deepEqual(read(gl),[driver[7936],driver[7937],driver[7938],driver[35724],driver[0x9245],driver[0x9246],8192]);
+  const masked=setup(profile);
+  assert.equal(masked.gl.getParameter(0x9246),null);assert.equal(masked.gl2.getParameter(0x9245),null);
+  const ext=masked.gl.getExtension('WEBGL_debug_renderer_info');
+  assert.deepEqual([ext.UNMASKED_VENDOR_WEBGL,ext.UNMASKED_RENDERER_WEBGL],[0x9245,0x9246]);masked.debug.enabled=true;
+  const one=['WebKit','WebKit WebGL','WebGL 1.0 (OpenGL ES 2.0 Chromium)','WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)',profile.gpuVendor,profile.gpu,8192];
+  const two=['WebKit','WebKit WebGL','WebGL 2.0 (OpenGL ES 3.0 Chromium)','WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)',profile.gpuVendor,profile.gpu,8192];
+  assert.deepEqual(read(masked.gl),one);assert.deepEqual(read(masked.gl2),two);
+  assert.deepEqual(read(masked.gl),one);assert.deepEqual(read(masked.gl2),two);
+  masked.gl.getExtension('WEBGL_lose_context').loseContext();assert.equal(masked.gl.getParameter(0x9246),null);assert.equal(masked.gl.getParameter(masked.gl.VERSION),null);
+  assert.deepEqual(read(masked.gl2),two);
 });

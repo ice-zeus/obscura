@@ -61,7 +61,11 @@ Invalid policy, missing libraries or exhausted backends cause `getContext()`
 to return `null` and produce a context-creation error event. Creation failures
 and attempted backends are logged by the host. Debug logging records the
 selected backend and actual renderer. Diagnostic driver strings are not a
-promise that a GPU matches the emulated browser/device identity.
+promise that a GPU matches the emulated browser/device identity. With runtime
+stealth, page-visible `WEBGL_debug_renderer_info` values come from the
+document's seeded GPU pool for the stealth platform, and `VERSION` and
+`SHADING_LANGUAGE_VERSION` use Chrome's format. Limits, extensions, shader
+precision and pixels still come from the actual backend and are not masked.
 
 Native libraries and displays are initialized lazily and reused within the
 process. Their discovery is cached; install or change a bundle before launch,
