@@ -86,6 +86,7 @@ pub struct CdpContext {
     pub runtime_enabled_sessions: HashSet<String>,
     /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
     pub(crate) lifecycle_enabled_sessions: HashSet<String>,
+    pub(crate) network_enabled_sessions: HashSet<String>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -191,6 +192,7 @@ impl CdpContext {
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
+            network_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -349,6 +351,7 @@ impl CdpContext {
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
+            self.network_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -495,6 +498,14 @@ impl CdpContext {
             self.valid_context_ids.remove(&id);
             self.execution_contexts.remove(&id)
         }).collect()
+    }
+
+    pub(crate) fn network_sessions_for_page(&self, page_id: &str) -> Vec<String> {
+        let mut sessions = self.network_enabled_sessions.iter()
+            .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
+            .cloned().collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
     }
 
     pub(crate) fn runtime_sessions_for_page(&self, page_id: &str) -> Vec<String> {

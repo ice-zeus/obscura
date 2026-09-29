@@ -19,7 +19,7 @@ use crate::client::{
     cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
-    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    validate_url, CallbackRegistry, InFlightGuard, NavigationExchange, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
@@ -327,6 +327,31 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile_traced(initial_method,url,initial_body,request,callbacks,None).await
+    }
+
+    /// Navigation-only transport observations, separate from logical callbacks.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_with_trace(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        let mut trace=Vec::new();
+        let method=if form.is_some() {wreq::Method::POST} else {wreq::Method::GET};
+        let result=self.fetch_with_profile_traced(method,url,form.map(|body|body.as_bytes().to_vec()),ResourceRequest::navigation(),callbacks,Some(&mut trace)).await;
+        if result.is_err() {
+            if let Some(last)=trace.last_mut() { last.failed=true; }
+        }
+        (result,trace)
+    }
+
+    async fn fetch_with_profile_traced(
+        &self,
+        initial_method: wreq::Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+        mut trace: Option<&mut Vec<NavigationExchange>>,
+    ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
@@ -423,6 +448,10 @@ impl StealthHttpClient {
                 request_callback_fired = true;
             }
 
+            let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            if let Some(trace)=trace.as_mut() {
+                trace.push(NavigationExchange::started(&request_info,body.as_deref(),timestamp));
+            }
             let in_flight = InFlightGuard::new(&self.in_flight);
             let result = if method == wreq::Method::GET && body.is_none() {
                 send_get_with_connection_reset_retry(req, &current_url).await
@@ -463,6 +492,11 @@ impl StealthHttpClient {
                 );
             }
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) {
+                last.status=Some(status.as_u16());
+                last.response_headers=response_headers.clone();
+            }
+
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location") {
                     let location_str = location.to_str().map_err(|_| {
@@ -493,6 +527,7 @@ impl StealthHttpClient {
                 .await?;
             drop(in_flight);
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) { last.response_body_size=Some(body.len()); }
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),

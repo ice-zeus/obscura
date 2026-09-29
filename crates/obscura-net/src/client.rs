@@ -172,6 +172,31 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
+/// Internal navigation/CDP observation captured at the transport boundary.
+/// Existing RequestInfo/Response and logical callback contracts are unchanged.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct NavigationExchange {
+    pub request: RequestInfo,
+    pub post_data: Option<String>,
+    pub has_post_data: bool,
+    pub status: Option<u16>,
+    pub response_headers: HashMap<String, String>,
+    pub response_body_size: Option<usize>,
+    pub failed: bool,
+    pub timestamp: f64,
+}
+impl NavigationExchange {
+    pub(crate) fn started(request: &RequestInfo, body: Option<&[u8]>, timestamp: f64) -> Self {
+        // Large/binary bodies remain explicitly unavailable, never reconstructed
+        // from the document. The redirect loop bounds the number of observations.
+        let post_data=body.filter(|bytes| bytes.len()<=64*1024)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::to_string);
+        Self { request:request.clone(),post_data,has_post_data:body.is_some(),status:None,
+            response_headers:HashMap::new(),response_body_size:None,failed:false,timestamp }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ResourceType {
     Document,
@@ -1464,6 +1489,31 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile_uncached_traced(initial_method,url,initial_body,callbacks,request,None).await
+    }
+
+    /// Navigation-only transport observations, separate from logical callbacks.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_with_trace(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        let mut trace=Vec::new();
+        let method=if form.is_some() {Method::POST} else {Method::GET};
+        let result=self.fetch_with_profile_uncached_traced(method,url,form.map(|body|body.as_bytes().to_vec()),callbacks,ResourceRequest::navigation(),Some(&mut trace)).await;
+        if result.is_err() {
+            if let Some(last)=trace.last_mut() { last.failed=true; }
+        }
+        (result,trace)
+    }
+
+    async fn fetch_with_profile_uncached_traced(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
+        mut trace: Option<&mut Vec<NavigationExchange>>,
+    ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
 
@@ -1661,6 +1711,10 @@ impl ObscuraHttpClient {
                 req_builder = req_builder.body(b.clone());
             }
 
+            let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            if let Some(trace)=trace.as_mut() {
+                trace.push(NavigationExchange::started(&request_info,body.as_deref(),timestamp));
+            }
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
@@ -1689,6 +1743,11 @@ impl ObscuraHttpClient {
                     k.as_str().to_lowercase(),
                     v.to_str().unwrap_or("").to_string(),
                 );
+            }
+
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) {
+                last.status=Some(status.as_u16());
+                last.response_headers=response_headers.clone();
             }
 
             if status.is_redirection() {
@@ -1725,6 +1784,7 @@ impl ObscuraHttpClient {
             .await?;
             drop(in_flight);
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) { last.response_body_size=Some(body_bytes.len()); }
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),

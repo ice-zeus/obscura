@@ -17449,6 +17449,69 @@ mod tests {
     }
 
     #[test]
+    fn native_form_submission_normalizes_names_and_values_without_mutating_controls() {
+        for method in ["GET", "POST"] {
+            let mut rt = setup_runtime(
+                r#"<form action="/submit"><textarea id="notes" name="notes"></textarea></form>"#,
+            );
+            rt.evaluate(&format!("document.querySelector('form').method={method:?}"))
+                .unwrap();
+            assert_eq!(
+                rt.evaluate(
+                    r#"(() => {
+              const control=document.getElementById('notes');
+              control.setAttribute('name','n\rx\ny\r\nz');control.value='a\rb\nc\r\nd';
+              document.querySelector('form').submit();
+              return [control.getAttribute('name'),control.value];
+            })()"#
+                )
+                .unwrap(),
+                serde_json::json!(["n\rx\ny\r\nz", "a\rb\nc\r\nd"])
+            );
+            let encoded = "n%0D%0Ax%0D%0Ay%0D%0Az=a%0D%0Ab%0D%0Ac%0D%0Ad";
+            let expected = if method == "POST" {
+                (
+                    String::from("http://example.com/submit"),
+                    String::from("POST"),
+                    encoded.to_string(),
+                )
+            } else {
+                (
+                    format!("http://example.com/submit?{encoded}"),
+                    String::from("GET"),
+                    String::new(),
+                )
+            };
+            assert_eq!(rt.take_pending_navigation(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn native_form_submission_preserves_empty_values_duplicates_and_form_encoding() {
+        let mut rt = setup_runtime(
+            r#"<form action="/submit" method="post"><textarea name="empty">original text</textarea><input name="extra" value="first"><input name="extra" value="second"><input id="punctuation" name="a b!~'()*-._" value=""><input name="ignored" disabled value="no"><input type="checkbox" name="unchecked" value="no"><input type="checkbox" checked name="checked" value="yes"></form>"#,
+        );
+        rt.evaluate(
+            r#"(() => {
+          document.querySelector('textarea').value='';
+          document.getElementById('punctuation').value="a b!~'()*-._é";
+          document.querySelector('form').submit();
+        })()"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                String::from("http://example.com/submit"),
+                String::from("POST"),
+                String::from(
+                    "empty=&extra=first&extra=second&a+b%21%7E%27%28%29*-._=a+b%21%7E%27%28%29*-._%C3%A9&checked=yes"
+                )
+            ))
+        );
+    }
+
+    #[test]
     fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
         let mut rt =
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);

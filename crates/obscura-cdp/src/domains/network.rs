@@ -31,14 +31,23 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            if let Some(session) = session_id.as_ref().filter(|sid| ctx.sessions.contains_key(*sid)) {
+                ctx.network_enabled_sessions.insert(session.clone());
+            }
+            Ok(json!({}))
+        }
         "disable" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.clear_response_bodies();
-            } else {
-                for page in &mut ctx.pages {
-                    page.clear_response_bodies();
+            if let Some(session) = session_id {
+                ctx.network_enabled_sessions.remove(session);
+                if let Some(page_id) = ctx.sessions.get(session).cloned() {
+                    if ctx.network_sessions_for_page(&page_id).is_empty() {
+                        if let Some(page) = ctx.get_page_mut(&page_id) { page.clear_response_bodies(); }
+                    }
                 }
+            } else {
+                // Preserve the browser-level response-body cache clearing API.
+                for page in &mut ctx.pages { page.clear_response_bodies(); }
             }
             Ok(json!({}))
         }

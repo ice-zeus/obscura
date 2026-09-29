@@ -5181,11 +5181,13 @@ class Element extends Node {
         const opt = f.querySelector('option[selected]') || f.querySelector('option');
         val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
       } else if (tag === 'textarea') {
-        val = f.value || f.textContent || '';
+        val = f.value; // An explicitly cleared textarea must stay empty.
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
+      // HTML form entry names and string values normalize line breaks before
+      // the shared application/x-www-form-urlencoded serializer runs.
+      const enc = (s) => _formEncode(String(s).replace(/\r\n|\r|\n/g, '\r\n'));
       pairs.push(enc(name) + '=' + enc(val));
     }
 

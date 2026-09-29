@@ -1827,7 +1827,7 @@ async fn process_with_interception(
         page.set_preload_scripts(preload_scripts);
         let result = if !send_command_response {
             page.navigate_from_document(&url_owned, &nav_method, &nav_body).await
-        } else if nav_method == "POST" && !nav_body.is_empty() {
+        } else if nav_method == "POST" {
             page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
         } else {
             page.navigate_with_wait(&url_owned, wait_until).await
@@ -1951,7 +1951,6 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
 
-    #[cfg(feature = "render")]
     let navigation_succeeded = navigate_result.is_ok();
     let response = match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
@@ -1973,6 +1972,7 @@ async fn process_with_interception(
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
+    if navigation_succeeded {
     crate::domains::page::emit_navigation_events(
         ctx,
         &session_for_events,
@@ -1984,6 +1984,9 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
+    } else {
+        crate::domains::page::emit_failed_navigation_events(ctx,&page_id_for_events,&frame_id,&loader_id);
+    }
     #[cfg(feature = "render")]
     if navigation_succeeded {
         crate::domains::page::schedule_screencast_frame(ctx, &session_for_events);
@@ -2908,6 +2911,43 @@ mod tests {
     #[test]
     fn parse_cdp_headers_absent_is_none() {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawned_navigation_keeps_a_bodyless_post_and_observer_route() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::task::LocalSet::new().run_until(async {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap();
+            let fixture=tokio::task::spawn_local(async move {
+                let (mut stream,_)=listener.accept().await.unwrap();
+                let mut bytes=Vec::new();
+                while !bytes.windows(4).any(|part|part==b"\r\n\r\n") {
+                    let mut buffer=[0;4096];let n=stream.read(&mut buffer).await.unwrap();assert_ne!(n,0);
+                    bytes.extend_from_slice(&buffer[..n]);assert!(bytes.len()<65536);
+                }
+                let head=String::from_utf8(bytes).unwrap();assert!(head.starts_with("POST /empty HTTP/1.1\r\n"),"{head}");
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\nConnection: close\r\n\r\n<body></body>").await.unwrap();
+            });
+            let context=obscura_browser::BrowserContext::with_storage_and_network("empty-post".into(),None,false,None,None,true);
+            let mut ctx=crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page=ctx.create_page();let primary=format!("{page}-primary");let audit=format!("{page}-audit");
+            ctx.sessions.insert(primary.clone(),page.clone());ctx.sessions.insert(audit.clone(),page);
+            crate::domains::network::handle("enable",&json!({}),&mut ctx,&Some(audit.clone())).await.unwrap();
+            let (_server_tx,mut server_rx)=tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx,mut reply_rx)=tokio::sync::mpsc::unbounded_channel();
+            let mut intercept_rx=None;let mut paused=HashMap::new();let mut deferred=std::collections::VecDeque::new();
+            let command=json!({"id":1,"method":"Page.navigate","sessionId":primary,"params":{"url":format!("http://{address}/empty"),"__method":"POST","__body":""}}).to_string();
+            tokio::time::timeout(std::time::Duration::from_secs(5),super::process_with_interception(&command,&mut ctx,&reply_tx,&mut server_rx,&mut intercept_rx,&mut paused,&mut deferred,true)).await.unwrap();
+            fixture.await.unwrap();
+            let mut replies=Vec::new();while let Ok(reply)=reply_rx.try_recv() { replies.push(serde_json::from_str::<serde_json::Value>(&reply).unwrap()); }
+            assert!(replies.iter().any(|reply|reply["id"]==1&&reply.get("error").is_none()));
+            let requests=replies.iter().filter(|reply|reply["method"]=="Network.requestWillBeSent").collect::<Vec<_>>();
+            assert_eq!(requests.len(),1);assert_eq!(requests[0]["sessionId"],audit);
+            assert_eq!(requests[0]["params"]["request"]["method"],"POST");
+            assert_eq!(requests[0]["params"]["request"]["postData"],"");
+            assert_eq!(requests[0]["params"]["request"]["hasPostData"],true);
+        }).await;
     }
 
     async fn assert_navigation_intercept_reply_without_timer(method: &str) {

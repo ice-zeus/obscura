@@ -59,10 +59,16 @@ async fn emit_post_eval_nav(
     if server_managed_navigation && page.has_pending_navigation() {
         return Ok(());
     }
-    let navigation = page
-        .process_pending_navigation_outcome()
-        .await
-        .map_err(|e| e.to_string())?;
+    let navigation = match page.process_pending_navigation_outcome().await {
+        Ok(navigation) => navigation,
+        Err(error) => {
+            let page_id=page.id.clone();
+            let frame_id=page.frame_id.clone();
+            let loader_id=format!("loader-{}",uuid::Uuid::new_v4());
+            super::page::emit_failed_navigation_events(ctx,&page_id,&frame_id,&loader_id);
+            return Err(error.to_string());
+        }
+    };
     if navigation == PendingNavigationOutcome::None {
         return Ok(());
     }

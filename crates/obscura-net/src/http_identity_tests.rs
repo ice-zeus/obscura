@@ -475,3 +475,162 @@ async fn identity_fork_cache_tracks_parent_and_local_interception_changes() {
         "independent languages use distinct shared-cache entries"
     );
 }
+
+async fn check_navigation_transport_trace(stealth: bool) {
+    for status in [302, 307, 0] {
+        let destination = Fixture::new(200, None);
+        let source = Fixture::new(status, Some(destination.url.to_string()));
+        let (callbacks, observations) = observe();
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let captured = responses.clone();
+        callbacks.add_response(Arc::new(move |request, response| {
+            captured.lock().unwrap().push((
+                request.method.clone(),
+                response.status,
+                response.url.clone(),
+            ));
+        }));
+        let (result, trace) = if stealth {
+            #[cfg(feature = "stealth")]
+            {
+                let client =
+                    crate::StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+                client.set_user_agent_override("TraceIdentity/22").await;
+                client
+                    .set_extra_headers(HashMap::from([("sec-ch-ua".into(), "Fixture Hint".into())]))
+                    .await;
+                client
+                    .fetch_navigation_with_trace(
+                        &source.url,
+                        Some("notes=line+one%0D%0Aline+two"),
+                        Some(&callbacks),
+                    )
+                    .await
+            }
+            #[cfg(not(feature = "stealth"))]
+            panic!("stealth case requires its feature")
+        } else {
+            let client = ordinary();
+            client.set_user_agent("TraceIdentity/22").await;
+            client
+                .set_extra_headers(HashMap::from([("sec-ch-ua".into(), "Fixture Hint".into())]))
+                .await;
+            client
+                .fetch_navigation_with_trace(
+                    &source.url,
+                    Some("notes=line+one%0D%0Aline+two"),
+                    Some(&callbacks),
+                )
+                .await
+        };
+        let mut wire = source.rows();
+        assert_eq!(
+            wire.len(),
+            1,
+            "POST must not replay even when its response is lost"
+        );
+        wire.extend(destination.rows());
+        assert_eq!(trace.len(), wire.len());
+        assert_eq!(
+            observations.lock().unwrap().len(),
+            1,
+            "logical callbacks retain one initial request"
+        );
+        let responses = responses.lock().unwrap();
+        assert_eq!(
+            responses.len(),
+            if status == 0 { 0 } else { 1 },
+            "logical callbacks retain only the completed final response"
+        );
+        if status != 0 {
+            assert_eq!(
+                responses[0],
+                (
+                    (if status == 302 { "GET" } else { "POST" }).to_string(),
+                    200,
+                    destination.url.clone()
+                )
+            );
+        }
+        for (hop, actual) in trace.iter().zip(&wire) {
+            assert_eq!(hop.request.method, actual.method);
+            for name in ["user-agent", "sec-ch-ua"] {
+                assert_eq!(hop.request.headers[name], actual.headers[name]);
+            }
+            assert!(hop.timestamp > 0.0);
+        }
+        assert_eq!(
+            trace[0].post_data.as_deref(),
+            Some("notes=line+one%0D%0Aline+two")
+        );
+        assert!(trace[0].has_post_data);
+        if status == 0 {
+            assert!(result.is_err());
+            assert_eq!(trace.len(), 1);
+            assert!(trace[0].status.is_none());
+            assert!(trace[0].response_headers.is_empty());
+            assert!(trace[0].response_body_size.is_none());
+            assert!(trace[0].failed);
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(trace.len(), 2);
+            assert_eq!(trace[0].status, Some(status));
+            assert!(
+                trace[0].response_body_size.is_none(),
+                "redirect body was not consumed"
+            );
+            assert_eq!(trace[1].status, Some(200));
+            assert_eq!(
+                trace[1].response_body_size,
+                Some(
+                    wire[1]
+                        .headers
+                        .get("accept-language")
+                        .map(String::len)
+                        .unwrap_or(2)
+                )
+            );
+            assert!(!trace[1].failed);
+            if status == 302 {
+                assert_eq!(trace[1].request.method, "GET");
+                assert!(!trace[1].has_post_data);
+                assert!(trace[1].post_data.is_none());
+            } else {
+                assert_eq!(trace[1].request.method, "POST");
+                assert_eq!(trace[1].post_data, trace[0].post_data);
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn ordinary_navigation_transport_trace_records_wire_hops_and_missing_response() {
+    check_navigation_transport_trace(false).await;
+}
+#[cfg(feature = "stealth")]
+#[tokio::test]
+async fn stealth_navigation_transport_trace_records_wire_hops_and_missing_response() {
+    check_navigation_transport_trace(true).await;
+}
+
+#[test]
+fn navigation_trace_body_capture_is_bounded_and_never_guesses_binary_data() {
+    let request = RequestInfo {
+        url: Url::parse("https://fixture.test/").unwrap(),
+        method: "POST".into(),
+        headers: HashMap::new(),
+        resource_type: crate::ResourceType::Document,
+    };
+    for body in [vec![b'a'; 65537], vec![255]] {
+        let hop = crate::client::NavigationExchange::started(&request, Some(&body), 1.0);
+        assert!(hop.has_post_data);
+        assert!(hop.post_data.is_none());
+        assert!(hop.status.is_none());
+        assert!(!hop.failed);
+    }
+    let empty = crate::client::NavigationExchange::started(&request, Some(b""), 1.0);
+    assert_eq!(empty.post_data.as_deref(), Some(""));
+    assert!(empty.has_post_data);
+    let absent = crate::client::NavigationExchange::started(&request, None, 1.0);
+    assert!(absent.post_data.is_none());
+    assert!(!absent.has_post_data);
+}
