@@ -2934,6 +2934,7 @@ mod tests {
             let started = tokio::time::Instant::now();
             let (resolution_tx, resolution_rx) = tokio::sync::oneshot::channel();
             intercept_tx.send(InterceptedRequest {
+                page_id: page_id.clone(),
                 request_id: "pending-test".into(), url: format!("http://{address}/pending"),
                 method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
                 resolver: resolution_tx,
