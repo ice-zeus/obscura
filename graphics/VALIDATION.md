@@ -76,11 +76,11 @@ graphics fixtures in a separate pass:
 ```sh
 cargo nextest list --locked --release -p obscura-webgl -p obscura-js \
   --features obscura-js/webgl --run-ignored only --ignore-default-filter \
-  -E 'test(/^driver_tests::/) | test(/^webgl_tests::/)' \
+  -E 'test(/^driver_tests::/) | test(/^runtime::webgl_tests::/)' \
   --message-format json > graphics-driver-inventory.json
 cargo nextest run --locked --release -p obscura-webgl -p obscura-js \
   --features obscura-js/webgl --run-ignored only --ignore-default-filter \
-  -E 'test(/^driver_tests::/) | test(/^webgl_tests::/)' \
+  -E 'test(/^driver_tests::/) | test(/^runtime::webgl_tests::/)' \
   --test-threads 1 --no-fail-fast
 ```
 
