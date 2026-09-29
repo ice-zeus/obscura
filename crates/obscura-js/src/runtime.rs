@@ -3790,8 +3790,11 @@ impl ObscuraJsRuntime {
         self.finish_heap_checked(result)
     }
 
-    /// Drive one browser task while allowing the future to remain parked on
-    /// deno_core's real timer/network waker. This is the long-lived browser
+    /// Drive a cooperative event-loop turn with at most two deno_core polls,
+    /// allowing the future to remain parked on its real timer/network waker.
+    /// The first poll may deliver ready work before returning Pending; the
+    /// wake poll then returns control even if more work remains. A turn is not
+    /// a single JavaScript callback budget. This is the long-lived browser
     /// server counterpart to bounded screenshot settling: the owner selects
     /// this future alongside incoming protocol commands, so a page continues
     /// to make progress while the automation client is idle without polling at
@@ -8486,52 +8489,56 @@ mod tests {
             "nested-zero-interval",
             "globalThis.__outerTimerRan = false;\
              globalThis.__zeroIntervalTicks = 0;\
+             globalThis.__zeroIntervalTrace = [];\
+             globalThis.__zeroHostEpoch = 0;\
              setTimeout(() => {\
                globalThis.__outerTimerRan = true;\
-               globalThis.__zeroInterval = setInterval(\
-                 () => __zeroIntervalTicks++, 0);\
+               globalThis.__zeroInterval = setInterval(() => {\
+                 __zeroIntervalTicks++;\
+                 __zeroIntervalTrace.push([__zeroIntervalTicks, __zeroHostEpoch, performance.now()]);\
+               }, 0);\
              }, 0);",
         )
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_autonomous_event_loop_turn().await.unwrap();
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "a repeating timer must yield between ticks; elapsed={elapsed:?}",
-        );
-        assert_eq!(
-            rt.evaluate("globalThis.__outerTimerRan").unwrap(),
-            serde_json::json!(true),
-        );
-        let mut ticks = 0.0;
-        for _ in 0..12 {
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
             rt.run_autonomous_event_loop_turn().await.unwrap();
-            let next = rt
-                .evaluate("globalThis.__zeroIntervalTicks")
-                .unwrap()
-                .as_f64()
-                .unwrap();
-            assert!(
-                next <= ticks + 1.0,
-                "a repeating timer must yield between ticks: {ticks} -> {next}",
-            );
-            ticks = next;
-            if ticks == 6.0 {
-                break;
+            assert_eq!(rt.evaluate("globalThis.__outerTimerRan").unwrap(), serde_json::json!(true));
+            // The initial turn may already have delivered the first interval.
+            // A turn polls deno_core at most twice: ready work before parking,
+            // then a wake poll. Each poll can dispatch this interval once.
+            let mut ticks = rt.evaluate("globalThis.__zeroIntervalTicks").unwrap().as_f64().unwrap();
+            let mut turns = Vec::new();
+            for turn in 0..12 {
+                rt.evaluate("++globalThis.__zeroHostEpoch").unwrap();
+                // Exercise both an immediately re-entered owner and a delayed
+                // owner whose first poll may already find the timer ready.
+                let pause_ms = if turn % 2 == 0 { 0 } else { 5 };
+                if pause_ms != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+                }
+                rt.run_autonomous_event_loop_turn().await.unwrap();
+                let next = rt.evaluate("globalThis.__zeroIntervalTicks").unwrap().as_f64().unwrap();
+                assert!(next >= ticks && next <= ticks + 2.0,
+                    "a repeating timer must yield after at most two polls: {ticks} -> {next}");
+                turns.push(serde_json::json!({"turn":turn,"host_pause_ms":pause_ms,"before":ticks,"after":next}));
+                ticks = next;
+                if ticks >= 6.0 { break; }
             }
-        }
-        assert_eq!(
-            ticks, 6.0,
-            "V8 maintenance wakes must not starve the repeating timer",
-        );
-        rt.execute_script(
-            "clear-zero-interval",
-            "clearInterval(globalThis.__zeroInterval)",
-        )
-            .unwrap();
+            assert!(ticks >= 6.0, "V8 maintenance wakes must not starve the repeating timer");
+            rt.execute_script("clear-zero-interval", "clearInterval(globalThis.__zeroInterval)").unwrap();
+            let callbacks = rt.evaluate("globalThis.__zeroIntervalTrace").unwrap();
+            let mut previous = 0.0;
+            for callback in callbacks.as_array().unwrap() {
+                let tick = callback[0].as_f64().unwrap();
+                assert_eq!(tick, previous + 1.0, "interval callbacks must retain their order");
+                previous = tick;
+            }
+            assert_eq!(previous, ticks);
+            eprintln!("TIMER_TURN_TRACE {}", serde_json::json!({"turns":turns,"callbacks":callbacks}));
+        }).await.expect("the repeating timer must return control and make progress within 500ms");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[tokio::test(flavor = "current_thread")]
