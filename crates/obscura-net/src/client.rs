@@ -1658,12 +1658,6 @@ impl ObscuraHttpClient {
                 .headers(headers);
 
             if let Some(ref b) = body {
-                if method == Method::POST {
-                    req_builder = req_builder.header(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    );
-                }
                 req_builder = req_builder.body(b.clone());
             }
 
