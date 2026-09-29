@@ -6723,12 +6723,16 @@ fn layout_dom_once(
                 s.intrinsic_size = metadata.natural_size();
                 s.replaced_intrinsic = Some(metadata);
                 s.ratio_only_available_width = ratio_only_available_widths.get(&nid).copied();
-                if (s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped)
-                    && metadata.ratio.is_some()
+                let refresh_canvas_ratio = metadata.canvas_bitmap && s.aspect_ratio_is_intrinsic;
+                if (s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped || refresh_canvas_ratio)
+                    && (metadata.ratio.is_some() || metadata.canvas_bitmap)
                 {
+                    // Retained container-query styles can carry the previous
+                    // bitmap's intrinsic ratio. Replace or clear that ratio
+                    // when the bitmap changes; preserve an authored ratio.
                     s.aspect_ratio = metadata.ratio;
                     s.aspect_ratio_is_mapped = false;
-                    s.aspect_ratio_is_intrinsic = true;
+                    s.aspect_ratio_is_intrinsic = metadata.ratio.is_some();
                 }
             }
         }
@@ -13031,8 +13035,12 @@ fn build(
             let ratio_only = intrinsic.width.is_none()
                 && intrinsic.height.is_none()
                 && intrinsic.ratio.is_some();
+            // A zero-axis canvas has independent intrinsic dimensions. A
+            // definite CSS height cannot turn its auto width into block fill.
+            let independent_canvas_width = intrinsic.canvas_bitmap
+                && intrinsic.ratio.is_none() && style.aspect_ratio.is_none();
             if matches!(style.width, crate::Dimension::Auto)
-                && matches!(style.height, crate::Dimension::Auto)
+                && (matches!(style.height, crate::Dimension::Auto) || independent_canvas_width)
                 && !has_percentage_constraint
                 && !ratio_only
                 && !is_in_flow_grid_item(tree, id, style, styles)

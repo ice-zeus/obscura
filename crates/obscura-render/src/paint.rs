@@ -16686,6 +16686,9 @@ mod tests {
             (20, 0, "", (20.0, 0.0)),
             (0, 12, "width:40px", (40.0, 12.0)),
             (20, 0, "height:30px", (20.0, 30.0)),
+            (20, 0, "height:30px;min-width:25px", (25.0, 30.0)),
+            (20, 0, "height:30px;max-width:15px", (15.0, 30.0)),
+            (20, 0, "height:30px;aspect-ratio:2", (60.0, 30.0)),
             (0, 12, "min-width:8px;max-height:10px", (8.0, 10.0)),
             (0, 12, "width:40px;aspect-ratio:4", (40.0, 10.0)),
         ] {
@@ -16748,14 +16751,15 @@ mod tests {
         let target = tree.get_element_by_id("target").unwrap();
         let mut case = QuerySeedCase::new(RenderResourceCache::default(), RenderResourceCache::default());
         case.flush(&tree, &[], 0.0);
-        for (width, height) in [(40, 20), (30, 10)] {
+        for (width, height) in [(40, 20), (30, 10), (30, 0), (40, 20)] {
             for resources in [&mut case.resources, &mut case.oracle_resources] {
                 resources.set_canvas_bitmap_size(target, width, height).unwrap();
             }
             case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
             let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
             assert!((rect.width - 100.0).abs() < 0.01);
-            assert!((rect.height - 100.0 * height as f32 / width as f32).abs() < 0.01);
+            assert!((rect.height - 100.0 * height as f32 / width as f32).abs() < 0.01,
+                "bitmap {width}x{height} produced {}x{}", rect.width, rect.height);
         }
         case.set_attribute(&tree, target, "hidden", "", 0.0);
         for resources in [&mut case.resources, &mut case.oracle_resources] {

@@ -139,7 +139,34 @@ fn parse(bytes: &[u8], depth: usize, budget: &Arc<Budget>) -> Option<usvg::Tree>
         },
         ..Default::default()
     };
-    let tree = usvg::Tree::from_xmltree(&document, &options).ok()?;
+    // usvg 0.47 resolves an absent percentage root against a 100x100
+    // view box and may replace it with the drawing bounds. An external SVG
+    // without intrinsic dimensions or a viewBox instead has the browser's
+    // 300x150 default viewport, independent of its painted content.
+    let tree = if root.attribute("width").is_none()
+        && root.attribute("height").is_none()
+        && root.attribute("viewBox").is_none()
+    {
+        // The XML parser has already validated this exact root. Insert only
+        // presentation attributes after its qualified name, preserving XML
+        // declarations, comments, namespaces, children and author CSS.
+        let name_start = root.range().start.checked_add(1)?;
+        let name_end = name_start + xml.as_bytes().get(name_start..)?.iter()
+            .position(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'/' | b'>'))?;
+        let normalized = format!("{} width=\"300\" height=\"150\"{}",
+            &xml[..name_end], &xml[name_end..]);
+        let normalized = usvg::roxmltree::Document::parse_with_options(
+            &normalized,
+            usvg::roxmltree::ParsingOptions {
+                allow_dtd: true,
+                nodes_limit: MAX_XML_NODES,
+                ..Default::default()
+            },
+        ).ok()?;
+        usvg::Tree::from_xmltree(&normalized, &options).ok()?
+    } else {
+        usvg::Tree::from_xmltree(&document, &options).ok()?
+    };
     tree_dimensions(&tree)?;
     Some(tree)
 }
@@ -229,6 +256,18 @@ mod tests {
             dimensions(b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
             Some((300, 150))
         );
+        for content in ["", "<rect width='2' height='1' fill='red'/>"] {
+            for prefix in ["", "<?xml version='1.0'?><!-- fixture -->"] {
+                let bytes = format!("{prefix}<s:svg xmlns:s='http://www.w3.org/2000/svg'>{content}</s:svg>");
+                assert_eq!(dimensions(bytes.as_bytes()), Some((300, 150)));
+            }
+        }
+        let bytes = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='100%' height='100%' fill='red'/></svg>";
+        let mut pixels = vec![0; 300 * 150 * 4];
+        assert!(decode(bytes, &mut pixels));
+        for offset in [0, (300 * 150 - 1) * 4] {
+            assert_eq!(&pixels[offset..offset + 4], &[255, 0, 0, 255]);
+        }
     }
     #[test]
     fn invalid_or_oversized_inputs_preserve_the_destination() {
