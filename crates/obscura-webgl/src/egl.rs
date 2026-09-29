@@ -466,6 +466,10 @@ impl Context {
         }
     }
     pub fn make_current(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if crate::creation_test_faults::ACTIVATE.with(|fault| fault.replace(false)) {
+            return Err("injected first Canvas activation failure".into());
+        }
         unsafe {
             let f = &self.display.libraries.functions;
             if (f.make_current)(

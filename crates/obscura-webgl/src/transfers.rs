@@ -815,6 +815,10 @@ impl CanvasContext {
             if self.attributes.stencil {
                 bits |= glow::STENCIL_BUFFER_BIT;
             }
+            #[cfg(test)]
+            if crate::creation_test_faults::CLEAR.with(|fault| fault.replace(false)) {
+                bits = u32::MAX; // Native GL rejects this mask; no successful clear occurs.
+            }
             gl.clear(bits);
             gl.clear_color(color[0], color[1], color[2], color[3]);
             gl.clear_depth_f32(depth);

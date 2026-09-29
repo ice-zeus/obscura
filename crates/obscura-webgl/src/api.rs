@@ -93,21 +93,17 @@ impl CanvasContext {
         version: u8,
         width: u32,
         height: u32,
-        mut attributes: Attributes,
+        attributes: Attributes,
         mode: Mode,
     ) -> Result<Self, CreationFailure> {
-        let requested_attributes = attributes.clone();
-        let options = SurfaceOptions {
-            alpha: attributes.alpha,
-            depth: attributes.depth,
-            stencil: attributes.stencil,
-            antialias: attributes.antialias,
-        };
-        let (driver, backend, attempts) = selection::select(
+        // Selection includes drawing-buffer initialization. A backend that
+        // fails before publication must not return an already-lost context or
+        // prevent auto mode from trying the next backend.
+        let (mut context, _, attempts) = selection::select(
             Platform::current(),
             mode,
             attributes.fail_if_major_performance_caveat,
-            |backend| egl::Context::create(backend, version, width, height, options),
+            |backend| Self::initialize(backend, version, width, height, attributes.clone()),
         )
         .map_err(|attempts| CreationFailure {
             reason: if attempts.is_empty() {
@@ -117,13 +113,31 @@ impl CanvasContext {
             },
             attempts,
         })?;
+        context.diagnostics.attempts = attempts;
+        Ok(context)
+    }
+    fn initialize(
+        backend: Backend,
+        version: u8,
+        width: u32,
+        height: u32,
+        mut attributes: Attributes,
+    ) -> Result<Self, String> {
+        let requested_attributes = attributes.clone();
+        let options = SurfaceOptions {
+            alpha: attributes.alpha,
+            depth: attributes.depth,
+            stencil: attributes.stencil,
+            antialias: attributes.antialias,
+        };
+        let driver = egl::Context::create(backend, version, width, height, options)?;
         let diagnostics = unsafe {
             Diagnostics {
                 backend,
                 renderer: driver.gl.get_parameter_string(glow::RENDERER),
                 vendor: driver.gl.get_parameter_string(glow::VENDOR),
                 gl_version: driver.gl.get_parameter_string(glow::VERSION),
-                attempts,
+                attempts: Vec::new(),
             }
         };
         attributes.antialias = driver.samples > 0;
@@ -161,6 +175,12 @@ impl CanvasContext {
             dirty: true,
         };
         context.initialize_drawing_buffer();
+        if context.is_lost() {
+            return Err("Initial WebGL drawing-buffer activation failed".into());
+        }
+        if context.retain_driver_errors() {
+            return Err("Initial WebGL drawing-buffer setup failed".into());
+        }
         Ok(context)
     }
     pub fn is_lost(&self) -> bool {
