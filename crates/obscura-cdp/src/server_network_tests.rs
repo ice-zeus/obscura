@@ -416,8 +416,7 @@ fn continued_response_resolutions_preserve_session_scope_and_cleanup() {
     assert!(ctx.pending_events.is_empty(), "Fail/Fulfill do not invent completion telemetry");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn continued_response_idle_cleanup_retires_residual_records_only_for_live_page() {
+async fn idle_response_provenance_cleanup(detach_last_session: bool) {
     let mut ctx = CdpContext::new();
     let page = ctx.create_page();
     let foreign = ctx.create_page();
@@ -427,6 +426,11 @@ async fn continued_response_idle_cleanup_retires_residual_records_only_for_live_
         "url":"data:text/html,<body>idle cleanup</body>", "waitUntil":"load",
     }), &mut ctx, &session).await.unwrap();
     ctx.pending_events.clear();
+    if detach_last_session {
+        ctx.sessions.remove("owner");
+        ctx.network_enabled_sessions.remove("owner");
+        assert!(ctx.sessions.values().all(|target| target != &page));
+    }
     // Each of these paths can settle without a successful response event.
     for request in ["cors-rejected", "rewrite-blocked", "network-error", "canceled"] {
         ctx.note_intercepted_network_request(&page, request, "owner");
@@ -437,4 +441,14 @@ async fn continued_response_idle_cleanup_retires_residual_records_only_for_live_
     assert_eq!(ctx.intercepted_network_requests.len(), 1);
     assert!(ctx.intercepted_network_requests.contains_key(&(foreign, "same-id".into())));
     assert!(ctx.pending_events.is_empty(), "idle cleanup must not fabricate successful events");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn continued_response_idle_cleanup_retires_residual_records_only_for_live_page() {
+    idle_response_provenance_cleanup(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn continued_response_idle_cleanup_retires_last_detached_session_records() {
+    idle_response_provenance_cleanup(true).await;
 }
