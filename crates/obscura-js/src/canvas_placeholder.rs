@@ -714,13 +714,14 @@ mod tests {
             },
             &mut [],
         );
-        assert_eq!(zero["status"], "ready");
-        assert_eq!(
-            (zero["width"].as_u64(), zero["height"].as_u64()),
-            (Some(0), Some(12))
-        );
-        assert_eq!(state.webgl.placeholders.retained_bytes, 0);
-        assert!(state.webgl_surfaces[&node].2.is_empty());
+        assert_eq!(zero["status"], "failed");
+        let retained = dispatch(&mut state, Request::Info { id }, &mut []);
+        assert_eq!((retained["width"].as_u64(), retained["height"].as_u64()), (Some(2), Some(1)));
+        assert_eq!(retained["revision"], 2);
+        assert_eq!(state.webgl.placeholders.retained_bytes, 8);
+        assert_eq!(state.webgl_surfaces[&node].2, [90; 8]);
+        assert_eq!(dispatch(&mut state, Request::Pixels { id, revision: 2 }, &mut output)["status"], "ready");
+        assert_eq!(output, [90; 8]);
     }
     #[test]
     fn invalid_destinations_sources_sizes_and_budgets_preserve_the_previous_frame() {
