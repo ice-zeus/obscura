@@ -114,7 +114,7 @@ class DependencyRecipeTests(unittest.TestCase):
         self.assertEqual(recipe.artifact(build, "libEGL.so"), build / "libEGL.so")
 
     def invoke(self, system="Linux", extra=(), wrong_revision=False, build_error=False, copy_error=False,
-               machine="arm64", sysroot_error=False):
+               machine="arm64", sysroot_error=False, missing_loader=False):
         argv = ["build_dependencies.py", "--work-dir", str(self.work), "--output", str(self.output), *extra]
         def checkout(directory, pin, env):
             directory.mkdir(parents=True, exist_ok=True)
@@ -140,6 +140,8 @@ class DependencyRecipeTests(unittest.TestCase):
                 suffix = "dylib" if system == "Darwin" else "so"
                 for name in [f"libEGL.{suffix}", f"libGLESv2.{suffix}", "libvk_swiftshader.so"]:
                     (build / name).write_bytes(name.encode())
+                if not missing_loader:
+                    (build / "libvulkan.so.1").write_bytes(b"pinned built Vulkan loader")
                 (build / "vk_swiftshader_icd.json").write_text(json.dumps({"ICD": {"library_path": "/temporary/path.so"}}))
             return None
         with patch("sys.argv", argv), patch.object(recipe.platform, "system", return_value=system), \
@@ -157,6 +159,9 @@ class DependencyRecipeTests(unittest.TestCase):
         self.assertEqual(manifest["os"], "linux"); self.assertEqual(manifest["arch"], "aarch64")
         self.assertEqual(manifest["angle_commit"], recipe.PINS["angle"]["commit"])
         self.assertEqual(manifest["swiftshader_commit"], recipe.PINS["swiftshader"]["commit"])
+        self.assertEqual(set(manifest["files"]), {"libEGL.so", "libGLESv2.so", "libvulkan.so.1",
+                                                 "libvk_swiftshader.so", "vk_swiftshader_icd.json"})
+        self.assertEqual((self.output / "libvulkan.so.1").read_bytes(), b"pinned built Vulkan loader")
         for name, digest in manifest["files"].items():
             self.assertEqual(digest, hashlib.sha256((self.output / name).read_bytes()).hexdigest())
         self.assertEqual(json.loads((self.output / "vk_swiftshader_icd.json").read_text())["ICD"]["library_path"], "./libvk_swiftshader.so")
@@ -164,6 +169,12 @@ class DependencyRecipeTests(unittest.TestCase):
         self.assertFalse((self.output / "licenses/NOTICE-link").exists())
         self.assertFalse(self.output.with_name("bundle.building").exists())
         self.assertIn("pending", manifest["validation"])
+
+    def test_missing_built_vulkan_loader_never_publishes_a_linux_bundle(self):
+        with self.assertRaisesRegex(RuntimeError, "libvulkan.so.1"):
+            self.invoke(missing_loader=True)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.output.with_name("bundle.building").exists())
 
     def test_macos_bundle_omits_software_libraries(self):
         commands = self.invoke(system="Darwin", sysroot_error=True)

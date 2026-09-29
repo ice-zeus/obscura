@@ -31,6 +31,9 @@ contain, or be inside, the work directory. Failed build/staging evidence is
 retained; the recipe does not overwrite an existing bundle. The dependency
 lock pins ANGLE, its matching SwiftShader revision and depot_tools. The
 result includes library hashes, upstream licenses and build arguments.
+Linux also includes the exact built `libvulkan.so.1`: this pinned ANGLE loads
+Vulkan from its own module directory, including when selecting SwiftShader.
+A system Vulkan loader does not satisfy this bundle dependency.
 
 Set `OBSCURA_WEBGL_LIB_DIR` to this bundle's absolute directory. Alternatively,
 install it as `webgl/` next to the Obscura executable. The loader verifies the

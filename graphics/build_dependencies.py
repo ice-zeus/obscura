@@ -137,7 +137,9 @@ def main():
     suffix = "dylib" if system == "macos" else "so"
     names = [f"libEGL.{suffix}", f"libGLESv2.{suffix}"]
     if system == "linux":
-        names += ["libvk_swiftshader.so", "vk_swiftshader_icd.json"]
+        # This pinned ANGLE uses a module-local Vulkan loader, including for
+        # SwiftShader. Its built loader must travel with EGL/GLES and the ICD.
+        names += ["libvulkan.so.1", "libvk_swiftshader.so", "vk_swiftshader_icd.json"]
     sources = {name: artifact(build, name) for name in names}
     # Verify all inputs first; never publish a manifest for a partial bundle.
     staging = output.with_name(output.name + ".building")
