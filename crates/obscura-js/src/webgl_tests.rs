@@ -1318,6 +1318,32 @@ fn real_buffer_data_overloads_convert_numeric_values_and_preserve_buffer_sources
           for(const source of [4,'4',bytes.buffer,null,undefined]){let type=null;try{gl.bufferData(gl.ARRAY_BUFFER,source,gl.STATIC_DRAW,undefined);}catch(error){type=error.name;}check(type==='TypeError','range requires view');}
           gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.STATIC_DRAW,1,2);const output=new Uint8Array(2);gl.getBufferSubData(gl.ARRAY_BUFFER,0,output);check(output.join(',')==='8,7','range bytes');
         }
+        if(typeof SharedArrayBuffer==='function'){
+          const shared=new Uint8Array(new SharedArrayBuffer(48));shared.fill(19);
+          if(version===2){
+            gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.STATIC_DRAW);
+            gl.getBufferSubData(gl.ARRAY_BUFFER,0,shared,4,4);
+            check(shared.slice(4,8).join(',')==='9,8,7,6'&&shared[3]===19&&shared[8]===19,'shared buffer copyback range');
+            shared.fill(19);gl.getBufferSubData(gl.ARRAY_BUFFER,99,shared,4,4);
+            check(gl.getError()===gl.INVALID_VALUE&&shared.every(n=>n===19),'rejected shared buffer read');
+            gl.pixelStorei(gl.PACK_ROW_LENGTH,3);gl.pixelStorei(gl.PACK_SKIP_PIXELS,1);gl.pixelStorei(gl.PACK_SKIP_ROWS,1);
+          }
+          gl.clearColor(1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.enable(0xdead);
+          gl.readPixels(0,0,2,2,gl.RGBA,gl.UNSIGNED_BYTE,shared);
+          check(gl.getError()===gl.INVALID_ENUM&&gl.getError()===0,'shared read preserves previous error');
+          const start=version===2?16:0,stride=version===2?12:8;
+          for(let i=0;i<48;i++){
+            const row=i>=start&&i<start+8?i-start:i>=start+stride&&i<start+stride+8?i-start-stride:-1;
+            check(shared[i]===(row<0?19:row%4===0||row%4===3?255:0),'shared packed pixel range');
+          }
+          shared.fill(19);gl.readPixels(0,0,2,2,0xdead,gl.UNSIGNED_BYTE,shared);
+          check(gl.getError()!==0&&shared.every(n=>n===19),'rejected shared pixel read');
+          const incomplete=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,incomplete);
+          gl.readPixels(0,0,2,2,gl.RGBA,gl.UNSIGNED_BYTE,shared);
+          check(gl.getError()===gl.INVALID_FRAMEBUFFER_OPERATION&&shared.every(n=>n===19),'native rejected shared pixel read');
+          gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(incomplete);
+          if(version===2){gl.pixelStorei(gl.PACK_ROW_LENGTH,0);gl.pixelStorei(gl.PACK_SKIP_PIXELS,0);gl.pixelStorei(gl.PACK_SKIP_ROWS,0);}
+        }
         check(gl.getError()===0,'final GL error');gl.deleteBuffer(buffer);gl.getExtension('WEBGL_lose_context').loseContext();
       }
       return true;

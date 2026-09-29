@@ -574,12 +574,17 @@ impl CanvasContext {
         Ok(())
     }
     pub fn get_buffer_sub_data(&mut self, target: u32, offset: i64, destination: &mut [u8]) {
+        let _ = self.get_buffer_sub_data_with_status(target, offset, destination);
+    }
+    /// Internal bridge completion receipt; public readback keeps its void API.
+    #[doc(hidden)]
+    pub fn get_buffer_sub_data_with_status(&mut self, target: u32, offset: i64, destination: &mut [u8]) -> bool {
         if !self.activate() {
-            return;
+            return false;
         }
         // Preserve older page errors before checking internal mapping errors.
         self.retain_driver_errors();
-        if self.is_lost() { return; }
+        if self.is_lost() { return false; }
         let result = (|| {
             if self.version != 2 {
                 return Err(glow::INVALID_OPERATION);
@@ -625,8 +630,9 @@ impl CanvasContext {
             }
             Ok(())
         })();
-        if let Err(error) = result {
-            self.error(error);
+        match result {
+            Ok(()) => true,
+            Err(error) => { self.error(error); false }
         }
     }
 }

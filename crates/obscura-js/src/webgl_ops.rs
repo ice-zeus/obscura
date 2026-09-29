@@ -253,6 +253,7 @@ enum Operation {
 #[derive(Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 enum ResultValue {
+    PixelRead(Option<obscura_webgl::transfers::PixelReadLayout>),
     DrawingBuffer { width: u32, height: u32, format: u32 },
     Query(Value),
     Attributes(Option<Attributes>),
@@ -602,7 +603,7 @@ fn call(context: &mut CanvasContext, operation: Operation, data: &mut [u8]) -> R
                 context.texture_image(image, has_data.then_some(&*data));
             }
         }
-        ReadPixels(request) => context.read_pixels(request, data),
+        ReadPixels(request) => return ResultValue::PixelRead(context.read_pixels_with_layout(request, data)),
         TextureSource {
             image,
             width,
@@ -612,7 +613,7 @@ fn call(context: &mut CanvasContext, operation: Operation, data: &mut [u8]) -> R
             source_premultiplied,
         } => context.texture_source_color(image, width, height, data, bitmap,source_space,source_premultiplied),
         ReadPixelsBuffer { request, offset } => context.read_pixels_to_buffer(request, offset),
-        BufferRead { target, offset } => context.get_buffer_sub_data(target, offset, data),
+        BufferRead { target, offset } => return ResultValue::Boolean(context.get_buffer_sub_data_with_status(target, offset, data)),
         Resize { width, height } => {
             if context.resize(width, height) { return buffer_info(context); }
         }

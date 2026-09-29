@@ -53,7 +53,7 @@ function fixture(options={}) {
       op_webgl_decode_info(bytes){return options.decodeFails?{status:'invalid'}:{status:'ready',width:1,height:1};},
       op_webgl_decode_pixels(bytes,pixels){pixels.set([17,33,65,128]);return !options.decodePixelsFail;},
       op_webgl_create(frame,epoch,node,version,width,height,attributes){calls.push({create:true,frame,epoch,node,version,width,height,attributes});if(options.fail)return{status:'failed',reason:'Missing graphics bundle'};const id=nextContext++;native.set(id,{lost:false,error:0,version,attributes,canvasSize:{width,height},buffer:{width,height,format:attributes.alpha===false?0x8051:0x8058}});return{status:'ready',id,width,height,attributes};},
-      op_webgl_call(frame,id,operation,data){calls.push({frame,id,operation,data:Array.from(data)});const s=native.get(id);let value={type:'none'};const {kind,value:arg}=operation;
+      op_webgl_call(frame,id,operation,data){calls.push({frame,id,operation,data:Array.from(data),sharedBacking:Object.prototype.toString.call(data.buffer)==='[object SharedArrayBuffer]'});const s=native.get(id);let value={type:'none'};const {kind,value:arg}=operation;
         if(!s||(s.lost&&options.emptyLossReply&&kind!=='restore'))return{lost:true,value};
         if(kind==='create')value={type:'number',value:nextObject++};
         if(kind==='error')s.error=arg.error;
@@ -76,11 +76,15 @@ function fixture(options={}) {
         if(kind==='query'||kind==='advanced')value={type:'query',value:options.query?.(arg)||{type:'null'}};
         if(kind==='query'&&arg.method==='getUniformLocation')value={type:'query',value:{type:'uint',value:nextObject++}};
         if(kind==='readback'||kind==='sourceReadback'){data.fill(42);value={type:'boolean',value:true};}
+        const dataReply=options.dataReply?.(operation,data);if(dataReply)value=dataReply;
         return{lost:s.lost,accepted:!options.reject?.(operation),value};
       }
     }}
   };
+  if(options.lateSharedBuffer)sandbox.SharedArrayBuffer=undefined;
+  if(options.failSharedCopy)sandbox.Uint8Array=new Proxy(Uint8Array,{construct(ctor,args){if(ArrayBuffer.isView(args[0]))throw new RangeError('fixture copy allocation');return Reflect.construct(ctor,args);}});
   vm.createContext(sandbox);vm.runInContext(source,sandbox);
+  if(options.lateSharedBuffer)sandbox.SharedArrayBuffer=SharedArrayBuffer;
   const canvas=new Canvas();const gl=sandbox._webglCreate(canvas,'webgl',{});
   return {sandbox,canvas,gl,calls,tasks,events,native,metadata,states,registrations,retained,finalize,advanceDocument(){sandbox._hostState.documentGeneration=++documentGeneration;},loseNative(id=1){native.get(id).lost=true;tasks.push(lossWatchers.get(id));},drain(){for(let i=0;tasks.length&&i<100;i++)tasks.shift()();assert.equal(tasks.length,0);}};
 }
@@ -892,4 +896,43 @@ test('bufferData selects WebGL2 range overload by argument count and WebGL1 igno
   assert.throws(()=>g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,1n),{name:'TypeError'});
   g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,2**64);assert.deepEqual(f.calls.at(-1).data,[1,2,3,4]);
   g.bufferData(g.ARRAY_BUFFER,bytes,g.STATIC_DRAW,-1);assert.equal(g.getError(),g.INVALID_VALUE);
+});
+
+test('shared buffer brands remain intrinsic when constructor exposure follows bootstrap',()=>{
+  const f=fixture({lateSharedBuffer:true});
+  const shared=new SharedArrayBuffer(5);new Uint8Array(shared).set([9,8,7,6,5]);
+  for(const value of [shared,new Uint8Array(shared,1,3),new DataView(shared,1,3)]){
+    f.gl.bufferData(f.gl.ARRAY_BUFFER,value,f.gl.STATIC_DRAW);
+    const call=f.calls.at(-1);assert.equal(call.operation.value.command.args.size,value.byteLength);
+    assert.equal(call.sharedBacking,false);assert.deepEqual(call.data,Array.from(new Uint8Array(value.buffer||value,value.byteOffset||0,value.byteLength)));
+  }
+  let coercions=0;f.gl.bufferData(f.gl.ARRAY_BUFFER,{[Symbol.toStringTag]:'SharedArrayBuffer',valueOf(){coercions++;return 3;}},f.gl.STATIC_DRAW);
+  assert.equal(coercions,1);assert.equal(f.calls.at(-1).operation.value.command.args.size,3);
+});
+test('shared readback copies only successful written ranges and bounds staging allocation',()=>{
+  const shared=new SharedArrayBuffer(40),destination=new Uint8Array(shared);destination.fill(9);
+  let succeed=false;
+  const f=fixture({dataReply(operation,data){
+    if(!['readPixels','bufferRead'].includes(operation.kind))return;
+    assert.notEqual(Object.prototype.toString.call(data.buffer),'[object SharedArrayBuffer]');
+    destination.fill(7); // Model another agent writing while native work runs.
+    data.fill(1);
+    if(operation.kind==='bufferRead')return{type:'boolean',value:succeed};
+    return{type:'pixelRead',value:succeed?{start:4,stride:12,rows:2,row_bytes:8}:null};
+  }});
+  f.gl.readPixels(0,0,2,2,f.gl.RGBA,f.gl.UNSIGNED_BYTE,destination);
+  assert.deepEqual(Array.from(destination),Array(40).fill(7));
+  succeed=true;f.gl.readPixels(0,0,2,2,f.gl.RGBA,f.gl.UNSIGNED_BYTE,destination);
+  for(let i=0;i<40;i++)assert.equal(destination[i],i>=4&&i<12||i>=16&&i<24?1:7);
+  const gl=f.sandbox._webglCreate(new f.sandbox.HTMLCanvasElement(),'webgl2',{});
+  succeed=false;gl.getBufferSubData(gl.ARRAY_BUFFER,0,destination,4,8);assert.deepEqual(Array.from(destination),Array(40).fill(7));
+  succeed=true;gl.getBufferSubData(gl.ARRAY_BUFFER,0,destination,4,8);
+  for(let i=0;i<40;i++)assert.equal(destination[i],i>=4&&i<12?1:7);
+  const allocation=fixture({failSharedCopy:true});allocation.gl.bufferData(allocation.gl.ARRAY_BUFFER,destination,allocation.gl.STATIC_DRAW);
+  assert.equal(allocation.gl.getError(),allocation.gl.OUT_OF_MEMORY);assert.equal(allocation.calls.some(row=>row.operation?.kind==='resource'),false);
+  // Shared buffers reserve virtual address space; the limit must reject before
+  // any ordinary copy or native op attempts to touch this oversized range.
+  const huge=new Uint8Array(new SharedArrayBuffer(256*1024*1024+1));
+  const bounded=fixture();bounded.gl.bufferData(bounded.gl.ARRAY_BUFFER,huge,bounded.gl.STATIC_DRAW);
+  assert.equal(bounded.gl.getError(),bounded.gl.OUT_OF_MEMORY);assert.equal(bounded.calls.some(row=>row.operation?.kind==='resource'),false);
 });
