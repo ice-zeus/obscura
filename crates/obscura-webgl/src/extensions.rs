@@ -2,7 +2,7 @@
 //! supply behavior. Driver-only extensions are never exposed wholesale.
 use crate::{api::CanvasContext, queries::Value};
 use glow::HasContext;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::collections::HashSet;
 
 struct Extension {
@@ -92,7 +92,7 @@ trait ExtensionAccess {
     fn request(&self, name: &str) -> bool;
 }
 type GetExtensionString = unsafe extern "system" fn(u32) -> *const u8;
-type RequestExtension = unsafe extern "system" fn(*const i8);
+type RequestExtension = unsafe extern "system" fn(*const c_char);
 fn read_extension_string(get: Option<GetExtensionString>, name: u32) -> Option<String> {
     let pointer = unsafe { get?(name) };
     (!pointer.is_null()).then(|| unsafe { CStr::from_ptr(pointer.cast()) }.to_string_lossy().into_owned())
@@ -284,11 +284,13 @@ mod tests {
         unsafe extern "system" fn get(name: u32) -> *const u8 {
             if name == glow::EXTENSIONS { c"GL_OES_texture_float".as_ptr().cast() } else { std::ptr::null() }
         }
-        unsafe extern "system" fn request(name: *const i8) {
+        unsafe extern "system" fn request(name: *const c_char) {
             if unsafe { CStr::from_ptr(name) }.to_bytes() == b"GL_OES_texture_float" {
                 REQUESTS.fetch_add(1, Ordering::SeqCst);
             }
         }
+        // Compile this boundary on both signed- and unsigned-c_char targets.
+        let request: RequestExtension = request;
         assert_eq!(read_extension_string(None, glow::EXTENSIONS), None);
         assert_eq!(read_extension_string(Some(get), 0x93A8), None);
         assert_eq!(read_extension_string(Some(get), glow::EXTENSIONS).as_deref(), Some("GL_OES_texture_float"));

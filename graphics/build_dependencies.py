@@ -39,6 +39,18 @@ def checkout(directory, pin, env):
     run(["git", "fetch", "--depth", "1", "origin", pin["commit"]], cwd=directory, env=env)
     run(["git", "checkout", "--detach", pin["commit"]], cwd=directory, env=env)
 
+def bootstrap_depot_tools(depot, env):
+    # Auto-update is disabled to retain the pin, so initialize its tools
+    # explicitly with the script that does not update the checkout itself.
+    run([depot / "ensure_bootstrap"], cwd=depot, env=env)
+    if run(["git", "rev-parse", "HEAD"], cwd=depot, env=env, capture=True) != PINS["depot_tools"]["commit"]:
+        raise RuntimeError("depot_tools bootstrap changed the pinned revision")
+    if run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=depot, env=env, capture=True):
+        raise RuntimeError("depot_tools bootstrap changed tracked files")
+    # ensure_bootstrap can finish after a failed background setup; verify the
+    # same Python wrapper required by gn before expensive dependency work.
+    run([depot / "python-bin/python3", "--version"], cwd=depot, env=env)
+
 def gn_arguments(system):
     args = ["is_debug=false", "is_component_build=false", "angle_build_all=false",
             "angle_enable_null=false", "angle_enable_gl=false", "is_clang=true",
@@ -91,6 +103,7 @@ def main():
     depot = work / "depot_tools"
     checkout(depot, PINS["depot_tools"], env)
     env["PATH"] = str(depot) + os.pathsep + env["PATH"]
+    bootstrap_depot_tools(depot, env)
     checkout(work / "angle", PINS["angle"], env)
     config = 'solutions = ' + repr([{"name": "angle", "url": PINS["angle"]["repository"],
                                     "managed": False, "custom_deps": {}, "custom_vars": {}}]) + '\n'
