@@ -1093,14 +1093,18 @@ fn image_data_private_color_state_and_canvas_conversion_need_no_graphics_context
 #[test]
 fn image_data_private_brand_survives_a_same_origin_realm_boundary() {
     let mut runtime=page();
-    runtime.execute_script("<fixture-setup>", "window.parentPixels=new ImageData(new Uint8ClampedArray([128,64,32,255]),1,1,{colorSpace:'display-p3'});Object.defineProperty(parentPixels,'data',{get(){throw Error('page getter');}})").unwrap();
     let frame=crate::frame::FrameRealm::new(&mut runtime,71,0,"https://graphics.example/frame","<html><body></body></html>").unwrap();
-    assert_eq!(frame.evaluate(&mut runtime,r#"(()=>{
-      const ctx=new OffscreenCanvas(1,1).getContext('2d');ctx.putImageData(parent.parentPixels,0,0);
+    frame.execute_script(&mut runtime, "window.foreignPixels=new ImageData(new Uint8ClampedArray([128,64,32,255]),1,1,{colorSpace:'display-p3'});Object.defineProperty(foreignPixels,'data',{get(){throw Error('page getter');}})").unwrap();
+    // Consume the child's actual published object. The inherited child
+    // `parent` messaging stub does not publish arbitrary parent properties.
+    assert_eq!(runtime.evaluate(r#"(()=>{
+      const child=globalThis.__obscura_frameObjects[71].window,image=child.foreignPixels;
+      const foreignRealm=child.ImageData!==ImageData && image instanceof child.ImageData && !(image instanceof ImageData);
+      const ctx=new OffscreenCanvas(1,1).getContext('2d');ctx.putImageData(image,0,0);
       const getter=Object.getOwnPropertyDescriptor(ImageData.prototype,'colorSpace').get;
-      return [getter.call(parent.parentPixels),Array.from(ctx.getImageData(0,0,1,1).data),
-        Object.getOwnPropertyNames(parent.parentPixels),Object.getOwnPropertySymbols(parent.parentPixels).length];
-    })()"#).unwrap(),json!(["display-p3",[138,59,21,255],["data"],0]));
+      return [foreignRealm,getter.call(image),Array.from(ctx.getImageData(0,0,1,1).data),
+        Object.getOwnPropertyNames(image),Object.getOwnPropertySymbols(image).length];
+    })()"#).unwrap(),json!([true,"display-p3",[138,59,21,255],["data"],0]));
 }
 
 #[test]
