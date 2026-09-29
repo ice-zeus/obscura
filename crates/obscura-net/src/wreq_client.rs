@@ -184,6 +184,19 @@ async fn send_get_with_connection_reset_retry(
 }
 
 #[cfg(feature = "stealth")]
+fn explicit_header_map(headers: &HashMap<String, String>) -> Result<wreq::header::HeaderMap, ObscuraNetError> {
+    let mut map = wreq::header::HeaderMap::new();
+    for (name, value) in headers {
+        let name = wreq::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| ObscuraNetError::Network("Invalid explicit HTTP header name".into()))?;
+        let value = wreq::header::HeaderValue::from_str(value)
+            .map_err(|_| ObscuraNetError::Network("Invalid explicit HTTP header value".into()))?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
@@ -377,12 +390,11 @@ impl StealthHttpClient {
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in &request_headers {
-                if k.eq_ignore_ascii_case("origin") {
-                    continue;
-                }
-                req = req.header(k.as_str(), v.as_str());
-            }
+            // wreq's single-header builder appends. Replace browser-derived
+            // values explicitly so Accept/Cookie and caller overrides stay singular.
+            let mut explicit = explicit_header_map(&request_headers)?;
+            explicit.remove(wreq::header::ORIGIN);
+            req = req.headers(explicit);
             if cors_required(&request, &current_url) {
                 req = req.header("origin", &request_origin);
             }
@@ -393,7 +405,9 @@ impl StealthHttpClient {
                 observed_headers.insert("origin".into(), request_origin.clone());
             }
             if let Some(bytes) = &body {
-                req = req.header("content-type", "application/x-www-form-urlencoded").body(bytes.clone());
+                let mut form_headers = wreq::header::HeaderMap::new();
+                form_headers.insert(wreq::header::CONTENT_TYPE, wreq::header::HeaderValue::from_static("application/x-www-form-urlencoded"));
+                req = req.headers(form_headers).body(bytes.clone());
                 observed_headers.insert("content-type".into(), "application/x-www-form-urlencoded".into());
             }
             let request_info = RequestInfo {
@@ -566,9 +580,7 @@ impl StealthHttpClient {
                 req = req.header("cookie", &cookie_header);
             }
         }
-        for (k, v) in headers.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        req = req.headers(explicit_header_map(headers)?);
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
