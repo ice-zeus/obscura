@@ -808,6 +808,8 @@ impl CanvasContext {
             };
             let framebuffer = gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING);
             let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            // WebGL 2 drops Clear while RASTERIZER_DISCARD is enabled.
+            let discard = self.version == 2 && gl.is_enabled(glow::RASTERIZER_DISCARD);
             let mask = gl.get_parameter_bool_array::<4>(glow::COLOR_WRITEMASK);
             let depth_mask = gl.get_parameter_bool(glow::DEPTH_WRITEMASK);
             let front = gl.get_parameter_i32(glow::STENCIL_WRITEMASK) as u32;
@@ -819,6 +821,9 @@ impl CanvasContext {
             gl.bind_framebuffer(target, self.default_framebuffer());
             let draw_selection=if self.version==2 { let previous=gl.get_parameter_i32(glow::DRAW_BUFFER0);gl.draw_buffers(&[if self.drawing_storage.is_some() {glow::COLOR_ATTACHMENT0} else {glow::BACK}]);Some(previous) } else { None };
             gl.disable(glow::SCISSOR_TEST);
+            if discard {
+                gl.disable(glow::RASTERIZER_DISCARD);
+            }
             gl.color_mask(true, true, true, true);
             gl.depth_mask(true);
             gl.stencil_mask(u32::MAX);
@@ -844,6 +849,9 @@ impl CanvasContext {
             gl.depth_mask(depth_mask);
             gl.stencil_mask_separate(glow::FRONT, front);
             gl.stencil_mask_separate(glow::BACK, back);
+            if discard {
+                gl.enable(glow::RASTERIZER_DISCARD);
+            }
             if scissor {
                 gl.enable(glow::SCISSOR_TEST);
             }

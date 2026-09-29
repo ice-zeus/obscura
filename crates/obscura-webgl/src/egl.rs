@@ -251,6 +251,71 @@ unsafe fn release_handles(f: &Functions, display: Handle, context: Handle, surfa
         (f.destroy_surface)(display, surface);
     }
 }
+/// Zero the current default framebuffer without changing page-visible state.
+/// Pinned ANGLE Metal never robust-initializes pbuffer color: SurfaceMtl sets
+/// mColorTextureInitialized to true and OffscreenSurfaceMtl never resets it
+/// after allocating a color texture. Drivers can hand a new pbuffer the
+/// memory of a surface that was just freed, so clear it explicitly.
+unsafe fn zero_default_framebuffer(gl: &glow::Context) {
+    use glow::HasContext;
+    let es3 = gl.version().major >= 3;
+    let target = if es3 {
+        glow::DRAW_FRAMEBUFFER
+    } else {
+        glow::FRAMEBUFFER
+    };
+    // FRAMEBUFFER_BINDING is the draw binding in ES3; the read binding is
+    // never changed here.
+    let framebuffer = gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING);
+    let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+    // ES3 drops Clear while RASTERIZER_DISCARD is enabled.
+    let discard = es3 && gl.is_enabled(glow::RASTERIZER_DISCARD);
+    let mask = gl.get_parameter_bool_array::<4>(glow::COLOR_WRITEMASK);
+    let depth_mask = gl.get_parameter_bool(glow::DEPTH_WRITEMASK);
+    let front = gl.get_parameter_i32(glow::STENCIL_WRITEMASK) as u32;
+    let back = gl.get_parameter_i32(glow::STENCIL_BACK_WRITEMASK) as u32;
+    let mut color = [0.0; 4];
+    gl.get_parameter_f32_slice(glow::COLOR_CLEAR_VALUE, &mut color);
+    let depth = gl.get_parameter_f32(glow::DEPTH_CLEAR_VALUE);
+    let stencil = gl.get_parameter_i32(glow::STENCIL_CLEAR_VALUE);
+    gl.bind_framebuffer(target, None);
+    // Draw-buffer selection belongs to the default framebuffer itself.
+    let draw = if es3 {
+        let previous = gl.get_parameter_i32(glow::DRAW_BUFFER0) as u32;
+        gl.draw_buffers(&[glow::BACK]);
+        Some(previous)
+    } else {
+        None
+    };
+    gl.disable(glow::SCISSOR_TEST);
+    if discard {
+        gl.disable(glow::RASTERIZER_DISCARD);
+    }
+    gl.color_mask(true, true, true, true);
+    gl.depth_mask(true);
+    gl.stencil_mask(u32::MAX);
+    gl.clear_color(0.0, 0.0, 0.0, 0.0);
+    gl.clear_depth_f32(1.0);
+    gl.clear_stencil(0);
+    gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+    gl.clear_color(color[0], color[1], color[2], color[3]);
+    gl.clear_depth_f32(depth);
+    gl.clear_stencil(stencil);
+    gl.color_mask(mask[0], mask[1], mask[2], mask[3]);
+    gl.depth_mask(depth_mask);
+    gl.stencil_mask_separate(glow::FRONT, front);
+    gl.stencil_mask_separate(glow::BACK, back);
+    if discard {
+        gl.enable(glow::RASTERIZER_DISCARD);
+    }
+    if scissor {
+        gl.enable(glow::SCISSOR_TEST);
+    }
+    if let Some(draw) = draw {
+        gl.draw_buffers(&[draw]);
+    }
+    gl.bind_framebuffer(target, framebuffer);
+}
 unsafe fn allocate_context<'a>(
     f: &'a Functions,
     display: Handle,
@@ -441,6 +506,14 @@ impl Context {
                 glow::Context::from_loader_function_cstr(|name| display.libraries.symbol(name))
             }))
             .map_err(|_| "ANGLE GLES entry points are incomplete")?;
+            if backend == Backend::Metal {
+                zero_default_framebuffer(&gl);
+                // A fresh context has no page errors to consume. Returning
+                // here drops `pending`, which releases the context and surface.
+                if glow::HasContext::get_error(&gl) != glow::NO_ERROR {
+                    return Err("initialize Metal WebGL drawing buffer".into());
+                }
+            }
             let mut samples = 0;
             if (f.get_config_attrib)(d, config, 0x3031, &mut samples) == 0 {
                 return Err(display.libraries.error("query drawing buffer samples"));
@@ -521,6 +594,10 @@ impl Context {
                 |op| self.display.libraries.error(op),
             )?;
             self.surface = replacement as usize;
+            if self.display.backend == Backend::Metal {
+                // The replacement is current. Page errors stay queued.
+                zero_default_framebuffer(&self.gl);
+            }
             self.width = width;
             self.height = height;
             Ok(())

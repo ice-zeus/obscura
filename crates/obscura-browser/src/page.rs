@@ -7413,6 +7413,8 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         requests += 1;
+                        // Accepted sockets inherit nonblocking mode on macOS.
+                        stream.set_nonblocking(false).unwrap();
                         stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
                         stream.set_write_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
                         let _ = stream.read(&mut [0u8; 2048]);
