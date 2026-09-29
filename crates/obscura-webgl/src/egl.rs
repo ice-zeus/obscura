@@ -46,7 +46,7 @@ egl_functions! {
 
 struct Libraries {
     _egl: Library,
-    gles: Library,
+    _gles: Library,
     functions: Functions,
     bundle: Bundle,
 }
@@ -72,7 +72,7 @@ impl Libraries {
             let functions = Functions::load(&egl)?;
             Ok(Self {
                 _egl: egl,
-                gles,
+                _gles: gles,
                 functions,
                 bundle,
             })
@@ -84,11 +84,10 @@ impl Libraries {
         })
     }
     unsafe fn symbol(&self, name: &CStr) -> *const c_void {
-        // GLES entry points must come from the same ANGLE build as EGL.
-        self.gles
-            .get::<*const c_void>(name.to_bytes_with_nul())
-            .map(|p| *p)
-            .unwrap_or_else(|_| (self.functions.get_proc_address)(name.as_ptr()))
+        // dlsym on a GLES library may search its dependencies and return a
+        // desktop GL function from the system driver. ANGLE's own procedure
+        // table returns only supported entry points from the pinned build.
+        (self.functions.get_proc_address)(name.as_ptr())
     }
 }
 

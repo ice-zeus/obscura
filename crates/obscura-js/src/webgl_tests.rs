@@ -475,14 +475,17 @@ fn real_webgl_resources_reject_cross_context_and_short_transfer_views() {
       const buffer=a.createBuffer();b.bindBuffer(b.ARRAY_BUFFER,buffer);const cross=b.getError();
       a.bindBuffer(a.ARRAY_BUFFER,buffer);a.bufferData(a.ARRAY_BUFFER,new Uint8Array([1,2,3,4]),a.STATIC_DRAW);a.bufferSubData(a.ARRAY_BUFFER,4,new Uint8Array([8]));const bounds=a.getError();
       const read=new Uint8Array(4);a.getBufferSubData(a.ARRAY_BUFFER,0,read);
+      const view=new Uint8Array([9,9,9,9]);a.getBufferSubData(a.ARRAY_BUFFER,1,view,1,2);
+      a.getBufferSubData(a.ARRAY_BUFFER,4,new Uint8Array(0));
+      const retained=a.getParameter(a.ARRAY_BUFFER_BINDING)===buffer;
       const texture=a.createTexture();a.bindTexture(a.TEXTURE_2D,texture);a.texImage2D(a.TEXTURE_2D,0,a.RGBA8,2,2,0,a.RGBA,a.UNSIGNED_BYTE,new Uint8Array(3));const short=a.getError();
       a.texImage2D(a.TEXTURE_2D,0,a.RGBA8,2,2,0,a.RGBA,a.UNSIGNED_BYTE,null);
       const fbo=a.createFramebuffer();a.bindFramebuffer(a.FRAMEBUFFER,fbo);a.framebufferTexture2D(a.FRAMEBUFFER,a.COLOR_ATTACHMENT0,a.TEXTURE_2D,texture,0);
       const attached=a.getFramebufferAttachmentParameter(a.FRAMEBUFFER,a.COLOR_ATTACHMENT0,a.FRAMEBUFFER_ATTACHMENT_OBJECT_NAME)===texture;
       a.clearColor(0,1,0,1);a.clear(a.COLOR_BUFFER_BIT);const pixel=new Uint8Array(4);a.readPixels(0,0,1,1,a.RGBA,a.UNSIGNED_BYTE,pixel);
-      const result=[cross,bounds,short,Array.from(read),attached,Array.from(pixel),a.getError()];
+      const result=[cross,bounds,short,Array.from(read),attached,Array.from(pixel),a.getError(),Array.from(view),retained];
       a.deleteFramebuffer(fbo);a.deleteTexture(texture);a.deleteBuffer(buffer);return result;
-    })()"#).unwrap(),json!([1282,1281,1282,[1,2,3,4],true,[0,255,0,255],0]));
+    })()"#).unwrap(),json!([1282,1281,1282,[1,2,3,4],true,[0,255,0,255],0,[9,2,3,9],true]));
 }
 #[test]
 #[ignore = "mandatory real-driver resize, viewport preservation and default-buffer clear validation"]
