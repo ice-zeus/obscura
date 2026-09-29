@@ -907,3 +907,54 @@ fn real_webgl_two_non_location_names_keep_their_distinct_validation_rules() {
     assert_eq!(context.get_error(),glow::NO_ERROR);context.link_program(program);
     assert_eq!(context.query(Query::GetProgramParameter {program,name:glow::LINK_STATUS}),Value::Bool(false));
 }
+
+
+#[test]
+#[ignore = "mandatory real ANGLE WebGL 2 failed-link query error precedence"]
+fn real_webgl_two_program_queries_reject_unlinked_and_failed_relinked_programs() {
+    use crate::advanced::Advanced;
+    fn rejects(context: &mut CanvasContext, program: u32) {
+        for index in [0, u32::MAX] {
+            for query in [
+                Advanced::GetTransformFeedbackVarying { program, index },
+                Advanced::GetActiveUniformBlockName { program, index },
+                Advanced::GetActiveUniformBlockParameter { program, index, name: glow::UNIFORM_BLOCK_DATA_SIZE },
+            ] {
+                assert_eq!(context.advanced(query), Value::Null);
+                assert_eq!(context.get_error(), glow::INVALID_OPERATION);
+                assert_eq!(context.get_error(), glow::NO_ERROR);
+            }
+        }
+        assert_eq!(context.advanced(Advanced::GetFragDataLocation { program, name: "color".into() }), Value::Int(-1));
+        assert_eq!(context.get_error(), glow::INVALID_OPERATION);
+        assert_eq!(context.get_error(), glow::NO_ERROR);
+    }
+    let mut context = browser_context(2);
+    let program = context.create_object(Kind::Program, 0).unwrap();
+    rejects(&mut context, program);
+    context.link_program(program);
+    assert_eq!(context.query(Query::GetProgramParameter { program, name: glow::LINK_STATUS }), Value::Bool(false));
+    rejects(&mut context, program);
+    for (kind, source) in [
+        (glow::VERTEX_SHADER, "#version 300 es\nuniform B {float b;};out float v;void main(){v=b;gl_Position=vec4(b,0.,0.,1.);}"),
+        (glow::FRAGMENT_SHADER, "#version 300 es\nprecision mediump float;out vec4 color;void main(){color=vec4(1.);}"),
+    ] {
+        let shader = context.create_object(Kind::Shader, kind).unwrap();
+        context.shader_source(shader, source); context.compile_shader(shader);
+        assert_eq!(context.query(Query::GetShaderParameter { shader, name: glow::COMPILE_STATUS }), Value::Bool(true));
+        context.attach_shader(program, shader, false);
+    }
+    context.resource(ResourceCommand::TransformFeedbackVaryings { program, varyings: vec!["v".into()], mode: glow::INTERLEAVED_ATTRIBS }, None);
+    context.link_program(program);
+    assert_eq!(context.query(Query::GetProgramParameter { program, name: glow::LINK_STATUS }), Value::Bool(true));
+    assert_eq!(context.advanced(Advanced::GetTransformFeedbackVarying { program, index: 0 }), Value::Active { size: 1, data_type: glow::FLOAT, name: "v".into() });
+    assert_eq!(context.advanced(Advanced::GetActiveUniformBlockName { program, index: 0 }), Value::String("B".into()));
+    assert!(matches!(context.advanced(Advanced::GetActiveUniformBlockParameter { program, index: 0, name: glow::UNIFORM_BLOCK_DATA_SIZE }), Value::Int(size) if size >= 4));
+    assert_eq!(context.get_error(), glow::NO_ERROR);
+    assert_eq!(context.advanced(Advanced::GetTransformFeedbackVarying { program, index: 1 }), Value::Null);
+    assert_eq!(context.get_error(), glow::INVALID_VALUE);
+    context.resource(ResourceCommand::TransformFeedbackVaryings { program, varyings: vec!["absent".into()], mode: glow::INTERLEAVED_ATTRIBS }, None);
+    context.link_program(program);
+    assert_eq!(context.query(Query::GetProgramParameter { program, name: glow::LINK_STATUS }), Value::Bool(false));
+    rejects(&mut context, program);
+}

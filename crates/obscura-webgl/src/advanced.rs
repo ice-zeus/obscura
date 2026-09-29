@@ -444,7 +444,12 @@ impl CanvasContext {
                     Value::Int(gl.get_sync_parameter_i32(object!(id, Sync), name))
                 }
                 GetTransformFeedbackVarying { program, index } => {
-                    let program = object!(program, Program);
+                    let program = self.program(program)?;
+                    // WebGL rejects these queries before index validation when
+                    // the program is unlinked, including a failed relink.
+                    if !gl.get_program_link_status(program) {
+                        return Err(glow::INVALID_OPERATION);
+                    }
                     let count = bounded_count(gl.get_program_parameter_i32(program, glow::TRANSFORM_FEEDBACK_VARYINGS))?;
                     if index as usize >= count { return Err(glow::INVALID_VALUE); }
                     // glow 0.17 uses a fixed 256-byte buffer here. GLES exposes
@@ -537,15 +542,22 @@ impl CanvasContext {
                             .unwrap_or(glow::INVALID_INDEX),
                     )
                 }
-                GetActiveUniformBlockName { program, index } => Value::String(
-                    gl.get_active_uniform_block_name(object!(program, Program), index),
-                ),
+                GetActiveUniformBlockName { program, index } => {
+                    let program = self.program(program)?;
+                    if !gl.get_program_link_status(program) {
+                        return Err(glow::INVALID_OPERATION);
+                    }
+                    Value::String(gl.get_active_uniform_block_name(program, index))
+                }
                 GetActiveUniformBlockParameter {
                     program,
                     index,
                     name,
                 } => {
-                    let program = object!(program, Program);
+                    let program = self.program(program)?;
+                    if !gl.get_program_link_status(program) {
+                        return Err(glow::INVALID_OPERATION);
+                    }
                     match name {
                         glow::UNIFORM_BLOCK_BINDING
                         | glow::UNIFORM_BLOCK_DATA_SIZE
