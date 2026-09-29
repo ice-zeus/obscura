@@ -428,6 +428,18 @@ fn real_webgl1_and_webgl2_buffers_start_zero_and_render_clear() {
             assert!(!renderer.is_empty());
             eprintln!("WebGL {version}, {:?}, {renderer}", backend());
         }
+        // A prior read must not be required to allocate a pbuffer before its
+        // first clear. Exercise cold creation and replacement independently.
+        let mut cold = self::context(version);
+        unsafe {
+            cold.gl.clear_color(0.0,1.0,0.0,1.0);
+            cold.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+            assert_eq!(pixel(&cold),[0,255,0,255]);
+            cold.resize(8,8).unwrap();
+            cold.gl.clear_color(1.0,0.0,1.0,1.0);
+            cold.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+            assert_eq!(pixel(&cold),[255,0,255,255]);
+        }
     }
 }
 
