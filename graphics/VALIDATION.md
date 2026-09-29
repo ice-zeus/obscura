@@ -60,6 +60,12 @@ pin, modified tracked tools or an unusable Python wrapper must stop before
 ANGLE sync/build and must never publish a bundle. A bootstrap pass does not
 prove host compiler, GN or native graphics compatibility.
 
+Linux must also install the native architecture's sysroot using the installer
+and checksum metadata from the exact ANGLE dependency checkout before GN.
+Record the installer/metadata hashes and selected tarball SHA-256 in the bundle.
+Exercise ARM64 and x86_64 selection, installer failure and the macOS no-op;
+never disable GN's sysroot requirement to make a failing build proceed.
+
 For each native backend, set `OBSCURA_WEBGL_LIB_DIR` to its verified bundle.
 Set `OBSCURA_WEBGL_TEST_BACKEND=metal|vulkan|swiftshader` for native crate
 fixtures and `OBSCURA_WEBGL_BACKEND=hardware|software` for browser fixtures.
