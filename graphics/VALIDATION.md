@@ -45,6 +45,21 @@ results. Candidate-only regressions must exist only on the candidate; never
 use a candidate binary as the baseline. Record ignored tests and the reason
 for every exclusion. The normal run above does not execute driver tests.
 
+The native extension request boundary must compile and its existing
+`extensions::tests::native_extension_entry_and_string_failures_do_not_publish_capabilities`
+case must run on Linux aarch64 (unsigned `c_char`) and a signed-`c_char` target,
+such as macOS or Linux x86_64. Its typed callback must accept `CString::as_ptr()`
+without a hardcoded signed-byte pointer. Keep separate target directories and
+record the actual Rust target triple for both results.
+
+The dependency recipe explicitly runs the pinned depot_tools `ensure_bootstrap`
+with automatic checkout updates disabled, verifies its revision and tracked
+files afterward, and checks the Python wrapper used by GN. Retain bootstrap
+stdout/stderr and toolchain architecture evidence. Bootstrap failure, a moved
+pin, modified tracked tools or an unusable Python wrapper must stop before
+ANGLE sync/build and must never publish a bundle. A bootstrap pass does not
+prove host compiler, GN or native graphics compatibility.
+
 For each native backend, set `OBSCURA_WEBGL_LIB_DIR` to its verified bundle.
 Set `OBSCURA_WEBGL_TEST_BACKEND=metal|vulkan|swiftshader` for native crate
 fixtures and `OBSCURA_WEBGL_BACKEND=hardware|software` for browser fixtures.

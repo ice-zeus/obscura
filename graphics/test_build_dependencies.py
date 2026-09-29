@@ -75,6 +75,32 @@ class DependencyRecipeTests(unittest.TestCase):
         with patch.object(recipe.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["tool"])):
             with self.assertRaises(subprocess.CalledProcessError): recipe.run(["tool"], cwd=self.root, env={})
 
+    def test_depot_bootstrap_retains_the_pin_and_checks_the_python_wrapper(self):
+        depot = self.work / "depot_tools"
+        env = {"DEPOT_TOOLS_UPDATE": "0"}
+        with patch.object(recipe, "run", side_effect=[None, recipe.PINS["depot_tools"]["commit"], "", None]) as run:
+            recipe.bootstrap_depot_tools(depot, env)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            [depot / "ensure_bootstrap"], ["git", "rev-parse", "HEAD"],
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            [depot / "python-bin/python3", "--version"]])
+        self.assertTrue(all(call.kwargs["cwd"] == depot and call.kwargs["env"] == env
+                            for call in run.call_args_list))
+
+    def test_depot_bootstrap_failures_and_pin_drift_stop_before_building(self):
+        pin = recipe.PINS["depot_tools"]["commit"]
+        failures = [([subprocess.CalledProcessError(1, ["ensure_bootstrap"])], subprocess.CalledProcessError),
+                    ([None, "other"], RuntimeError), ([None, pin, " M gn.py"], RuntimeError),
+                    ([None, pin, "", subprocess.CalledProcessError(1, ["python3"])], subprocess.CalledProcessError)]
+        for replies, expected in failures:
+            with self.subTest(replies=replies), patch.object(recipe, "run", side_effect=replies) as run:
+                with self.assertRaises(expected): recipe.bootstrap_depot_tools(self.work / "depot_tools", {})
+                self.assertEqual(run.call_count, len(replies))
+        with patch.object(recipe, "bootstrap_depot_tools", side_effect=RuntimeError("bootstrap failed")):
+            with self.assertRaisesRegex(RuntimeError, "bootstrap failed"): self.invoke()
+        self.assertFalse((self.work / "angle").exists())
+        self.assertFalse(self.output.exists())
+
     def test_artifact_selection_rejects_missing_and_ambiguous_results(self):
         build = self.root / "build"; build.mkdir()
         with self.assertRaises(RuntimeError): recipe.artifact(build, "libEGL.so")
@@ -97,8 +123,8 @@ class DependencyRecipeTests(unittest.TestCase):
         def run(argv, *, cwd, env, capture=False):
             command = [str(a) for a in argv]
             if command[:2] == ["git", "rev-parse"]:
-                key = "swiftshader" if Path(cwd).name == "SwiftShader" else "angle"
-                return "wrong" if wrong_revision else recipe.PINS[key]["commit"]
+                key = {"SwiftShader": "swiftshader", "depot_tools": "depot_tools"}.get(Path(cwd).name, "angle")
+                return "wrong" if wrong_revision and key != "depot_tools" else recipe.PINS[key]["commit"]
             if Path(command[0]).name == "autoninja":
                 if build_error: raise subprocess.CalledProcessError(1, command)
                 build = Path(command[command.index("-C") + 1]); build.mkdir(parents=True)
