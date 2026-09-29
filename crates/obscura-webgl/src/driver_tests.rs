@@ -966,37 +966,55 @@ fn creation_test_mode() -> Mode {
 #[test]
 #[ignore = "real driver with injected initialization fault: first canvas make-current fails"]
 fn initial_activation_failure_rejects_creation() {
-    crate::creation_test_faults::ACTIVATE.with(|fault| fault.set(true));
-    let result = CanvasContext::create(2, 8, 8, Attributes::default(), creation_test_mode());
-    let consumed = crate::creation_test_faults::ACTIVATE.with(|fault| !fault.replace(false));
-    assert!(consumed, "backend did not reach the injected canvas activation");
-    if let Ok(context) = &result {
-        eprintln!("INITIALIZATION_RESULT returned_ok=true lost={}", context.is_lost());
+    for version in [1, 2] {
+        crate::creation_test_faults::ACTIVATE.with(|fault| fault.set(true));
+        let result = CanvasContext::create(version, 8, 8, Attributes::default(), creation_test_mode());
+        let consumed = crate::creation_test_faults::ACTIVATE.with(|fault| !fault.replace(false));
+        assert!(consumed, "backend did not reach the injected canvas activation");
+        if let Ok(context) = &result {
+            eprintln!("INITIALIZATION_RESULT returned_ok=true lost={}", context.is_lost());
+        }
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("creation published a context after initial setup failed"),
+        };
+        assert_eq!(failure.attempts.len(), 1);
+        assert_eq!(failure.attempts[0].backend, backend());
+        assert_eq!(failure.attempts[0].reason, "Initial WebGL drawing-buffer activation failed");
     }
-    assert!(result.is_err(), "creation published a context after initial activation failed");
 }
 
 #[test]
 #[ignore = "real driver with injected initialization fault: first drawing-buffer clear fails"]
 fn initial_clear_failure_rejects_creation() {
-    crate::creation_test_faults::CLEAR.with(|fault| fault.set(true));
-    let mut result = CanvasContext::create(2, 8, 8, Attributes::default(), creation_test_mode());
-    let consumed = crate::creation_test_faults::CLEAR.with(|fault| !fault.replace(false));
-    assert!(consumed, "backend did not reach the injected clear");
-    if let Ok(context) = &mut result {
-        eprintln!("INITIALIZATION_RESULT returned_ok=true lost={} error={}", context.is_lost(), context.get_error());
+    for version in [1, 2] {
+        crate::creation_test_faults::CLEAR.with(|fault| fault.set(true));
+        let mut result = CanvasContext::create(version, 8, 8, Attributes::default(), creation_test_mode());
+        let consumed = crate::creation_test_faults::CLEAR.with(|fault| !fault.replace(false));
+        assert!(consumed, "backend did not reach the injected clear");
+        if let Ok(context) = &mut result {
+            eprintln!("INITIALIZATION_RESULT returned_ok=true lost={} error={}", context.is_lost(), context.get_error());
+        }
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("creation published a context after initial setup failed"),
+        };
+        assert_eq!(failure.attempts.len(), 1);
+        assert_eq!(failure.attempts[0].backend, backend());
+        assert_eq!(failure.attempts[0].reason, "Initial WebGL drawing-buffer setup failed");
     }
-    assert!(result.is_err(), "creation published a context after initial clear failed");
 }
 
 #[test]
 #[ignore = "control: activation failure after publication remains context loss"]
 fn activation_failure_after_creation_loses_context() {
-    let mut context = CanvasContext::create(2, 8, 8, Attributes::default(), creation_test_mode()).unwrap();
-    assert!(!context.is_lost());
-    crate::creation_test_faults::ACTIVATE.with(|fault| fault.set(true));
-    context.command(Command::Clear { mask: glow::COLOR_BUFFER_BIT });
-    assert!(context.is_lost());
-    assert_eq!(context.get_error(), 0x9242);
-    assert_eq!(context.get_error(), glow::NO_ERROR);
+    for version in [1, 2] {
+        let mut context = CanvasContext::create(version, 8, 8, Attributes::default(), creation_test_mode()).unwrap();
+        assert!(!context.is_lost());
+        crate::creation_test_faults::ACTIVATE.with(|fault| fault.set(true));
+        context.command(Command::Clear { mask: glow::COLOR_BUFFER_BIT });
+        assert!(context.is_lost());
+        assert_eq!(context.get_error(), 0x9242);
+        assert_eq!(context.get_error(), glow::NO_ERROR);
+    }
 }
