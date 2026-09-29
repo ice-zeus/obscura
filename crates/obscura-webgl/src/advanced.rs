@@ -159,6 +159,13 @@ fn bounded_count(value: i32) -> Result<usize, u32> {
         .filter(|&n| n <= 65536)
         .ok_or(glow::INVALID_OPERATION)
 }
+fn native_output_name(bytes: &[u8], written: i32) -> Result<String, u32> {
+    let length = bounded_count(written)?;
+    if length >= bytes.len() || bytes[length] != 0 || bytes[..length].contains(&0) {
+        return Err(glow::INVALID_OPERATION);
+    }
+    String::from_utf8(bytes[..length].to_vec()).map_err(|_| glow::INVALID_OPERATION)
+}
 fn query_target(target: u32) -> bool {
     matches!(
         target,
@@ -436,14 +443,23 @@ impl CanvasContext {
                     }
                     Value::Int(gl.get_sync_parameter_i32(object!(id, Sync), name))
                 }
-                GetTransformFeedbackVarying { program, index } => gl
-                    .get_transform_feedback_varying(object!(program, Program), index)
-                    .map(|v| Value::Active {
-                        size: v.size,
-                        data_type: v.tftype,
-                        name: v.name,
-                    })
-                    .unwrap_or(Value::Null),
+                GetTransformFeedbackVarying { program, index } => {
+                    let program = object!(program, Program);
+                    let count = bounded_count(gl.get_program_parameter_i32(program, glow::TRANSFORM_FEEDBACK_VARYINGS))?;
+                    if index as usize >= count { return Err(glow::INVALID_VALUE); }
+                    // glow 0.17 uses a fixed 256-byte buffer here. GLES exposes
+                    // the actual maximum including NUL; valid longer names must
+                    // retain every byte rather than silently truncating.
+                    let capacity = bounded_count(gl.get_program_parameter_i32(program, glow::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH))?;
+                    if capacity == 0 { return Err(glow::INVALID_OPERATION); }
+                    let mut bytes = vec![0_u8; capacity];
+                    let (mut written, mut size, mut data_type) = (0, 0, 0);
+                    driver.entry::<unsafe extern "system" fn(u32, u32, i32, *mut i32, *mut i32, *mut u32, *mut std::ffi::c_char)>(
+                        c"glGetTransformFeedbackVarying",
+                    )?(program.0.get(), index, capacity as i32, &mut written, &mut size, &mut data_type, bytes.as_mut_ptr().cast());
+                    let name = native_output_name(&bytes, written)?;
+                    Value::Active { size, data_type, name }
+                },
                 GetIndexedParameter { target, index } => {
                     let (limit, object) = match target {
                         glow::UNIFORM_BUFFER_BINDING => (glow::MAX_UNIFORM_BUFFER_BINDINGS, true),
@@ -740,6 +756,16 @@ mod tests {
         assert!(bounded_count(65537).is_err());
         assert_eq!(bounded_count(0), Ok(0));
         assert_eq!(bounded_count(4), Ok(4));
+    }
+    #[test]
+    fn native_output_names_preserve_long_names_and_reject_invalid_lengths() {
+        let name = format!("v{}", "x".repeat(256));
+        let bytes = [name.as_bytes(), &[0]].concat();
+        assert_eq!(native_output_name(&bytes, 257), Ok(name));
+        assert_eq!(native_output_name(b"\0", 0), Ok(String::new()));
+        for (bytes, length) in [(&b"x\0"[..], -1), (&b"x\0"[..], 2), (&b"xx"[..], 1), (&b"x\0x\0"[..], 3), (&b"\xff\0"[..], 1)] {
+            assert_eq!(native_output_name(bytes, length), Err(glow::INVALID_OPERATION));
+        }
     }
     #[test]
     fn clear_buffer_requires_all_components_before_passing_a_pointer() {

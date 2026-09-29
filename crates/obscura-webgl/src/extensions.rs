@@ -116,6 +116,11 @@ impl ExtensionAccess for crate::egl::Context {
 }
 fn driver_extensions(driver: &impl ExtensionAccess) -> HashSet<String> {
     let mut names = driver.initial_active().clone();
+    // ANGLE removes activated tokens from its requestable list; glow's startup
+    // snapshot cannot represent extensions activated after context creation.
+    if let Some(active) = driver.extension_string(glow::EXTENSIONS) {
+        names.extend(active.split_ascii_whitespace().map(str::to_owned));
+    }
     if let Some(requestable) = driver.extension_string(0x93A8) { // GL_REQUESTABLE_EXTENSIONS_ANGLE
         names.extend(requestable.split_ascii_whitespace().map(str::to_owned));
     }
@@ -142,18 +147,17 @@ fn activate_extension(
     if enabled.contains(&canonical) {
         return Some(canonical);
     }
+    // ANGLE's ES2 RGBA16F renderbuffer support requires native half-float
+    // texture support too. Activate that driver dependency without publishing
+    // the browser's OES_texture_half_float capability before it is requested.
+    if canonical == "EXT_color_buffer_half_float"
+        && supported.iter().any(|name| name == "OES_texture_half_float")
+        && !activate_driver_extension(driver, "GL_OES_texture_half_float")
+    {
+        return None;
+    }
     if let Some(extension) = EXTENSIONS.iter().find(|e| e.web == canonical) {
-        if !driver.initial_active().contains(extension.driver) {
-            if !driver.request(extension.driver) {
-                return None;
-            }
-            // glow's active list is cached at context creation. Read ANGLE's
-            // current string after the request before committing browser state.
-            let active = driver.extension_string(glow::EXTENSIONS)?;
-            if !active.split_ascii_whitespace().any(|n| n == extension.driver) {
-                return None;
-            }
-        }
+        if !activate_driver_extension(driver, extension.driver) { return None; }
     }
     if canonical == "OES_texture_half_float"
         && supported.iter().any(|name| name == "EXT_color_buffer_half_float")
@@ -314,6 +318,34 @@ mod tests {
         fixture.missing_request = true;*fixture.current.borrow_mut() = None;
         assert_eq!(enable(&fixture, 1, &mut enabled, "oes_TEXTURE_FLOAT").as_deref(), Some("OES_texture_float"));
         assert!(fixture.requests.borrow().is_empty());
+    }
+    #[test]
+    fn activated_extensions_remain_available_after_leaving_the_requestable_list() {
+        let mut fixture = DriverFixture::available(&["GL_OES_texture_float"]);
+        let mut enabled = HashSet::new();
+        assert!(enable(&fixture, 1, &mut enabled, "OES_texture_float").is_some());
+        fixture.requestable = None;
+        fixture.missing_request = true;
+        assert!(driver_extensions(&fixture).contains("GL_OES_texture_float"));
+        assert_eq!(enable(&fixture, 1, &mut enabled, "oes_TEXTURE_float").as_deref(), Some("OES_texture_float"));
+        assert_eq!(*fixture.requests.borrow(), ["GL_OES_texture_float"]);
+    }
+    #[test]
+    fn half_float_renderbuffer_native_dependency_does_not_publish_texture_api() {
+        let fixture = DriverFixture::available(&["GL_OES_texture_half_float", "GL_EXT_color_buffer_half_float"]);
+        let mut enabled = HashSet::new();
+        fixture.rejected.borrow_mut().insert("GL_OES_texture_half_float".into());
+        assert!(enable(&fixture, 1, &mut enabled, "EXT_color_buffer_half_float").is_none());
+        assert!(enabled.is_empty());
+        assert_eq!(*fixture.requests.borrow(), ["GL_OES_texture_half_float"]);
+        fixture.rejected.borrow_mut().clear();
+        assert!(enable(&fixture, 1, &mut enabled, "EXT_color_buffer_half_float").is_some());
+        assert_eq!(enabled, HashSet::from(["EXT_color_buffer_half_float".into()]));
+        assert_eq!(*fixture.requests.borrow(), ["GL_OES_texture_half_float", "GL_OES_texture_half_float", "GL_EXT_color_buffer_half_float"]);
+        let two = DriverFixture::available(&["GL_EXT_color_buffer_half_float"]);
+        let mut enabled = HashSet::new();
+        assert!(enable(&two, 2, &mut enabled, "EXT_color_buffer_half_float").is_some());
+        assert_eq!(*two.requests.borrow(), ["GL_EXT_color_buffer_half_float"]);
     }
     #[test]
     fn extension_version_unknown_and_browser_only_requests_never_touch_native_activation() {
