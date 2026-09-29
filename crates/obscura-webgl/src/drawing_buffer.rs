@@ -190,16 +190,20 @@ impl StorageDriver for Native<'_> {
         let gl=&self.context.gl;
         unsafe {
             let scissor=gl.is_enabled(glow::SCISSOR_TEST);let mask=gl.get_parameter_bool_array::<4>(glow::COLOR_WRITEMASK);
+            // WebGL 2 drops Clear while RASTERIZER_DISCARD is enabled.
+            let discard=self.version==2 && gl.is_enabled(glow::RASTERIZER_DISCARD);
             let depth_mask=gl.get_parameter_bool(glow::DEPTH_WRITEMASK);
             let front=gl.get_parameter_i32(glow::STENCIL_WRITEMASK) as u32;let back=gl.get_parameter_i32(glow::STENCIL_BACK_WRITEMASK) as u32;
             let mut color=[0.;4];gl.get_parameter_f32_slice(glow::COLOR_CLEAR_VALUE,&mut color);
             let depth_value=gl.get_parameter_f32(glow::DEPTH_CLEAR_VALUE);let stencil_value=gl.get_parameter_i32(glow::STENCIL_CLEAR_VALUE);
-            gl.disable(glow::SCISSOR_TEST);gl.color_mask(true,true,true,true);gl.depth_mask(true);gl.stencil_mask(u32::MAX);
+            gl.disable(glow::SCISSOR_TEST);if discard { gl.disable(glow::RASTERIZER_DISCARD); }
+            gl.color_mask(true,true,true,true);gl.depth_mask(true);gl.stencil_mask(u32::MAX);
             gl.clear_color(0.,0.,0.,0.);gl.clear_depth_f32(1.);gl.clear_stencil(0);
             gl.clear(glow::COLOR_BUFFER_BIT | if depth { glow::DEPTH_BUFFER_BIT } else { 0 } | if stencil { glow::STENCIL_BUFFER_BIT } else { 0 });
             gl.clear_color(color[0],color[1],color[2],color[3]);gl.clear_depth_f32(depth_value);gl.clear_stencil(stencil_value);
             gl.color_mask(mask[0],mask[1],mask[2],mask[3]);gl.depth_mask(depth_mask);
             gl.stencil_mask_separate(glow::FRONT,front);gl.stencil_mask_separate(glow::BACK,back);
+            if discard { gl.enable(glow::RASTERIZER_DISCARD); }
             if scissor { gl.enable(glow::SCISSOR_TEST); }
         }
         self.check()

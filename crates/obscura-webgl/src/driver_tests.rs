@@ -552,6 +552,189 @@ fn real_resize_clears_pixels_and_allocation_failure_retains_old_surface() {
     }
 }
 
+unsafe fn whole_surface_is_zero(context: &Context, width: i32, height: i32) -> bool {
+    context.make_current().unwrap();
+    let mut pixels = vec![0xA5; (width * height * 4) as usize];
+    context.gl.read_pixels(
+        0,
+        0,
+        width,
+        height,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelPackData::Slice(Some(&mut pixels)),
+    );
+    assert_eq!(context.gl.get_error(), glow::NO_ERROR);
+    pixels.iter().all(|&v| v == 0)
+}
+
+#[test]
+#[ignore = "requires verified ANGLE bundle; new and resized pbuffers must not reuse freed surface memory"]
+fn real_new_and_resized_drawing_buffers_never_expose_freed_surface_memory() {
+    let options = SurfaceOptions {
+        alpha: true,
+        depth: true,
+        stencil: true,
+        antialias: false,
+    };
+    // Intel Metal drivers hand a new pbuffer the memory of a surface freed
+    // just before, same size or not. Nothing may be read before a clear.
+    for (first, second, width, height) in [
+        (1, 1, 8, 8),
+        (1, 2, 8, 8),
+        (2, 1, 8, 8),
+        (2, 2, 8, 8),
+        (2, 2, 16, 16),
+        (2, 2, 4, 4),
+    ] {
+        {
+            let drawn = context(first);
+            unsafe {
+                drawn.gl.clear_color(0.0, 1.0, 0.0, 1.0);
+                drawn.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+                assert_eq!(pixel(&drawn), [0, 255, 0, 255]);
+            }
+        }
+        let fresh = Context::create(backend(), second, width, height, options).unwrap();
+        unsafe {
+            assert!(
+                whole_surface_is_zero(&fresh, width as i32, height as i32),
+                "WebGL {first} -> {second} {width}x{height} exposed a freed drawing buffer"
+            );
+        }
+    }
+    // Replacement allocates before freeing, so resizing back reaches the
+    // allocation freed by the first resize. Page state must be unchanged.
+    for version in [1, 2] {
+        let mut context = context(version);
+        unsafe {
+            context.gl.clear_color(0.0, 1.0, 0.0, 1.0);
+            context.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        context.resize(16, 16).unwrap();
+        unsafe {
+            assert!(whole_surface_is_zero(&context, 16, 16));
+            let gl = &context.gl;
+            let framebuffer = gl.create_framebuffer().unwrap();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(1, 1, 1, 1);
+            gl.color_mask(false, true, false, true);
+            gl.depth_mask(false);
+            gl.stencil_mask_separate(glow::FRONT, 3);
+            gl.stencil_mask_separate(glow::BACK, 7);
+            gl.clear_color(0.25, 0.5, 0.75, 0.5);
+            gl.clear_depth_f32(0.25);
+            gl.clear_stencil(5);
+            if version == 2 {
+                gl.enable(glow::RASTERIZER_DISCARD);
+            }
+        }
+        context.resize(8, 8).unwrap();
+        unsafe {
+            let gl = &context.gl;
+            let framebuffer = gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING);
+            assert!(framebuffer.is_some());
+            assert!(gl.is_enabled(glow::SCISSOR_TEST));
+            let mut scissor = [0; 4];
+            gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut scissor);
+            assert_eq!(scissor, [1, 1, 1, 1]);
+            assert_eq!(gl.get_parameter_bool_array::<4>(glow::COLOR_WRITEMASK), [false, true, false, true]);
+            assert!(!gl.get_parameter_bool(glow::DEPTH_WRITEMASK));
+            assert_eq!(gl.get_parameter_i32(glow::STENCIL_WRITEMASK), 3);
+            assert_eq!(gl.get_parameter_i32(glow::STENCIL_BACK_WRITEMASK), 7);
+            let mut color = [0.0; 4];
+            gl.get_parameter_f32_slice(glow::COLOR_CLEAR_VALUE, &mut color);
+            assert_eq!(color, [0.25, 0.5, 0.75, 0.5]);
+            assert_eq!(gl.get_parameter_f32(glow::DEPTH_CLEAR_VALUE), 0.25);
+            assert_eq!(gl.get_parameter_i32(glow::STENCIL_CLEAR_VALUE), 5);
+            assert_eq!(gl.is_enabled(glow::RASTERIZER_DISCARD), version == 2);
+            assert_eq!(gl.get_error(), glow::NO_ERROR);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(framebuffer.unwrap());
+            if version == 2 {
+                gl.disable(glow::RASTERIZER_DISCARD);
+            }
+            gl.disable(glow::SCISSOR_TEST);
+            assert!(
+                whole_surface_is_zero(&context, 8, 8),
+                "WebGL {version} resize back exposed a freed drawing buffer"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "mandatory real-driver WebGL 2 internal clears while the page keeps RASTERIZER_DISCARD enabled"]
+fn real_rasterizer_discard_does_not_skip_internal_drawing_buffer_clears() {
+    fn fill_green_then_discard(context: &mut CanvasContext) {
+        // Clear is itself dropped while discard is enabled.
+        context.command(Command::Disable { cap: glow::RASTERIZER_DISCARD });
+        context.command(Command::ClearColor { red: 0.0, green: 1.0, blue: 0.0, alpha: 1.0 });
+        context.command(Command::Clear { mask: glow::COLOR_BUFFER_BIT });
+        assert!(context.drawing_buffer_source_rgba().unwrap().chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+        context.command(Command::Enable { cap: glow::RASTERIZER_DISCARD });
+    }
+    fn assert_cleared_and_discard_kept(context: &mut CanvasContext, step: &str) {
+        let pixels = context.drawing_buffer_source_rgba().unwrap();
+        assert!(pixels.iter().all(|&v| v == 0), "{step} left drawing-buffer content");
+        assert_eq!(context.query(Query::IsEnabled { cap: glow::RASTERIZER_DISCARD }), Value::Bool(true), "{step}");
+        let mut clear = [0.0; 4];
+        unsafe { context.driver.as_ref().unwrap().gl.get_parameter_f32_slice(glow::COLOR_CLEAR_VALUE, &mut clear); }
+        assert_eq!(clear, [0.0, 1.0, 0.0, 1.0], "{step}");
+        assert_eq!(context.get_error(), glow::NO_ERROR, "{step}");
+    }
+    for owned in [false, true] {
+        let mut context = browser_context(2);
+        assert!(!context.attributes.preserve_drawing_buffer);
+        if owned { assert!(context.drawing_buffer_storage(glow::RGBA8, 8, 8)); }
+        // Resize to a larger buffer and back reaches a just-freed allocation.
+        fill_green_then_discard(&mut context);
+        assert!(context.resize(16, 16));
+        assert!(context.resize(8, 8));
+        assert_cleared_and_discard_kept(&mut context, "resize");
+        fill_green_then_discard(&mut context);
+        context.did_present();
+        assert_cleared_and_discard_kept(&mut context, "present");
+        fill_green_then_discard(&mut context);
+        let mut bitmap = vec![0_u8; 8 * 8 * 4];
+        assert!(context.transfer_bitmap(&mut bitmap));
+        assert!(bitmap.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+        assert_cleared_and_discard_kept(&mut context, "transfer");
+        if owned {
+            fill_green_then_discard(&mut context);
+            assert!(context.drawing_buffer_storage(glow::RGBA8, 8, 8));
+            assert_cleared_and_discard_kept(&mut context, "storage replacement");
+        }
+    }
+    // The multisample resolve is a blit, which discard does not suppress.
+    use crate::drawing_buffer::{Backing,StorageSpec};
+    let context = browser_context(2);
+    let driver = context.driver.as_ref().unwrap();
+    let gl = &driver.gl;
+    let attributes = Attributes { antialias: true, ..context.attributes.clone() };
+    let spec = StorageSpec::validate(glow::RGBA8, 8, 4, 2, &attributes, &context.extensions, 4096, 4).unwrap();
+    let backing = Backing::create(driver, 2, spec).unwrap();
+    assert_ne!(backing.draw, backing.read);
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(backing.draw));
+        gl.clear_color(1.0, 0.0, 0.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.enable(glow::RASTERIZER_DISCARD);
+        let read = backing.resolve(driver, 2).unwrap();
+        assert!(gl.is_enabled(glow::RASTERIZER_DISCARD));
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(read));
+        let mut pixels = vec![0; 8 * 4 * 4];
+        gl.read_pixels(0, 0, 8, 4, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut pixels)));
+        assert!(pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.disable(glow::RASTERIZER_DISCARD);
+        backing.destroy(driver);
+        assert_eq!(gl.get_error(), glow::NO_ERROR);
+    }
+}
+
 #[test]
 #[ignore = "requires verified ANGLE bundle; mandatory repeated-profile cleanup validation"]
 fn real_repeated_context_cleanup_releases_live_gl_objects() {

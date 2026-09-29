@@ -8568,15 +8568,25 @@ mod tests {
         )
         .unwrap();
 
-        for _ in 0..7 {
-            rt.run_autonomous_event_loop_turn().await.unwrap();
-        }
-        assert_eq!(
-            rt.evaluate("globalThis.__nestedTimerDelays.length")
-                .unwrap(),
-            serde_json::json!(7.0),
-            "the interval must continue yielding and making progress",
-        );
+        // A turn polls deno_core at most twice, and a V8 maintenance wake can
+        // end it without dispatching a timer. Keep the clamp assertions below,
+        // but wait for bounded progress instead of one tick per turn.
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                rt.run_autonomous_event_loop_turn().await.unwrap();
+                let ticks = rt
+                    .evaluate("globalThis.__nestedTimerDelays.length")
+                    .unwrap()
+                    .as_f64()
+                    .unwrap();
+                if ticks >= 7.0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the interval must continue yielding and making progress");
         let observed = rt.evaluate("globalThis.__nestedTimerDelays").unwrap();
         let delays = observed.as_array().unwrap();
         assert!(

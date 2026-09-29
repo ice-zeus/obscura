@@ -3145,6 +3145,12 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit nonblocking mode on macOS.
+                        // Wait for request bytes, but bound a stalled fixture client.
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                            .unwrap();
                         let mut request = [0u8; 2048];
                         let _ = stream.read(&mut request);
                         observed.fetch_add(1, Ordering::SeqCst);
