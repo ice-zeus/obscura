@@ -558,16 +558,52 @@ impl CanvasContext {
                     first,
                     count,
                     instances,
-                } => gl.draw_arrays_instanced(mode, first, count, instances),
+                } => {
+                    if self.version == 1 {
+                        // The ES3 core entry point rejects ES2 even after the
+                        // WebGL1 ANGLE extension is enabled.
+                        let draw = self.driver.as_ref().unwrap().entry::<
+                            unsafe extern "system" fn(u32, i32, i32, i32),
+                        >(c"glDrawArraysInstancedANGLE");
+                        match draw {
+                            Ok(draw) => draw(mode, first, count, instances),
+                            Err(error) => { self.error(error); return; }
+                        }
+                    } else {
+                        gl.draw_arrays_instanced(mode, first, count, instances);
+                    }
+                },
                 Command::DrawElementsInstanced {
                     mode,
                     count,
                     element_type,
                     offset,
                     instances,
-                } => gl.draw_elements_instanced(mode, count, element_type, offset, instances),
+                } => {
+                    if self.version == 1 {
+                        let draw = self.driver.as_ref().unwrap().entry::<
+                            unsafe extern "system" fn(u32, i32, u32, *const std::ffi::c_void, i32),
+                        >(c"glDrawElementsInstancedANGLE");
+                        match draw {
+                            Ok(draw) => draw(mode, count, element_type, offset as usize as *const _, instances),
+                            Err(error) => { self.error(error); return; }
+                        }
+                    } else {
+                        gl.draw_elements_instanced(mode, count, element_type, offset, instances);
+                    }
+                },
                 Command::VertexAttribDivisor { index, divisor } => {
-                    gl.vertex_attrib_divisor(index, divisor)
+                    if self.version == 1 {
+                        let set = self.driver.as_ref().unwrap().entry::<
+                            unsafe extern "system" fn(u32, u32),
+                        >(c"glVertexAttribDivisorANGLE");
+                        match set {
+                            Ok(set) => set(index, divisor),
+                            Err(error) => { self.error(error); return; }
+                        }
+                    } else {
+                        gl.vertex_attrib_divisor(index, divisor);
+                    }
                 }
                 Command::VertexAttribIPointer {
                     index,

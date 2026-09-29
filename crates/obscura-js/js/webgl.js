@@ -329,9 +329,28 @@
   }
   function query(s, method, args) { return retainedQuery(s, method, args, call(s, 'query', {method,args}).value); }
   function resource(s, method, args, bytes) { call(s, 'resource', {command:{method,args},has_data:bytes !== undefined}, bytes || empty); }
+  const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get;
+  const sharedBufferLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype,'byteLength').get : null;
+  function isBuffer(value) {
+    if (value === null || typeof value !== 'object') return false;
+    // Intrinsic getters test internal slots across realms, without trusting
+    // instanceof or a page-controlled Symbol.toStringTag.
+    try { arrayBufferLength.call(value); return true; } catch {}
+    if (sharedBufferLength) { try { sharedBufferLength.call(value); return true; } catch {} }
+    return false;
+  }
+  function bufferSize(value, unsigned = false) {
+    let size = Math.trunc(+value); // ToNumber must reject Symbol and BigInt.
+    if (!Number.isFinite(size)) return 0;
+    // GLsizeiptr is a signed WebIDL long long, not an EnforceRange argument.
+    if (!Number.isSafeInteger(size) || unsigned && size < 0)
+      size = Number((unsigned ? BigInt.asUintN : BigInt.asIntN)(64,BigInt(size)));
+    return size;
+  }
   function typedBytes(value, allowBuffer = false) {
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer,value.byteOffset,value.byteLength);
-    if (allowBuffer && value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (allowBuffer && isBuffer(value)) return new Uint8Array(value);
     throw new TypeError('Expected an ArrayBuffer view');
   }
   const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
@@ -422,10 +441,26 @@
   for (const [suffix,kind] of [['Buffer','buffer'],['Texture','texture'],['Framebuffer','framebuffer'],['Renderbuffer','renderbuffer']]) method('bind'+suffix,2,(s,target,value)=>{const id=obj(s,value,kind);if(id!==invalid)resource(s,'bind'+suffix,{target:uint(target),id});});
   for (const [name,kind,field] of [['bindSampler','sampler','unit'],['bindTransformFeedback','transformFeedback','target']]) method(name,2,(s,target,value)=>{const id=obj(s,value,kind);if(id!==invalid)resource(s,name,{[field]:uint(target),id});},2);
   method('bindVertexArray',1,(s,value)=>{const id=obj(s,value,'vertexArray');if(id!==invalid)resource(s,'bindVertexArray',{id});},2);
-  method('bufferData',3,(s,target,data,usage,offset,length)=>{
-    if(typeof data==='number'){const size=Math.trunc(data);if(!Number.isSafeInteger(size)){error(s,0x0501);return;}resource(s,'bufferData',{target:uint(target),size,usage:uint(usage)});return;}
-    if(data==null){error(s,0x0501);return;}
-    const bytes=elements(s,data,offset,length,true);if(bytes)resource(s,'bufferData',{target:uint(target),size:bytes.byteLength,usage:uint(usage)},bytes);
+  method('bufferData',3,(s,target,data,usage,...range)=>{
+    target=uint(target);
+    // Only WebGL2's four/five-argument overload accepts an element range.
+    // WebGL1 ignores excess arguments; three arguments select BufferSource
+    // by internal brand and otherwise perform numeric WebIDL conversion.
+    if(s.version===2 && range.length){
+      typedBytes(data);usage=uint(usage);
+      const offset=bufferSize(range[0],true),length=range[1]===undefined?0:uint(range[1]);
+      const bytes=elements(s,data,offset,length);
+      if(bytes)resource(s,'bufferData',{target,size:bytes.byteLength,usage},bytes);
+      return;
+    }
+    if(data==null){uint(usage);error(s,0x0501);return;}
+    if(ArrayBuffer.isView(data)||isBuffer(data)){
+      const bytes=typedBytes(data,true);usage=uint(usage);
+      resource(s,'bufferData',{target,size:bytes.byteLength,usage},bytes);return;
+    }
+    const size=bufferSize(data);usage=uint(usage);
+    if(!Number.isSafeInteger(size)){error(s,0x0501);return;}
+    resource(s,'bufferData',{target,size,usage});
   });
   method('bufferSubData',3,(s,target,offset,data,start,length)=>{const bytes=elements(s,data,start,length,true);const n=Math.trunc(Number(offset));if(!Number.isSafeInteger(n)){error(s,0x0501);return;}if(bytes)resource(s,'bufferSubData',{target:uint(target),offset:n},bytes);});
   method('getBufferSubData',3,(s,target,offset,data,start,length)=>{const bytes=elements(s,data,start,length);const n=Math.trunc(Number(offset));if(!Number.isSafeInteger(n)){error(s,0x0501);return;}if(bytes)call(s,'bufferRead',{target:uint(target),offset:n},bytes);},2);

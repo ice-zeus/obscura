@@ -1281,3 +1281,82 @@ async fn placeholder_publication_waits_for_a_frame_and_preserves_author_attribut
     }
     assert_eq!(runtime.evaluate("frameResults").unwrap(),json!(expected));
 }
+
+#[test]
+#[ignore = "mandatory real-driver bufferData overload conversion and exact range dispatch"]
+fn real_buffer_data_overloads_convert_numeric_values_and_preserve_buffer_sources() {
+    require_driver();let mut runtime=page();
+    assert_eq!(runtime.evaluate(r#"(()=>{
+      const check=(ok,message)=>{if(!ok)throw Error(message);};
+      for(const version of [1,2]){
+        const canvas=document.createElement('canvas'),gl=canvas.getContext(version===1?'webgl':'webgl2');
+        check(!!gl,'context');
+        const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+        for(const [value,size] of [[4,4],[5.8,5],['4',4],['5.8',5],[[42],42],[[42,64],0],[{},0],[true,1],[NaN,0],[Infinity,0],[{valueOf(){return 6;}},6]]){
+          gl.bufferData(gl.ARRAY_BUFFER,value,gl.STATIC_DRAW);
+          check(gl.getError()===0,'numeric error');check(gl.getBufferParameter(gl.ARRAY_BUFFER,gl.BUFFER_SIZE)===size,'numeric size');
+        }
+        const failure=new RangeError('conversion');let caught=null;
+        try{gl.bufferData(gl.ARRAY_BUFFER,{valueOf(){throw failure;}},gl.STATIC_DRAW);}catch(error){caught=error;}
+        check(caught===failure,'coercion exception');
+        for(const value of [Symbol(),4n]){let type=null;try{gl.bufferData(gl.ARRAY_BUFFER,value,gl.STATIC_DRAW);}catch(error){type=error.name;}check(type==='TypeError','numeric TypeError');}
+        for(const value of [null,undefined,-4]){gl.bufferData(gl.ARRAY_BUFFER,value,gl.STATIC_DRAW);check(gl.getError()===gl.INVALID_VALUE,'null/negative');}
+        const bytes=new Uint8Array([9,8,7,6]);
+        const sources=[bytes.buffer,bytes,new DataView(bytes.buffer)];
+        if(typeof SharedArrayBuffer==='function'){
+          const shared=new SharedArrayBuffer(4);new Uint8Array(shared).set(bytes);sources.push(shared,new Uint8Array(shared),new DataView(shared));
+        }
+        for(const source of sources){
+          gl.bufferData(gl.ARRAY_BUFFER,source,gl.STATIC_DRAW);
+          check(gl.getBufferParameter(gl.ARRAY_BUFFER,gl.BUFFER_SIZE)===4,'source size');
+          gl.bufferSubData(gl.ARRAY_BUFFER,0,source);check(gl.getError()===0,'source upload');
+          if(version===2){const output=new Uint8Array(4);gl.getBufferSubData(gl.ARRAY_BUFFER,0,output);check(output.join(',')==='9,8,7,6','source bytes');}
+        }
+        if(version===1){
+          for(const source of [4,'4',bytes.buffer,bytes]){gl.bufferData(gl.ARRAY_BUFFER,source,gl.STATIC_DRAW,1,1);check(gl.getBufferParameter(gl.ARRAY_BUFFER,gl.BUFFER_SIZE)===4,'ignored range');}
+        }else{
+          for(const source of [4,'4',bytes.buffer,null,undefined]){let type=null;try{gl.bufferData(gl.ARRAY_BUFFER,source,gl.STATIC_DRAW,undefined);}catch(error){type=error.name;}check(type==='TypeError','range requires view');}
+          gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.STATIC_DRAW,1,2);const output=new Uint8Array(2);gl.getBufferSubData(gl.ARRAY_BUFFER,0,output);check(output.join(',')==='8,7','range bytes');
+        }
+        check(gl.getError()===0,'final GL error');gl.deleteBuffer(buffer);gl.getExtension('WEBGL_lose_context').loseContext();
+      }
+      return true;
+    })()"#).unwrap(),json!(true));
+}
+
+#[test]
+#[ignore = "mandatory real-driver WebGL1 extension and WebGL2 core instancing with unused attributes"]
+fn real_instanced_draws_use_version_correct_entry_points_and_keep_attribute_validation() {
+    require_driver();let mut runtime=page();
+    assert_eq!(runtime.evaluate(r#"(()=>{
+      const check=(ok,message)=>{if(!ok)throw Error(message);};
+      for(const version of [1,2]){
+        const canvas=document.createElement('canvas');canvas.width=canvas.height=4;
+        const gl=canvas.getContext(version===1?'webgl':'webgl2',{antialias:false,preserveDrawingBuffer:true});check(!!gl,'context');
+        const program=gl.createProgram(),shaders=[];
+        for(const [type,source] of [[gl.VERTEX_SHADER,version===1?'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}':'#version 300 es\nin vec2 p;void main(){gl_Position=vec4(p,0.,1.);}'],[gl.FRAGMENT_SHADER,version===1?'precision mediump float;void main(){gl_FragColor=vec4(1.,0.,0.,1.);}':'#version 300 es\nprecision mediump float;out vec4 color;void main(){color=vec4(1.,0.,0.,1.);}']]){
+          const shader=gl.createShader(type);gl.shaderSource(shader,source);gl.compileShader(shader);check(gl.getShaderParameter(shader,gl.COMPILE_STATUS),gl.getShaderInfoLog(shader));gl.attachShader(program,shader);shaders.push(shader);
+        }
+        gl.bindAttribLocation(program,0,'p');gl.linkProgram(program);check(gl.getProgramParameter(program,gl.LINK_STATUS),gl.getProgramInfoLog(program));gl.useProgram(program);
+        const vertex=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vertex);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.enableVertexAttribArray(0);
+        const index=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,index);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([999,0,1,2]),gl.STATIC_DRAW);
+        const ext=version===1?gl.getExtension('ANGLE_instanced_arrays'):null;check(version===2||!!ext,'instancing extension');
+        const divisor=(i,n)=>version===1?ext.vertexAttribDivisorANGLE(i,n):gl.vertexAttribDivisor(i,n);
+        divisor(0,1);check(gl.getVertexAttrib(0,0x88fe)===1,'divisor set');divisor(0,0);check(gl.getVertexAttrib(0,0x88fe)===0,'divisor reset');check(gl.getError()===0,'divisor error');
+        const draws=[()=>version===1?ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,3,1):gl.drawArraysInstanced(gl.TRIANGLES,0,3,1),()=>version===1?ext.drawElementsInstancedANGLE(gl.TRIANGLES,3,gl.UNSIGNED_SHORT,2,1):gl.drawElementsInstanced(gl.TRIANGLES,3,gl.UNSIGNED_SHORT,2,1)];
+        const unused=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,unused);gl.vertexAttribPointer(1,2,gl.FLOAT,false,0,0);
+        for(const enabled of [false,true]){
+          if(enabled)gl.enableVertexAttribArray(1);
+          for(const draw of draws){
+            gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);draw();check(gl.getError()===0,'instanced draw error');
+            const pixel=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);check(pixel.join(',')==='255,0,0,255','instanced pixels');
+          }
+        }
+        divisor(gl.getParameter(gl.MAX_VERTEX_ATTRIBS),0);check(gl.getError()===gl.INVALID_VALUE,'invalid divisor index');
+        const bad=()=>version===1?ext.drawArraysInstancedANGLE(gl.TRIANGLES,0,-1,1):gl.drawArraysInstanced(gl.TRIANGLES,0,-1,1);bad();check(gl.getError()===gl.INVALID_VALUE,'negative count');
+        gl.disableVertexAttribArray(1);gl.deleteBuffer(unused);gl.deleteBuffer(index);gl.deleteBuffer(vertex);gl.useProgram(null);gl.deleteProgram(program);for(const shader of shaders)gl.deleteShader(shader);
+        check(gl.getError()===0,'cleanup');gl.getExtension('WEBGL_lose_context').loseContext();
+      }
+      return true;
+    })()"#).unwrap(),json!(true));
+}
