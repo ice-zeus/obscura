@@ -139,22 +139,36 @@ fn parse(bytes: &[u8], depth: usize, budget: &Arc<Budget>) -> Option<usvg::Tree>
         },
         ..Default::default()
     };
-    // usvg 0.47 resolves an absent percentage root against a 100x100
-    // view box and may replace it with the drawing bounds. An external SVG
-    // without intrinsic dimensions or a viewBox instead has the browser's
-    // 300x150 default viewport, independent of its painted content.
-    let tree = if root.attribute("width").is_none()
-        && root.attribute("height").is_none()
-        && root.attribute("viewBox").is_none()
-    {
-        // The XML parser has already validated this exact root. Insert only
-        // presentation attributes after its qualified name, preserving XML
-        // declarations, comments, namespaces, children and author CSS.
+    // usvg 0.47 resolves root percentages against a 100x100 view box
+    // without a viewBox. External SVG images instead default each missing or
+    // percentage intrinsic axis independently to 300x150 CSS pixels.
+    let mut replacements = Vec::new();
+    let mut missing = String::new();
+    if root.attribute("viewBox").is_none() {
+        for (name, fallback) in [("width", "300"), ("height", "150")] {
+            match root.attribute_node(name) {
+                None => missing.push_str(&format!(" {name}=\"{fallback}\"")),
+                Some(attribute) if attribute.value().trim().strip_suffix('%')
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_some_and(|value| value.is_finite() && value >= 0.0) => {
+                    // Replace the parser-validated whole attribute range; do
+                    // not infer quote/value offsets or duplicate attributes.
+                    replacements.push((attribute.range(), format!("{name}=\"{fallback}\"")));
+                }
+                _ => {}
+            }
+        }
+    }
+    let tree = if !missing.is_empty() || !replacements.is_empty() {
         let name_start = root.range().start.checked_add(1)?;
         let name_end = name_start + xml.as_bytes().get(name_start..)?.iter()
             .position(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'/' | b'>'))?;
-        let normalized = format!("{} width=\"300\" height=\"150\"{}",
-            &xml[..name_end], &xml[name_end..]);
+        replacements.push((name_end..name_end, missing));
+        replacements.sort_by_key(|(range, _)| range.start);
+        let mut normalized = xml.to_owned();
+        for (range, value) in replacements.into_iter().rev() {
+            normalized.replace_range(range, &value);
+        }
         let normalized = usvg::roxmltree::Document::parse_with_options(
             &normalized,
             usvg::roxmltree::ParsingOptions {
@@ -261,6 +275,21 @@ mod tests {
                 let bytes = format!("{prefix}<s:svg xmlns:s='http://www.w3.org/2000/svg'>{content}</s:svg>");
                 assert_eq!(dimensions(bytes.as_bytes()), Some((300, 150)));
             }
+        }
+        // Chromium's external-image natural size defaults each unspecified
+        // intrinsic axis; a percentage does not supply an intrinsic length.
+        for (attributes, expected) in [
+            ("height='40'", (300, 40)),
+            ("width='80'", (80, 150)),
+            ("width='50%'", (300, 150)),
+            ("height='50%'", (300, 150)),
+            ("width='50%' height='50%'", (300, 150)),
+            ("width='80' height='50%'", (80, 150)),
+            ("width='50%' height='40'", (300, 40)),
+            ("width = '5&#48;%' height = \"40\"", (300, 40)),
+        ] {
+            let bytes = format!("<?xml version='1.0'?><!-- fixture --><s:svg xmlns:s='http://www.w3.org/2000/svg' {attributes}><s:rect width='100%' height='100%' fill='red'/></s:svg>");
+            assert_eq!(dimensions(bytes.as_bytes()), Some(expected), "{attributes}");
         }
         let bytes = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='100%' height='100%' fill='red'/></svg>";
         let mut pixels = vec![0; 300 * 150 * 4];
