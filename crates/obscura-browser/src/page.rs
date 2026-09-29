@@ -246,6 +246,7 @@ pub struct Page {
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
+    http_identity_default_user_agent: Option<(std::sync::Weak<ObscuraHttpClient>, String)>,
     pub context: Arc<BrowserContext>,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
@@ -1109,6 +1110,7 @@ impl Page {
             js: None,
             lifecycle: LifecycleState::Idle,
             http_client,
+            http_identity_default_user_agent: None,
             context,
             title: String::new(),
             referrer: String::new(),
@@ -1726,6 +1728,51 @@ impl Page {
     fn capture_surface_color(&self) -> [u8; 4] {
         self.default_background_color_override
             .unwrap_or([255, 255, 255, 255])
+    }
+
+    async fn isolate_http_identity(&mut self) {
+        let already_isolated = self.http_identity_default_user_agent.as_ref()
+            .and_then(|(owner, _)| owner.upgrade())
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &self.http_client));
+        if !already_isolated {
+            let client = Arc::new(self.http_client.fork_request_settings().await);
+            self.http_identity_default_user_agent = Some((Arc::downgrade(&client), client.user_agent.read().await.clone()));
+            self.http_client = client;
+            if let Some(js) = &self.js {
+                js.set_http_client(self.http_client.clone());
+            }
+        }
+    }
+
+    pub async fn set_http_user_agent_override(&mut self, user_agent: &str) {
+        self.isolate_http_identity().await;
+        let ordinary = if user_agent.is_empty() {
+            self.http_identity_default_user_agent.as_ref().unwrap().1.as_str()
+        } else {
+            user_agent
+        };
+        self.http_client.set_user_agent(ordinary).await;
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            client.set_user_agent_override(user_agent).await;
+        }
+    }
+
+    pub async fn set_http_extra_headers(&mut self, headers: std::collections::HashMap<String, String>) {
+        self.isolate_http_identity().await;
+        self.http_client.set_extra_headers(headers.clone()).await;
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            client.set_extra_headers(headers).await;
+        }
+    }
+
+    async fn do_post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            return client.post_form_with_callbacks(url, body, Some(&self.callbacks)).await;
+        }
+        self.http_client.post_form_with_callbacks(url, body, Some(&self.callbacks)).await
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -3453,9 +3500,7 @@ impl Page {
                 redirected_from: Vec::new(),
             })
         } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+            self.do_post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
         }

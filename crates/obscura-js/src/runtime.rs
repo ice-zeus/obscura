@@ -1243,11 +1243,13 @@ impl ObscuraJsRuntime {
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         let mut state = self.state.borrow_mut();
-        state.http_client = Some(client);
+        state.http_client = Some(client.clone());
         // A page transport makes the renderer cache-only; see
         // `ops::fresh_render_resources` for why layout must not fetch itself.
         #[cfg(feature = "render")]
         state.render_resources.set_sync_loading_enabled(false);
+        drop(state);
+        self.realm_states().borrow().set_http_client(client);
     }
 
     /// Install the owning page's passive on_request/on_response callback
