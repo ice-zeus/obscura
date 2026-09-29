@@ -9737,8 +9737,7 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
       }
       if (!inScope) continue;
       matched = true;
-      retainOldValue ||= type === 'attributes' ? !!t.options.attributeOldValue
-        : type === 'characterData' ? !!t.options.characterDataOldValue : false;
+      retainOldValue ||= type !== 'attributes' || !!t.options.attributeOldValue;
     }
     // Each observer receives its own record. One observer's old-value option
     // must not leak through the record shared with another registration.
