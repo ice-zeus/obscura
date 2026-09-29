@@ -425,8 +425,39 @@ fn unavailable_navigation_body_and_response_remain_unavailable() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].params["request"]["hasPostData"], true);
     assert!(before[0].params["request"].get("postData").is_none());
+    assert!(before[0].params["request"].get("postDataEntries").is_none());
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].method, "Network.loadingFailed");
+}
+
+#[test]
+fn captured_navigation_body_entries_preserve_empty_and_utf8_bytes() {
+    use base64::Engine as _;
+    for body in ["", "notes=雪&symbol=🐈"] {
+        let hop = obscura_net::client::NavigationExchange {
+            request: obscura_net::RequestInfo {
+                url: url::Url::parse("https://fixture.test/").unwrap(),
+                method: "POST".into(),
+                headers: HashMap::new(),
+                resource_type: obscura_net::ResourceType::Document,
+            },
+            post_data: Some(body.into()),
+            has_post_data: true,
+            status: Some(200),
+            response_headers: HashMap::new(),
+            response_body_size: Some(0),
+            failed: false,
+            timestamp: 1.0,
+        };
+        let (before, _) = transport_navigation_events(&[vec![hop]], "frame", "loader", true);
+        let request = &before[0].params["request"];
+        assert_eq!(request["postData"], body);
+        assert_eq!(request["hasPostData"], true);
+        let entries = request["postDataEntries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(base64::engine::general_purpose::STANDARD
+            .decode(entries[0]["bytes"].as_str().unwrap()).unwrap(), body.as_bytes());
+    }
 }
 
 #[tokio::test]
@@ -463,6 +494,7 @@ async fn bodyless_form_evaluation_emits_post_to_the_observer_session() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].session_id, audit);
     assert_eq!(requests[0].params["request"]["method"], "POST");
+    assert_eq!(requests[0].params["request"]["postDataEntries"], json!([{"bytes":""}]));
     assert_eq!(requests[0].params["request"]["postData"], "");
     assert_eq!(requests[0].params["request"]["hasPostData"], true);
 }

@@ -923,7 +923,13 @@ fn transport_navigation_events(
             let mut request = json!({"url": hop.request.url.as_str(), "method": hop.request.method,
                 "headers": hop.request.headers, "hasPostData": hop.has_post_data});
             if let Some(body) = &hop.post_data {
+                use base64::Engine as _;
                 request["postData"] = json!(body);
+                // Current CDP clients consume the byte entries rather than
+                // the deprecated text field. Only advertise captured bytes.
+                request["postDataEntries"] = json!([{
+                    "bytes": base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
+                }]);
             }
             let mut params = json!({"requestId": id, "loaderId": id, "documentURL": hop.request.url.as_str(),
                 "request": request, "timestamp": hop.timestamp, "wallTime": hop.timestamp,

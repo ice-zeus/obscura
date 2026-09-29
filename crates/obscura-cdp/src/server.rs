@@ -2066,7 +2066,9 @@ fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     let result = match req.method.as_str() {
-        "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
+        // Network.enable mutates per-session subscriptions in CdpContext and
+        // must reach the owning processor before its acknowledgement.
+        "Network.setCacheDisabled" | "Network.setRequestInterception" |
         "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
@@ -2178,6 +2180,10 @@ async fn handle_connection_ws(
     send_task.abort();
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "server_network_tests.rs"]
+mod network_tests;
 
 #[cfg(test)]
 mod tests {
