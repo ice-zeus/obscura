@@ -75,6 +75,7 @@ const __obscuraCore = globalThis.Deno.core;
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
+    'MutationRecord', 'CSSConditionRule', 'CSSMediaRule', 'CSSSupportsRule',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -2239,6 +2240,281 @@ function _seedUnchangedConnection(node, connected) {
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
 
+// Node documents. The main document owns a node unless its tree's root says
+// otherwise: a detached Document (createHTMLDocument, createDocument) is the
+// root of its own tree, and the root of a tree made by another document (its
+// create* methods, DOMParser, an iframe shim document) carries
+// `_nodeDocument`. All nodes of a tree share one node document, so only roots
+// are stamped: insertion clears the stamp (the node is no longer a root) and
+// removal stamps the new root with the document it left.
+let _foreignDocumentCount = 0;
+function _nodeDocumentOf(node) {
+  if (_foreignDocumentCount === 0 || node.isConnected) return globalThis.document;
+  let root = node;
+  for (let parent = root.parentNode; parent; parent = parent.parentNode) root = parent;
+  if (root.nodeType === 9 && root._detached) return root;
+  if (root instanceof ShadowRoot && root.host) return _nodeDocumentOf(root.host);
+  return root._nodeDocument || globalThis.document;
+}
+function _stampNodeDocument(node, doc) {
+  if (node && doc && doc !== globalThis.document) node._nodeDocument = doc;
+  return node;
+}
+function _registerForeignDocument() { _foreignDocumentCount++; }
+// A Document without a browsing context, backed by its own native tree root.
+function _createDetachedDocument(contentType, xml) {
+  const nid = +_dom("create_document_fragment");
+  const DocumentClass = xml ? (globalThis.XMLDocument || Document) : Document;
+  const doc = new DocumentClass(nid);
+  doc._detached = true;
+  doc._contentType = contentType;
+  _seedDetachedTreeState(doc);
+  _cache.set(nid, doc);
+  _registerForeignDocument();
+  return doc;
+}
+function _childNodeOfType(parent, type) {
+  for (let child = parent.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === type) return child;
+  }
+  return null;
+}
+
+// DOM mutation algorithms (https://dom.spec.whatwg.org/#mutation-algorithms).
+// appendChild, insertBefore, replaceChild, removeChild, the ChildNode and
+// ParentNode methods, textContent and Range all go through these, so they
+// validate in the spec's order and queue the same MutationObserver records.
+
+function _isDomNode(value) {
+  return value instanceof Node
+    || (value !== null && typeof value === "object" && typeof value._nid === "number");
+}
+
+function _requireNodeArgument(value, method, position, iface = "Node") {
+  if (!_isDomNode(value)) {
+    throw new TypeError(
+      `Failed to execute '${method}' on '${iface}': parameter ${position} is not of type 'Node'.`,
+    );
+  }
+}
+
+function _mutationError(method, message, name) {
+  return new DOMException(`Failed to execute '${method}' on 'Node': ${message}`, name);
+}
+
+function _isHostIncludingInclusiveAncestor(node, parent) {
+  if (node === parent) return true;
+  // The native walk goes up from parent and through shadow hosts; leaves
+  // that host no shadow root answer without walking.
+  return _dom("is_host_including_inclusive_ancestor", node._nid, parent._nid) === "true";
+}
+
+// "Ensure pre-insertion validity" and the validity checks of "replace"
+// (`replacing` true). Steps run in the spec's order because the order is
+// observable through which exception is thrown.
+function _ensureInsertionValidity(parent, node, child, method, replacing) {
+  const parentType = parent.nodeType;
+  if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
+    throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError");
+  }
+  if (_isHostIncludingInclusiveAncestor(node, parent)) {
+    throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError");
+  }
+  if (child !== null && child.parentNode !== parent) {
+    throw _mutationError(
+      method,
+      replacing
+        ? "The node to be replaced is not a child of this node."
+        : "The node before which the new node is to be inserted is not a child of this node.",
+      "NotFoundError",
+    );
+  }
+  const nodeType = node.nodeType;
+  if (nodeType !== 1 && nodeType !== 3 && nodeType !== 4 && nodeType !== 7
+      && nodeType !== 8 && nodeType !== 10 && nodeType !== 11) {
+    throw _mutationError(
+      method,
+      `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
+      "HierarchyRequestError",
+    );
+  }
+  if (((nodeType === 3 || nodeType === 4) && parentType === 9)
+      || (nodeType === 10 && parentType !== 9)) {
+    throw _mutationError(
+      method,
+      `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
+      "HierarchyRequestError",
+    );
+  }
+  if (parentType === 9) _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing);
+}
+
+function _ensureDocumentChildValidity(doc, node, nodeType, child, method, replacing) {
+  const children = Array.from(doc.childNodes);
+  const childIndex = child === null ? children.length : children.indexOf(child);
+  const hasElementOtherThanChild = children.some(c => c.nodeType === 1 && !(replacing && c === child));
+  const doctypeFollowsChild = child !== null
+    && children.slice(childIndex + (replacing ? 1 : 0)).some(c => c.nodeType === 10);
+  const elementPrecedesChild = children.slice(0, childIndex).some(c => c.nodeType === 1);
+  const oneElement = () => {
+    if (hasElementOtherThanChild || (!replacing && child !== null && child.nodeType === 10) || doctypeFollowsChild) {
+      throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError");
+    }
+  };
+  if (nodeType === 11) {
+    let elements = 0;
+    for (const c of Array.from(node.childNodes)) {
+      const t = c.nodeType;
+      if (t === 1) elements++;
+      else if (t === 3 || t === 4) {
+        throw _mutationError(method, "Nodes of type '#text' may not be inserted inside nodes of type '#document'.", "HierarchyRequestError");
+      }
+    }
+    if (elements > 1) throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError");
+    if (elements === 1) oneElement();
+  } else if (nodeType === 1) {
+    oneElement();
+  } else if (nodeType === 10) {
+    const hasOtherDoctype = children.some(c => c.nodeType === 10 && !(replacing && c === child));
+    if (hasOtherDoctype) throw _mutationError(method, "Only one doctype on document allowed.", "HierarchyRequestError");
+    if (child !== null ? elementPrecedesChild : children.some(c => c.nodeType === 1)) {
+      throw _mutationError(method, "Can't insert a doctype after the document element.", "HierarchyRequestError");
+    }
+  }
+}
+
+// "Convert nodes into a node": strings become Text nodes; more than one
+// argument is collected into a DocumentFragment so the caller inserts once and
+// observers get a single record.
+function _convertNodesIntoNode(nodes, context) {
+  if (nodes.length === 1 && _isDomNode(nodes[0])) return nodes[0];
+  const owner = _nodeDocumentForInsertion(context);
+  const converted = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    converted.push(_isDomNode(n) ? n : owner.createTextNode(String(n)));
+  }
+  if (converted.length === 1) return converted[0];
+  const fragment = owner.createDocumentFragment();
+  for (const n of converted) fragment.appendChild(n);
+  return fragment;
+}
+
+function _nodeDocumentForInsertion(node) {
+  if (node.nodeType === 9) return node._detached ? node : globalThis.document;
+  return _nodeDocumentOf(node);
+}
+
+function _hasMutationObservers() {
+  const observers = globalThis.__mutationObservers;
+  return !!(observers && observers.length);
+}
+
+// "Remove": `suppress` skips the record, as replace/replace-all queue their own.
+function _removeNode(parent, child, suppress, method = "removeChild") {
+  const observed = !suppress && _hasMutationObservers();
+  const previousSibling = observed ? child.previousSibling : null;
+  const nextSibling = observed ? child.nextSibling : null;
+  const removedWindowNames = _windowNamedNamesInTree(child);
+  if (child instanceof Element) _releaseLinkedStylesheetsIn(child);
+  const parentConnected = parent.isConnected;
+  const removed = _dom("remove_child", child._nid) === "true";
+  if (!removed) {
+    throw _mutationError(method, "The node to be removed is not a child of this node.", "NotFoundError");
+  }
+  _seedUnchangedConnection(parent, parentConnected);
+  _seedDetachedTreeState(child);
+  if (_foreignDocumentCount) _stampNodeDocument(child, _nodeDocumentForInsertion(parent));
+  _detachStyleSheetsInSubtree(child);
+  _reconcileWindowNamedProperties(removedWindowNames);
+  if (observed) _queueTreeMutationRecord(parent, [], [child], previousSibling, nextSibling);
+}
+
+// Move one node under `parent` before `child` (append when null). A node
+// that still has a parent is removed from it first, which old-parent
+// observers see as a removal (adopt runs "remove" before inserting).
+function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  if (node._shadowParent) {
+    node._shadowParent.removeChild(node);
+  } else {
+    const oldParent = node.parentNode;
+    if (oldParent) {
+      if (queueOldParentRecord && _hasMutationObservers()) {
+        _queueTreeMutationRecord(oldParent, [], [node], node.previousSibling, node.nextSibling);
+      }
+      _detachStyleSheetsInSubtree(node);
+    }
+  }
+  const parentConnected = parent.isConnected;
+  const inserted = child === null
+    ? _dom("append_child", parent._nid, node._nid) === "true"
+    : _dom("insert_before", node._nid, child._nid) === "true";
+  if (!inserted) {
+    throw _mutationError(method, "The new child would create an invalid tree.", "HierarchyRequestError");
+  }
+  _seedUnchangedConnection(parent, parentConnected);
+  _seedInsertedTreeState(node, parent, parentConnected);
+  if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
+  _registerWindowNamedTree(node);
+}
+
+// "Insert": returns the inserted nodes. `suppress` skips parent's record.
+function _insertNode(parent, node, child, suppress, method) {
+  const isFragment = node.nodeType === 11;
+  let nodes;
+  if (isFragment) {
+    nodes = Array.from(node.childNodes);
+    if (nodes.length === 0) return nodes;
+    // The children leave the fragment silently; the fragment's own
+    // observers get one record for all of them.
+    if (_hasMutationObservers()) _queueTreeMutationRecord(node, [], nodes, null, null);
+  } else {
+    nodes = [node];
+  }
+  const observed = !suppress && _hasMutationObservers();
+  const previousSibling = observed ? (child === null ? parent.lastChild : child.previousSibling) : null;
+  for (const n of nodes) _insertOneNode(parent, n, child, method, !isFragment);
+  if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
+  for (const n of nodes) {
+    __prepareInsertedSubtree(n);
+    if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+  }
+  return nodes;
+}
+
+function _preInsertNode(parent, node, child, method) {
+  _ensureInsertionValidity(parent, node, child, method, false);
+  let reference = child;
+  if (reference === node) reference = node.nextSibling;
+  _insertNode(parent, node, reference, false, method);
+  return node;
+}
+
+function _replaceChildNode(parent, node, child, method) {
+  _ensureInsertionValidity(parent, node, child, method, true);
+  let reference = child.nextSibling;
+  if (reference === node) reference = node.nextSibling;
+  const observed = _hasMutationObservers();
+  const previousSibling = observed ? child.previousSibling : null;
+  const addedNodes = observed ? (node.nodeType === 11 ? Array.from(node.childNodes) : [node]) : null;
+  _removeNode(parent, child, true, method);
+  _insertNode(parent, node, reference, true, method);
+  if (observed) _queueTreeMutationRecord(parent, addedNodes, [child], previousSibling, reference);
+  return child;
+}
+
+// "Replace all" (replaceChildren, textContent). `node` may be null.
+function _replaceAllChildren(parent, node, method) {
+  const removedNodes = Array.from(parent.childNodes);
+  const observed = _hasMutationObservers();
+  const addedNodes = node === null ? [] : (node.nodeType === 11 ? Array.from(node.childNodes) : [node]);
+  for (const c of removedNodes) _removeNode(parent, c, true, method);
+  if (node !== null) _insertNode(parent, node, null, true, method);
+  if (observed && (addedNodes.length || removedNodes.length)) {
+    _queueTreeMutationRecord(parent, addedNodes, removedNodes, null, null);
+  }
+}
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -2262,30 +2538,44 @@ class Node {
   constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
-  get ownerDocument() { return globalThis.document; }
+  get ownerDocument() { return _nodeDocumentOf(this); }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
     try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
+    const type = this.nodeType;
+    if (type === 9 || type === 10) return;
+    const value = v == null ? "" : String(v);
+    if (type !== 1 && type !== 11) {
+      this.data = value;
+      return;
+    }
+    // "String replace all". Removal keeps the old cheap per-child steps; the
+    // record rules are the spec's: one record, and none when nothing changed.
     const oldChildren = _domParse("child_nodes", this._nid) || [];
+    const observed = _hasMutationObservers();
+    const removedNodes = observed ? oldChildren.map(_wrap).filter(Boolean) : null;
+    const doc = _foreignDocumentCount ? _nodeDocumentForInsertion(this) : null;
     for (const c of oldChildren) {
       const child = _wrap(c);
       if (child) _detachStyleSheetsInSubtree(child);
       _dom("remove_child", c);
+      if (child) {
+        _seedDetachedTreeState(child);
+        _stampNodeDocument(child, doc);
+      }
     }
-    let added = [];
-    if (v != null && v !== "") {
-      const tn = +_dom("create_text_node", String(v));
-      _dom("append_child", this._nid, tn);
-      added = [tn];
+    let addedNodes = [];
+    if (value !== "") {
+      const text = _nodeDocumentForInsertion(this).createTextNode(value);
+      _dom("append_child", this._nid, text._nid);
+      _seedInsertedTreeState(text, this, this.isConnected);
+      addedNodes = [text];
     }
-    // Real MutationObserver fires childList for the children swap.
-    // Without this React 18+ hydration mismatch detection and many polling
-    // libs (intersection-driven lazy load, content sync) silently stall.
-    if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
+    if (observed && (addedNodes.length || removedNodes.length)) {
+      _queueTreeMutationRecord(this, addedNodes, removedNodes, null, null);
     }
   }
   get nodeValue() {
@@ -2295,7 +2585,9 @@ class Node {
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
+    if (t !== 3 && t !== 8) return;
+    if (this instanceof CharacterData) this.data = v ?? "";
+    else _dom("set_text_content", this._nid, String(v ?? ""));
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
@@ -2329,144 +2621,31 @@ class Node {
     }
     return _wrap(+_dom("prev_sibling", this._nid));
   }
-  appendChild(c) {
-    if (!c) return c;
-    if (this instanceof CharacterData) {
-      throw new DOMException(
-        "Failed to execute 'appendChild' on 'Node': This node type cannot have children.",
-        "HierarchyRequestError",
-      );
-    }
-    if (c instanceof DocumentFragment) {
-      const children = Array.from(c.childNodes);
-      for (const child of children) this.appendChild(child);
-      return c;
-    }
-    if (c._shadowParent) c._shadowParent.removeChild(c);
-    else if (c.parentNode) _detachStyleSheetsInSubtree(c);
-    const parentConnected = this.isConnected;
-    const inserted = _dom("append_child", this._nid, c._nid) === "true";
-    if (!inserted) {
-      throw new DOMException(
-        "Failed to execute 'appendChild' on 'Node': The new child would create an invalid tree.",
-        "HierarchyRequestError",
-      );
-    }
-    _seedUnchangedConnection(this, parentConnected);
-    _seedInsertedTreeState(c, this, parentConnected);
-    _registerWindowNamedTree(c);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
-    __prepareInsertedSubtree(c);
-    if (c instanceof Element && c.tagName === 'LINK') {
-      _loadLinkedStylesheet(c);
-    }
-    return c;
+  appendChild(node) {
+    _requireNodeArgument(node, "appendChild", 1);
+    return _preInsertNode(this, node, null, "appendChild");
   }
-  removeChild(c) {
-    if (!c || c.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
-        'NotFoundError'
-      );
+  removeChild(child) {
+    _requireNodeArgument(child, "removeChild", 1);
+    if (child.parentNode !== this) {
+      throw _mutationError("removeChild", "The node to be removed is not a child of this node.", "NotFoundError");
     }
-    const removedWindowNames = _windowNamedNamesInTree(c);
-    if (c instanceof Element) _releaseLinkedStylesheetsIn(c);
-    const parentConnected = this.isConnected;
-    const removed = _dom("remove_child", c._nid) === "true";
-    if (!removed) {
-      throw new DOMException(
-        "Failed to execute 'removeChild' on 'Node': The node is not a child of this node.",
-        "NotFoundError",
-      );
-    }
-    _seedUnchangedConnection(this, parentConnected);
-    _seedDetachedTreeState(c);
-    _detachStyleSheetsInSubtree(c);
-    _reconcileWindowNamedProperties(removedWindowNames);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
-    return c;
+    _removeNode(this, child, false);
+    return child;
   }
-  replaceChild(newChild, oldChild) {
-    if (!oldChild || !newChild) return oldChild;
-    if (oldChild.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
-        "NotFoundError",
-      );
-    }
-    if (newChild === oldChild) return oldChild;
-    if (newChild instanceof DocumentFragment) {
-      const children = Array.from(newChild.childNodes);
-      for (const child of children) this.insertBefore(child, oldChild);
-      this.removeChild(oldChild);
-      return oldChild;
-    }
-    if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
-    else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
-    const parentConnected = this.isConnected;
-    const removedWindowNames = _windowNamedNamesInTree(oldChild);
-    const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
-    if (!inserted) {
-      throw new DOMException(
-        "Failed to execute 'replaceChild' on 'Node': The new child would create an invalid tree.",
-        "HierarchyRequestError",
-      );
-    }
-    const removed = _dom("remove_child", oldChild._nid) === "true";
-    if (!removed) throw new DOMException("The node could not be replaced.", "NotFoundError");
-    _seedUnchangedConnection(this, parentConnected);
-    _seedInsertedTreeState(newChild, this, parentConnected);
-    _seedDetachedTreeState(oldChild);
-    _detachStyleSheetsInSubtree(oldChild);
-    _registerWindowNamedTree(newChild);
-    _reconcileWindowNamedProperties(removedWindowNames);
-    // As in appendChild and removeChild. A replacement is an insertion and a removal. An
-    // observer saw neither so far.
-    if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
-    }
-    __prepareInsertedSubtree(newChild);
-    if (newChild instanceof Element && newChild.tagName === 'LINK') {
-      _loadLinkedStylesheet(newChild);
-    }
-    return oldChild;
+  replaceChild(node, child) {
+    _requireNodeArgument(node, "replaceChild", 1);
+    _requireNodeArgument(child, "replaceChild", 2);
+    return _replaceChildNode(this, node, child, "replaceChild");
   }
-  insertBefore(n, ref) {
-    if (!n) return n;
-    if (!ref) { this.appendChild(n); return n; }
-    if (ref.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
-        "NotFoundError",
-      );
+  insertBefore(node, child) {
+    _requireNodeArgument(node, "insertBefore", 1);
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'insertBefore' on 'Node': 2 arguments required, but only 1 present.");
     }
-    if (n === ref) return n;
-    if (n instanceof DocumentFragment) {
-      const children = Array.from(n.childNodes);
-      for (const child of children) this.insertBefore(child, ref);
-      return n;
-    }
-    if (n._shadowParent) n._shadowParent.removeChild(n);
-    else if (n.parentNode) _detachStyleSheetsInSubtree(n);
-    const parentConnected = this.isConnected;
-    const inserted = _dom("insert_before", n._nid, ref._nid) === "true";
-    if (!inserted) {
-      throw new DOMException(
-        "Failed to execute 'insertBefore' on 'Node': The new child would create an invalid tree.",
-        "HierarchyRequestError",
-      );
-    }
-    _seedUnchangedConnection(this, parentConnected);
-    _seedInsertedTreeState(n, this, parentConnected);
-    _registerWindowNamedTree(n);
-    // The same steps as in appendChild. Where a node is inserted does not decide whether an
-    // observer sees it and whether a <link> loads its stylesheet.
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
-    __prepareInsertedSubtree(n);
-    if (n instanceof Element && n.tagName === 'LINK') {
-      _loadLinkedStylesheet(n);
-    }
-    return n;
+    if (child === undefined) child = null;
+    if (child !== null) _requireNodeArgument(child, "insertBefore", 2);
+    return _preInsertNode(this, node, child, "insertBefore");
   }
   contains(o) {
     if (o === this) return true;
@@ -2541,21 +2720,31 @@ class Node {
     return connected;
   }
   normalize() {
-    // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
-    // removed nodes keep their own data (read from the backing node by nid).
+    // Spec order: drop an empty Text node; otherwise append the data of the
+    // following contiguous Text nodes (one characterData record), then remove
+    // those nodes one by one (one childList record each). Detached removed
+    // nodes keep their own data (read from the backing node by nid).
     let child = this.firstChild;
     while (child) {
-      const next = child.nextSibling;
       if (child.nodeType === 3) {
-        let data = child.data, sib = child.nextSibling;
-        while (sib && sib.nodeType === 3) { const after = sib.nextSibling; data += sib.data; this.removeChild(sib); sib = after; }
-        if (data.length === 0) { this.removeChild(child); child = sib; continue; }
-        if (data !== child.data) child.data = data;
-        child = sib; continue;
-      } else if (child.nodeType === 1 || child.nodeType === 11) {
-        child.normalize();
+        if (child.data.length === 0) {
+          const next = child.nextSibling;
+          this.removeChild(child);
+          child = next;
+          continue;
+        }
+        const following = [];
+        let sibling = child.nextSibling;
+        while (sibling && sibling.nodeType === 3) { following.push(sibling); sibling = sibling.nextSibling; }
+        if (following.length) {
+          child.data = child.data + following.map(t => t.data).join("");
+          for (const t of following) this.removeChild(t);
+        }
+        child = sibling;
+        continue;
       }
-      child = next;
+      if (child.nodeType === 1 || child.nodeType === 11) child.normalize();
+      child = child.nextSibling;
     }
   }
   isEqualNode(other) {
@@ -3746,6 +3935,7 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (n === "src" && this.localName === "iframe") {
@@ -3770,7 +3960,7 @@ class Element extends Node {
       if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (_hasMutationObservers()) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3787,7 +3977,10 @@ class Element extends Node {
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
+    const localName = n.includes(":") ? n.slice(n.indexOf(":") + 1) : n;
+    const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
@@ -3800,7 +3993,9 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     _dom("remove_attribute", this._nid, n);
+    if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
@@ -3829,7 +4024,9 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
@@ -5369,18 +5566,17 @@ class Element extends Node {
   }
   getAnimations() { return _animationsForTarget(this); }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-  append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
+  append(...nodes) {
+    _preInsertNode(this, _convertNodesIntoNode(nodes, this), null, "append");
+  }
   prepend(...nodes) {
-    const ref = this.firstChild;
-    for (const n of _convertNodes(nodes)) {
-      if (ref) this.insertBefore(n, ref); else this.appendChild(n);
-    }
+    _preInsertNode(this, _convertNodesIntoNode(nodes, this), this.firstChild, "prepend");
   }
   replaceChildren(...nodes) {
-    const converted = _convertNodes(nodes);
-    let c;
-    while ((c = this.firstChild)) this.removeChild(c);
-    for (const n of converted) this.appendChild(n);
+    const node = _convertNodesIntoNode(nodes, this);
+    const empty = node.nodeType === 11 && !node.firstChild;
+    _ensureInsertionValidity(this, node, null, "replaceChildren", false);
+    _replaceAllChildren(this, empty ? null : node, "replaceChildren");
   }
 }
 
@@ -5617,7 +5813,10 @@ class Document extends Node {
     return Array.from(_waapiAnimations).filter(animation => animation.playState !== 'idle'
       && (animation.playState !== 'finished' || animation.effect?._timing.fill === 'forwards' || animation.effect?._timing.fill === 'both'));
   }
-  get documentElement() { return _wrapEl(+_dom("document_element")); }
+  get documentElement() {
+    if (this._detached) return _childNodeOfType(this, 1);
+    return _wrapEl(+_dom("document_element"));
+  }
   get children() {
     const root = this.documentElement;
     return HTMLCollection._from(root ? [root] : []);
@@ -5628,16 +5827,27 @@ class Document extends Node {
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
   get doctype() {
+    if (this._detached) return _childNodeOfType(this, 10);
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
     if (info && info.name) {
-      this._doctype = new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+      const cached = _cache.get(info.nodeId);
+      this._doctype = cached instanceof DocumentType
+        ? cached
+        : new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+      _cache.set(info.nodeId, this._doctype);
     } else {
       this._doctype = null;
     }
     return this._doctype;
   }
-  get title() { return _domParse("document_title") ?? ""; }
+  get title() {
+    if (this._detached) {
+      const title = this.querySelector("title");
+      return title ? title.textContent.replace(/[\t\n\f\r ]+/g, " ").trim() : "";
+    }
+    return _domParse("document_title") ?? "";
+  }
   set title(v) {
     const value = String(v);
     let title = this.querySelector("title");
@@ -5654,7 +5864,7 @@ class Document extends Node {
     }
     title.textContent = value;
   }
-  get URL() { return _domParse("document_url") ?? ""; }
+  get URL() { return this._detached ? "about:blank" : (_domParse("document_url") ?? ""); }
   get documentURI() { return this.URL; }
   get domain() {
     return this === globalThis.document
@@ -5678,10 +5888,13 @@ class Document extends Node {
     // grant cross-document access.
     this._effectiveDomain = candidate;
   }
-  get referrer() { return _domParse("document_referrer") ?? ""; }
-  get location() { return globalThis.location; }
-  set location(url) { __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
-  get defaultView() { return globalThis; }
+  get referrer() { return this._detached ? "" : (_domParse("document_referrer") ?? ""); }
+  get location() { return this._detached ? null : globalThis.location; }
+  set location(url) {
+    if (this._detached) return;
+    __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', '');
+  }
+  get defaultView() { return this._detached ? null : globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
@@ -5690,7 +5903,7 @@ class Document extends Node {
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
-  get characterSet() { return (this._nid === undefined || this._nid === null) ? "UTF-8" : _docEncoding(); }
+  get characterSet() { return (this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding(); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -5713,7 +5926,7 @@ class Document extends Node {
     if (/\.(?:xml|svg)(?:[?#]|$)/i.test(url)) return "application/xml";
     return "text/html";
   }
-  get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
+  get readyState() { return this._detached ? 'complete' : (globalThis.__documentReadyState__ || 'complete'); }
   get currentScript() {
     // Next.js / Turbopack chunk loader reads document.currentScript.src to
     // derive its base path. page.rs sets __currentScriptNid before each
@@ -5725,11 +5938,20 @@ class Document extends Node {
   get visibilityState() { return "visible"; }
   getElementById(id) {
     const needle = String(id);
-    return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
+    if (needle === "") return null;
+    if (this._detached) {
+      return this.querySelector('[id="' + needle.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]');
+    }
+    return _wrapEl(+_dom("get_element_by_id", needle));
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) {
+    if (this._detached) return _wrapEl(+_dom("query_selector_scoped", this._nid, s));
+    return _wrapEl(+_dom("query_selector", s));
+  }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = (this._detached
+      ? _domParse("query_selector_all_scoped", this._nid, s)
+      : _domParse("query_selector_all", s)) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
@@ -5755,6 +5977,7 @@ class Document extends Node {
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
+    _stampNodeDocument(el, this);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
       el._templateContent._fragmentContext = 'template';
@@ -5788,21 +6011,21 @@ class Document extends Node {
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
-    return el;
+    return _stampNodeDocument(el, this);
   }
   createTextNode(t) {
     const nid = +_dom("create_text_node", String(t));
     const n = new Text(nid);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createCDATASection(data) {
     // Spec: throw NotSupportedError on an HTML document, reject data
@@ -5818,7 +6041,7 @@ class Document extends Node {
     const n = new CDATASection(nid);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createProcessingInstruction(target, data) {
     // Spec: not gated on document type. Reject targets that are not an XML
@@ -5835,14 +6058,14 @@ class Document extends Node {
     const n = new ProcessingInstruction(nid, tgt);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
     _seedDetachedTreeState(frag);
     _cache.set(nid, frag);
-    return frag;
+    return _stampNodeDocument(frag, this);
   }
   // Legacy DOM Level 2 event factory. Spec returns an event of the requested
   // class with an empty type until init*Event() is called. We previously
@@ -6089,7 +6312,10 @@ class Document extends Node {
     };
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
-  get activeElement() { return globalThis.__obscura_focused || this.body; }
+  get activeElement() {
+    if (this._detached) return this.body;
+    return globalThis.__obscura_focused || this.body;
+  }
   // The element that scrolls the viewport, and where the page offset lives
   // (issue #468). Standards mode, so documentElement — quirks mode would be
   // body, but we never parse in quirks mode.
@@ -6104,30 +6330,30 @@ class Document extends Node {
       // jQuery 3.x with it. Reuse the DOMParser path to build a detached
       // document, then optionally set the title.
       createHTMLDocument(title) {
-        // Build head>title and body explicitly. Parsing a full skeleton string
-        // as innerHTML of <html> collapses through the fragment parser (it
-        // dropped head/body and kept only <title>), leaving doc.body null.
-        const doc = new DOMParser().parseFromString("", "text/html");
-        const root = doc.documentElement;
-        const head = document.createElement("head");
-        const titleEl = document.createElement("title");
-        if (title != null) titleEl.textContent = String(title);
-        head.appendChild(titleEl);
-        const body = document.createElement("body");
-        root.appendChild(head);
-        root.appendChild(body);
+        const doc = _createDetachedDocument("text/html", false);
+        doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
+        const html = doc.createElement("html");
+        doc.appendChild(html);
+        const head = doc.createElement("head");
+        html.appendChild(head);
+        if (title !== undefined) {
+          const titleEl = doc.createElement("title");
+          titleEl.appendChild(doc.createTextNode(String(title)));
+          head.appendChild(titleEl);
+        }
+        html.appendChild(doc.createElement("body"));
         return doc;
       },
-      // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
-      // an XML document with a root element of the given name. We don't
-      // have a separate XML stack, so return a minimal detached document
-      // with an element of the requested local name as documentElement.
-      createDocument(_ns, qualifiedName, _doctype) {
-        const name = (qualifiedName && String(qualifiedName)) || "root";
-        const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = new DOMParser().parseFromString(html, "application/xml");
-        if (_doctype) doc._docType = _doctype;
+      createDocument(namespace, qualifiedName, doctype) {
+        const ns = namespace == null ? null : String(namespace);
+        const contentType = ns === "http://www.w3.org/1999/xhtml"
+          ? "application/xhtml+xml"
+          : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
+        const doc = _createDetachedDocument(contentType, true);
+        const name = qualifiedName == null ? "" : String(qualifiedName);
+        const element = name === "" ? null : doc.createElementNS(ns, name);
+        if (doctype != null) doc.appendChild(doctype);
+        if (element) doc.appendChild(element);
         return doc;
       },
       // createDocumentType(qualifiedName, publicId, systemId): build a detached
@@ -6140,13 +6366,14 @@ class Document extends Node {
           throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
         }
         const dt = new DocumentType(
-          +_dom("create_comment_node", ""),
+          +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
           name,
           publicId === undefined ? "" : String(publicId),
           systemId === undefined ? "" : String(systemId)
         );
-        dt._ownerDocument = ownerDoc;
-        return dt;
+        _seedDetachedTreeState(dt);
+        _cache.set(dt._nid, dt);
+        return _stampNodeDocument(dt, ownerDoc);
       },
       hasFeature() { return true; },
     };
@@ -6160,10 +6387,12 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
+    // A document without a browsing context is cookie-averse.
+    if (this._detached) return "";
     return __obscuraCore.ops.op_get_cookies();
   }
   set cookie(v) {
-    if (!v) return;
+    if (!v || this._detached) return;
     __obscuraCore.ops.op_set_cookie(v);
   }
   // Inserts into the document's input stream, which the host keeps alive across calls.
@@ -6259,7 +6488,7 @@ class Document extends Node {
     };
     setTimeout(finishParsing, 0);
   }
-  hasFocus() { return true; }
+  hasFocus() { return !this._detached; }
   execCommand() { return false; }
 }
 
@@ -6325,7 +6554,6 @@ class DocumentType extends Node {
   get systemId() { return this._systemId; }
   get nodeValue() { return null; }
   set nodeValue(v) {}
-  get ownerDocument() { return this._ownerDocument || globalThis.document; }
 }
 
 const _cache = new Map();
@@ -6929,6 +7157,9 @@ function _wrap(nid) {
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) {
+    n = new DocumentType(nid, _domParse("doctype_name", nid) ?? "", _domParse("doctype_public_id", nid) ?? "", "");
+  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -8199,16 +8430,27 @@ if (!Element.prototype.replaceWith) {
   Element.prototype.replaceWith = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
-    parent.removeChild(this);
+    const next = _viableSibling(this, nodes, "nextSibling");
+    const node = _convertNodesIntoNode(nodes, this);
+    if (this.parentNode === parent) _replaceChildNode(parent, node, this, "replaceWith");
+    else _preInsertNode(parent, node, next, "replaceWith");
   };
   _markNative(Element.prototype.replaceWith);
+}
+// ChildNode before/after/replaceWith anchor on the first sibling that is not
+// itself being inserted.
+function _viableSibling(node, nodes, direction) {
+  let sibling = node[direction];
+  while (sibling && nodes.includes(sibling)) sibling = sibling[direction];
+  return sibling;
 }
 if (!Element.prototype.before) {
   Element.prototype.before = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
+    const previous = _viableSibling(this, nodes, "previousSibling");
+    const node = _convertNodesIntoNode(nodes, this);
+    _preInsertNode(parent, node, previous ? previous.nextSibling : parent.firstChild, "before");
   };
   _markNative(Element.prototype.before);
 }
@@ -8216,8 +8458,9 @@ if (!Element.prototype.after) {
   Element.prototype.after = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    const ref = this.nextSibling;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, ref);
+    const next = _viableSibling(this, nodes, "nextSibling");
+    const node = _convertNodesIntoNode(nodes, this);
+    _preInsertNode(parent, node, next, "after");
   };
   _markNative(Element.prototype.after);
 }
@@ -8534,7 +8777,7 @@ globalThis.ResizeObserver = class ResizeObserver {
       return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
     this._active = [];
-    try { this._callback(entries, this); } catch (_error) {}
+    try { this._callback.call(this, entries, this); } catch (_error) {}
   }
   observe(target, options = {}) {
     if (!(target instanceof Element)) {
@@ -8949,16 +9192,21 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   };
 
   const target = style;
+  // An element outside any document has no computed style: every property
+  // reads "" and length is 0. Checked per read, as the declaration is live.
+  const detachedLookup = (name) => (_computedStyleHasNoDocument(el) ? '' : lookup(name));
   return new Proxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
-      if (prop === 'getPropertyValue') return (name) => lookup(name);
+      if (prop === 'getPropertyValue') return (name) => detachedLookup(name);
       if (prop === 'getPropertyPriority') return () => '';
       if (prop === 'item') return (i) => {
+        if (_computedStyleHasNoDocument(el)) return '';
         refreshRendered();
         return snapshot.names[i | 0] || '';
       };
       if (prop === 'length') {
+        if (_computedStyleHasNoDocument(el)) return 0;
         refreshRendered();
         return snapshot.names.length;
       }
@@ -8972,14 +9220,25 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
           && (_CSS_PROP_SET.has(prop)
               || _CSS_PROP_SET.has(_cssKebabToCamel(prop))
               || prop.includes('-'))) {
-        return lookup(prop);
+        return detachedLookup(prop);
       }
       if (prop in target) return target[prop];
-      if (typeof prop === 'string') return lookup(prop);
+      if (typeof prop === 'string') return detachedLookup(prop);
       return undefined;
     },
   });
 };
+// Chrome parity: only elements whose shadow-including root is not a document
+// lose their style. Iframe shim documents count as documents, and shadow
+// content of a connected host keeps its style even when it is not slotted.
+const _iframeDocumentRoots = new WeakSet();
+function _computedStyleHasNoDocument(el) {
+  if (!(el instanceof Node) || el.isConnected) return false;
+  const root = el.getRootNode({ composed: true });
+  if (!root) return true;
+  if (root.nodeType === 9) return root !== globalThis.document && !!root._detached;
+  return !_iframeDocumentRoots.has(root);
+}
 // Returns the one Selection instance for a document (cached on the document),
 // so window.getSelection() === document.getSelection(). The real Selection
 // class is defined below, after Range. _selectionFor is hoisted.
@@ -9014,7 +9273,7 @@ class CSSRule {
   get type() { return this._type; }
   get cssText() { return this._cssText; }
   set cssText(_value) {}
-  get parentStyleSheet() { return this._parentStyleSheet; }
+  get parentStyleSheet() { return this._parentStyleSheet || this._parentRule?.parentStyleSheet || null; }
   get parentRule() { return this._parentRule; }
 }
 for (const name of [
@@ -9048,7 +9307,8 @@ class CSSStyleRule extends CSSRule {
   }
   set cssText(_value) {}
   _changed() {
-    if (this._parentStyleSheet) this._parentStyleSheet._ruleChanged();
+    const sheet = this.parentStyleSheet;
+    if (sheet) sheet._ruleChanged();
   }
 }
 
@@ -9113,7 +9373,7 @@ function _splitTopLevelCssRules(value) {
 function _cssRuleFromText(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
-  if (trimmed[0] === "@") return new CSSRule(trimmed, 0);
+  if (trimmed[0] === "@") return _cssConditionRuleFromText(trimmed) || new CSSRule(trimmed, 0);
   const open = trimmed.indexOf("{");
   if (open <= 0 || !trimmed.endsWith("}")) return null;
   const selector = trimmed.slice(0, open).trim();
@@ -9174,17 +9434,68 @@ class CSSGroupingRule extends CSSRule {
     if (!parsed.valid || parsed.rules.length !== 1) throw new DOMException("The rule could not be parsed", "SyntaxError");
     const child = _cssRuleFromText(parsed.rules[0]);
     if (!child) throw new DOMException("The rule could not be parsed", "SyntaxError");
-    child._parentStyleSheet = this.parentStyleSheet;
+    child._parentRule = this;
     this._rules.splice(idx, 0, child);
+    // A nested rule changes its top-level rule's text, so the sheet resyncs.
     this.parentStyleSheet?._ruleChanged();
     return idx;
   }
   deleteRule(index) {
     const idx = Number(index) >>> 0;
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
-    this._rules.splice(idx, 1);
+    const [removed] = this._rules.splice(idx, 1);
+    if (removed) removed._parentRule = null;
     this.parentStyleSheet?._ruleChanged();
   }
+}
+
+// @media and @supports expose their nested rules; other at-rules stay opaque.
+class CSSConditionRule extends CSSGroupingRule {
+  constructor(prelude, type) {
+    super("", type);
+    this._conditionText = prelude;
+  }
+  get conditionText() { return this._conditionText; }
+  get cssText() {
+    const keyword = this._type === CSSRule.MEDIA_RULE ? "@media" : "@supports";
+    const body = this._rules.map(rule => "\n  " + rule.cssText).join("");
+    return `${keyword} ${this._conditionText} {${body}\n}`;
+  }
+  set cssText(_value) {}
+}
+class CSSMediaRule extends CSSConditionRule {
+  get media() {
+    const text = this._conditionText;
+    const items = text ? text.split(",").map(item => item.trim()).filter(Boolean) : [];
+    return {
+      mediaText: text,
+      length: items.length,
+      item(index) { return items[index >>> 0] ?? null; },
+      toString() { return text; },
+    };
+  }
+}
+class CSSSupportsRule extends CSSConditionRule {}
+
+function _cssConditionRuleFromText(text) {
+  const match = /^@(media|supports)\b/i.exec(text);
+  if (!match) return null;
+  const open = text.indexOf("{");
+  if (open < 0 || !text.endsWith("}")) return null;
+  const prelude = text.slice(match[0].length, open).trim().replace(/\s+/g, " ");
+  const parsed = _splitTopLevelCssRules(text.slice(open + 1, -1));
+  if (!parsed.valid) return null;
+  const isMedia = match[1].toLowerCase() === "media";
+  const rule = isMedia
+    ? new CSSMediaRule(prelude, CSSRule.MEDIA_RULE)
+    : new CSSSupportsRule(prelude, CSSRule.SUPPORTS_RULE);
+  for (const childText of parsed.rules) {
+    const child = _cssRuleFromText(childText);
+    if (!child) return null;
+    child._parentRule = rule;
+    rule._rules.push(child);
+  }
+  return rule;
 }
 
 class StyleSheet {
@@ -9517,6 +9828,9 @@ Object.defineProperty(Element.prototype, "sheet", {
 globalThis.CSSRule = CSSRule;
 globalThis.CSSStyleRule = CSSStyleRule;
 globalThis.CSSGroupingRule = CSSGroupingRule;
+globalThis.CSSConditionRule = CSSConditionRule;
+globalThis.CSSMediaRule = CSSMediaRule;
+globalThis.CSSSupportsRule = CSSSupportsRule;
 globalThis.CSSRuleList = CSSRuleList;
 globalThis.StyleSheet = StyleSheet;
 globalThis.CSSStyleSheet = CSSStyleSheet;
@@ -9620,90 +9934,183 @@ Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
 });
 
 globalThis.__mutationObservers = [];
+// MutationRecord fields are prototype getters over internal state, as in
+// browsers; records are only built while an observer exists.
+const _mutationRecordData = new WeakMap();
+globalThis.MutationRecord = class MutationRecord {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get type() { return _mutationRecordData.get(this).type; }
+  get target() { return _mutationRecordData.get(this).target; }
+  get addedNodes() { return _mutationRecordData.get(this).addedNodes; }
+  get removedNodes() { return _mutationRecordData.get(this).removedNodes; }
+  get previousSibling() { return _mutationRecordData.get(this).previousSibling; }
+  get nextSibling() { return _mutationRecordData.get(this).nextSibling; }
+  get attributeName() { return _mutationRecordData.get(this).attributeName; }
+  get attributeNamespace() { return _mutationRecordData.get(this).attributeNamespace; }
+  get oldValue() { return _mutationRecordData.get(this).oldValue; }
+};
+function _makeMutationRecord(type, target, init, includeOldValue) {
+  const record = Object.create(MutationRecord.prototype);
+  _mutationRecordData.set(record, {
+    type,
+    target,
+    addedNodes: _nodeList(init.addedNodes || []),
+    removedNodes: _nodeList(init.removedNodes || []),
+    previousSibling: init.previousSibling || null,
+    nextSibling: init.nextSibling || null,
+    attributeName: init.attributeName ?? null,
+    attributeNamespace: init.attributeNamespace ?? null,
+    oldValue: includeOldValue ? (init.oldValue ?? null) : null,
+  });
+  return record;
+}
+
+let _mutationObserverMicrotaskQueued = false;
+function _notifyMutationObservers() {
+  _mutationObserverMicrotaskQueued = false;
+  // Observers are notified in creation order; one callback per observer
+  // with every record queued since the last delivery.
+  const observers = _mutationObserverRegistry.slice();
+  for (const observer of observers) {
+    if (observer._records.length === 0) continue;
+    const records = observer._records.splice(0);
+    try { observer._callback.call(observer, records, observer); }
+    catch (e) { _reportMutationObserverError(e); }
+  }
+}
+function _reportMutationObserverError(error) {
+  try {
+    if (typeof globalThis.reportError === "function") globalThis.reportError(error);
+    else console.error(error);
+  } catch (e) { /* reporting must not stop delivery */ }
+}
+// Every observing MutationObserver in creation order, which is delivery order.
+const _mutationObserverRegistry = [];
+
 globalThis.MutationObserver = class MutationObserver {
   constructor(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+    }
     this._callback = callback;
     this._targets = [];
     this._records = [];
   }
-  observe(target, options) {
-    this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+  observe(target, options = {}) {
+    if (!_isDomNode(target)) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+    }
+    const o = options == null ? {} : options;
+    const init = {
+      childList: !!o.childList,
+      subtree: !!o.subtree,
+      attributes: o.attributes === undefined ? undefined : !!o.attributes,
+      characterData: o.characterData === undefined ? undefined : !!o.characterData,
+      attributeOldValue: o.attributeOldValue === undefined ? undefined : !!o.attributeOldValue,
+      characterDataOldValue: o.characterDataOldValue === undefined ? undefined : !!o.characterDataOldValue,
+      attributeFilter: o.attributeFilter === undefined ? undefined : Array.from(o.attributeFilter, String),
+    };
+    if (init.attributes === undefined && (init.attributeOldValue !== undefined || init.attributeFilter !== undefined)) {
+      init.attributes = true;
+    }
+    if (init.characterData === undefined && init.characterDataOldValue !== undefined) init.characterData = true;
+    const fail = (message) => new TypeError("Failed to execute 'observe' on 'MutationObserver': " + message);
+    if (!init.childList && !init.attributes && !init.characterData) {
+      throw fail("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    }
+    if (init.attributeOldValue && !init.attributes) {
+      throw fail("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    }
+    if (init.attributeFilter !== undefined && !init.attributes) {
+      throw fail("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+    }
+    if (init.characterDataOldValue && !init.characterData) {
+      throw fail("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+    }
+    init.attributes = !!init.attributes;
+    init.characterData = !!init.characterData;
+    const existing = this._targets.find(registration => registration.target === target);
+    if (existing) existing.options = init;
+    else this._targets.push({ target, options: init });
+    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
+    if (!_mutationObserverRegistry.includes(this)) _mutationObserverRegistry.push(this);
   }
   disconnect() {
     this._targets = [];
+    this._records = [];
     const idx = globalThis.__mutationObservers.indexOf(this);
     if (idx >= 0) globalThis.__mutationObservers.splice(idx, 1);
+    const registered = _mutationObserverRegistry.indexOf(this);
+    if (registered >= 0) _mutationObserverRegistry.splice(registered, 1);
   }
   takeRecords() {
-    const r = this._records.slice();
-    this._records = [];
-    return r;
+    return this._records.splice(0);
   }
-  _notify(records) {
-    this._records.push(...records);
-    Promise.resolve().then(() => {
-      if (this._records.length > 0) {
-        const batch = this._records.splice(0);
-        try { this._callback(batch, this); } catch(e) { /* observer errors shouldn't propagate */ }
-      }
-    });
+  _enqueue(record) {
+    this._records.push(record);
+    if (!_mutationObserverMicrotaskQueued) {
+      _mutationObserverMicrotaskQueued = true;
+      queueMicrotask(_notifyMutationObservers);
+    }
   }
 };
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue) {
+
+// "Queue a mutation record": find every observer registered on the target or,
+// with subtree, on one of its inclusive ancestors, and apply its filters.
+function _queueMutationRecord(type, target, init) {
+  const observers = globalThis.__mutationObservers;
+  if (!observers.length || !target) return;
+  let ancestors = null;
+  for (const observer of observers) {
+    let matched = false;
+    let wantsOldValue = false;
+    for (const registration of observer._targets) {
+      const root = registration.target;
+      const options = registration.options;
+      if (!root) continue;
+      if (root !== target && root._nid !== target._nid) {
+        if (!options.subtree) continue;
+        if (!ancestors) {
+          ancestors = new Set();
+          for (let cur = target.parentNode; cur; cur = cur.parentNode) ancestors.add(cur._nid);
+        }
+        if (!ancestors.has(root._nid)) continue;
+      }
+      if (type === "attributes") {
+        if (!options.attributes) continue;
+        if (options.attributeFilter
+            && (init.attributeNamespace != null || !options.attributeFilter.includes(init.attributeName))) continue;
+        if (options.attributeOldValue) wantsOldValue = true;
+      } else if (type === "characterData") {
+        if (!options.characterData) continue;
+        if (options.characterDataOldValue) wantsOldValue = true;
+      } else if (!options.childList) {
+        continue;
+      }
+      matched = true;
+    }
+    if (matched) observer._enqueue(_makeMutationRecord(type, target, init, wantsOldValue));
+  }
+}
+function _queueAttributeMutationRecord(target, localName, namespace, oldValue) {
+  _queueMutationRecord("attributes", target, { attributeName: localName, attributeNamespace: namespace, oldValue });
+}
+function _queueTreeMutationRecord(target, addedNodes, removedNodes, previousSibling, nextSibling) {
+  _queueMutationRecord("childList", target, { addedNodes, removedNodes, previousSibling, nextSibling });
+}
+// Node-id entry point kept for the native-backed callers (innerHTML,
+// attributes, character data).
+globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue, attributeNamespace) {
   if (!globalThis.__mutationObservers.length) return;
-  // Use `_wrap` (the canonical node-id → wrapper resolver) instead of a
-  // direct cache poke. The previous code referenced `globalThis._cache`,
-  // but `_cache` is a module-local Map — the lookup always returned
-  // undefined, so the function silently bailed every time. Result: no
-  // MutationObserver fired in obscura, ever, despite the call sites being
-  // wired up at appendChild / setAttribute. _wrap also lazily creates a
-  // wrapper for nodes that didn't have one yet (e.g. children parsed from
-  // `set innerHTML`), which we need for record.target/added/removed.
   const target = _wrap(target_nid);
   if (!target) return;
-  const record = {
-    type: type, // 'childList', 'attributes', 'characterData'
-    target: target,
+  _queueMutationRecord(type, target, {
     addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
-    attributeName: attributeName || null,
+    attributeName: attributeName ?? null,
+    attributeNamespace: attributeNamespace ?? null,
     oldValue: oldValue ?? null,
-    previousSibling: null,
-    nextSibling: null,
-  };
-  // Walk target → ancestors so a subtree-mode observer rooted at any
-  // ancestor matches. The previous implementation just checked that
-  // `target.contains` and `target.closest` were defined (always true on
-  // any Element), so subtree=true silently behaved like subtree=false and
-  // every nested mutation missed its subscriber.
-  for (const obs of globalThis.__mutationObservers) {
-    let matched = false;
-    for (const t of obs._targets) {
-      const root = t.target;
-      if (!root) continue;
-      // Filter by type per the observer options. Default behaviour matches
-      // real MutationObserver: attribute mutations need options.attributes,
-      // characterData mutations need options.characterData, childList
-      // needs options.childList.
-      const wantsType =
-        (type === 'attributes' && t.options.attributes) ||
-        (type === 'characterData' && t.options.characterData) ||
-        (type === 'childList' && t.options.childList);
-      if (!wantsType) continue;
-      if (root._nid === target_nid) { matched = true; break; }
-      if (t.options.subtree) {
-        // Walk parents until we hit the observed root or run off the tree.
-        let cur = target.parentNode;
-        while (cur) {
-          if (cur._nid === root._nid) { matched = true; break; }
-          cur = cur.parentNode;
-        }
-        if (matched) break;
-      }
-    }
-    if (matched) obs._notify([record]);
-  }
+  });
 };
 
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
@@ -9734,37 +10141,17 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
     }
   }
   appendChild(child) {
+    _requireNodeArgument(child, "appendChild", 1);
     this._assertInsertable(child, 'appendChild');
     return super.appendChild(child);
   }
   insertBefore(node, reference) {
-    if (reference && reference.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
-        'NotFoundError'
-      );
-    }
-    if (node === reference) return node;
+    _requireNodeArgument(node, "insertBefore", 1);
     this._assertInsertable(node, 'insertBefore');
-    return super.insertBefore(node, reference);
-  }
-  removeChild(child) {
-    if (!child || child.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
-        'NotFoundError'
-      );
-    }
-    return super.removeChild(child);
+    return super.insertBefore(...arguments);
   }
   replaceChild(node, oldChild) {
-    if (!oldChild || oldChild.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
-        'NotFoundError'
-      );
-    }
-    if (node === oldChild) return oldChild;
+    _requireNodeArgument(node, "replaceChild", 1);
     this._assertInsertable(node, 'replaceChild');
     return super.replaceChild(node, oldChild);
   }
@@ -9961,7 +10348,7 @@ function _scheduleIntersectionObserverDelivery(observer) {
     for (const current of pending) {
       if (!current._connected || !current._records.length) continue;
       const records = current.takeRecords();
-      try { current._callback(records, current); } catch (e) {}
+      try { current._callback.call(current, records, current); } catch (e) {}
     }
   }, _schedulerPriorityRank["user-visible"] * 2, documentGeneration, () => {
     _intersectionDeliveryTaskPending = false;
@@ -10092,6 +10479,24 @@ function _ioElementPaddingBox(element, style, measurements) {
     : element.clientHeight;
   return _ioRect(rect.left + borderLeft, rect.top + borderTop, width, height);
 }
+// Entry fields are prototype getters over internal state, as in browsers.
+const _ioEntryData = new WeakMap();
+globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
+  constructor(init) {
+    if (init === undefined) {
+      throw new TypeError("Failed to construct 'IntersectionObserverEntry': 1 argument required, but only 0 present.");
+    }
+    _ioEntryData.set(this, { isVisible: false, ...init });
+  }
+  get time() { return _ioEntryData.get(this).time; }
+  get rootBounds() { return _ioEntryData.get(this).rootBounds ?? null; }
+  get boundingClientRect() { return _ioEntryData.get(this).boundingClientRect; }
+  get intersectionRect() { return _ioEntryData.get(this).intersectionRect; }
+  get isIntersecting() { return !!_ioEntryData.get(this).isIntersecting; }
+  get isVisible() { return !!_ioEntryData.get(this).isVisible; }
+  get intersectionRatio() { return _ioEntryData.get(this).intersectionRatio; }
+  get target() { return _ioEntryData.get(this).target; }
+};
 globalThis.IntersectionObserver = class IntersectionObserver {
   constructor(callback, options) {
     if (typeof callback !== "function") {
@@ -10202,7 +10607,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     const targetArea = Math.max(0, rect.width) * Math.max(0, rect.height);
     const isIntersecting = edgesTouch;
     const area = isIntersecting ? width * height : 0;
-    return {
+    return new IntersectionObserverEntry({
       target,
       isIntersecting,
       intersectionRatio: targetArea > 0 ? area / targetArea : (isIntersecting ? 1 : 0),
@@ -10210,7 +10615,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
       intersectionRect: isIntersecting ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
       rootBounds: root,
       time: performance.now(),
-    };
+    });
   }
   _thresholdIndex(ratio) {
     let index = 0;
@@ -10306,7 +10711,6 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   if (globalThis.document) wireUp();
   else Promise.resolve().then(wireUp);
 })();
-globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 // Feature detection reads this static before deciding to observe anything;
 // absent it, supportedEntryTypes.includes(...) throws and instrumentation
@@ -11148,24 +11552,24 @@ globalThis.DOMParser = class DOMParser {
       getElementsByName(n) {
         return root.querySelectorAll(`[name="${n}"]`);
       },
-      createElement: (t) => document.createElement(t),
-      createElementNS: (ns, t) => document.createElement(t),
-      createTextNode: (t) => document.createTextNode(t),
-      createComment: (t) => document.createComment(t),
-      createDocumentFragment: () => document.createDocumentFragment(),
+      createElement: (t) => _stampNodeDocument(document.createElement(t), docNode),
+      createElementNS: (ns, t) => _stampNodeDocument(document.createElement(t), docNode),
+      createTextNode: (t) => _stampNodeDocument(document.createTextNode(t), docNode),
+      createComment: (t) => _stampNodeDocument(document.createComment(t), docNode),
+      createDocumentFragment: () => _stampNodeDocument(document.createDocumentFragment(), docNode),
       createRange: () => new Range(),
       createEvent: (type) => document.createEvent(type),
       createCDATASection: (data) => {
         if (mimeType === "text/html") throw new DOMException("createCDATASection is not supported in HTML documents", "NotSupportedError");
         const s = String(data);
         if (s.indexOf("]]>") !== -1) throw new DOMException("CDATA section data must not contain ']]>'", "InvalidCharacterError");
-        return new CDATASection(+_dom("create_text_node", s));
+        return _stampNodeDocument(new CDATASection(+_dom("create_text_node", s)), docNode);
       },
       createProcessingInstruction: (target, data) => {
         const t = String(target), s = String(data);
         if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
         if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
-        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+        return _stampNodeDocument(new ProcessingInstruction(+_dom("create_text_node", s), t), docNode);
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
@@ -11183,6 +11587,9 @@ globalThis.DOMParser = class DOMParser {
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
+    // The parsed tree belongs to this document, not the main one.
+    _registerForeignDocument();
+    _stampNodeDocument(root, docNode);
     return docNode;
   }
 };
@@ -12774,6 +13181,78 @@ function _rngCmp(nA, oA, nB, oB) {
   }
   return -1;
 }
+function _rngIsCharacterData(n) {
+  const t = n.nodeType;
+  return t === 3 || t === 4 || t === 7 || t === 8;
+}
+function _rngIsInclusiveAncestor(a, n) {
+  return _rngSame(a, n) || (a.contains ? a.contains(n) : false);
+}
+// A node is contained when all of it lies between the boundary points, and
+// partially contained when it is an inclusive ancestor of just one of them.
+function _rngContains(range, node) {
+  return _rngCmp(node, 0, range._sc, range._so) > 0
+    && _rngCmp(node, _rngNodeLength(node), range._ec, range._eo) < 0;
+}
+function _rngPartiallyContains(range, node) {
+  return _rngIsInclusiveAncestor(node, range._sc) !== _rngIsInclusiveAncestor(node, range._ec);
+}
+// Where extract/delete collapse the range: the start, or just after the
+// start's highest ancestor that does not contain the end.
+function _rngCollapsePoint(sc, so, ec) {
+  if (_rngIsInclusiveAncestor(sc, ec)) return [sc, so];
+  let reference = sc;
+  while (reference.parentNode && !_rngIsInclusiveAncestor(reference.parentNode, ec)) reference = reference.parentNode;
+  return [reference.parentNode, _rngNodeIndex(reference) + 1];
+}
+// The shared body of cloneContents (extract false) and extractContents.
+function _rngCopyContents(range, extract) {
+  const sc = range._sc, so = range._so, ec = range._ec, eo = range._eo;
+  const doc = sc.nodeType === 9 ? sc : (sc.ownerDocument || globalThis.document);
+  const fragment = doc.createDocumentFragment();
+  if (range.collapsed) return fragment;
+  if (_rngSame(sc, ec) && _rngIsCharacterData(sc)) {
+    const clone = sc.cloneNode(false);
+    clone.data = sc.data.substring(so, eo);
+    fragment.appendChild(clone);
+    if (extract) sc.replaceData(so, eo - so, "");
+    return fragment;
+  }
+  let common = sc;
+  while (!_rngIsInclusiveAncestor(common, ec)) common = common.parentNode;
+  const children = Array.from(common.childNodes);
+  const firstPartial = _rngIsInclusiveAncestor(sc, ec)
+    ? null : (children.find(c => _rngPartiallyContains(range, c)) || null);
+  const lastPartial = _rngIsInclusiveAncestor(ec, sc)
+    ? null : ([...children].reverse().find(c => _rngPartiallyContains(range, c)) || null);
+  const contained = children.filter(c => _rngContains(range, c));
+  if (contained.some(c => c.nodeType === 10)) {
+    throw new DOMException("The Range contains a DocumentType node.", "HierarchyRequestError");
+  }
+  const [newNode, newOffset] = extract ? _rngCollapsePoint(sc, so, ec) : [null, 0];
+  const copyPartial = (child, start, end) => {
+    if (_rngIsCharacterData(child)) {
+      const clone = child.cloneNode(false);
+      const from = start ? so : 0;
+      const to = start ? _rngNodeLength(child) : eo;
+      clone.data = child.data.substring(from, to);
+      fragment.appendChild(clone);
+      if (extract) child.replaceData(from, to - from, "");
+      return;
+    }
+    const clone = child.cloneNode(false);
+    fragment.appendChild(clone);
+    const sub = new Range();
+    if (start) { sub._sc = sc; sub._so = so; sub._ec = child; sub._eo = _rngNodeLength(child); }
+    else { sub._sc = child; sub._so = 0; sub._ec = ec; sub._eo = eo; }
+    clone.appendChild(_rngCopyContents(sub, extract));
+  };
+  if (firstPartial) copyPartial(firstPartial, true);
+  for (const child of contained) fragment.appendChild(extract ? child : child.cloneNode(true));
+  if (lastPartial) copyPartial(lastPartial, false);
+  if (extract) { range._sc = newNode; range._so = newOffset; range._ec = newNode; range._eo = newOffset; }
+  return fragment;
+}
 function _rngCheckOffset(n, o) {
   if (n && n.nodeType === 10) throw new DOMException("Range boundary cannot be a DocumentType", "InvalidNodeTypeError");
   if (o < 0 || o > _rngNodeLength(n)) throw new DOMException("Range offset out of bounds", "IndexSizeError");
@@ -12888,11 +13367,72 @@ globalThis.Range = class Range {
     if (!_rngSame(sc, ec) && (ec.nodeType === 3 || ec.nodeType === 4)) s += (ec.data || "").slice(0, this._eo);
     return s;
   }
-  cloneContents() { return (globalThis.document || document).createDocumentFragment(); }
-  extractContents() { return (globalThis.document || document).createDocumentFragment(); }
-  deleteContents() {}
-  insertNode(node) { if (node && this._sc && this._sc.insertBefore) { const kids = this._sc.childNodes; this._sc.insertBefore(node, kids[this._so] || null); } }
-  surroundContents(node) { this.insertNode(node); }
+  cloneContents() { return _rngCopyContents(this, false); }
+  extractContents() { return _rngCopyContents(this, true); }
+  deleteContents() {
+    if (this.collapsed) return;
+    const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
+    if (_rngSame(sc, ec) && _rngIsCharacterData(sc)) {
+      sc.replaceData(so, eo - so, "");
+      return;
+    }
+    // Contained nodes in tree order, skipping those whose parent is contained.
+    const toRemove = [];
+    const collect = (node) => {
+      for (const child of Array.from(node.childNodes)) {
+        if (_rngContains(this, child)) toRemove.push(child);
+        else collect(child);
+      }
+    };
+    collect(this.commonAncestorContainer);
+    const [newNode, newOffset] = _rngCollapsePoint(sc, so, ec);
+    if (_rngIsCharacterData(sc)) sc.replaceData(so, _rngNodeLength(sc) - so, "");
+    for (const node of toRemove) {
+      const parent = node.parentNode;
+      if (parent) parent.removeChild(node);
+    }
+    if (_rngIsCharacterData(ec)) ec.replaceData(0, eo, "");
+    this._sc = newNode; this._so = newOffset; this._ec = newNode; this._eo = newOffset;
+  }
+  insertNode(node) {
+    _requireNodeArgument(node, "insertNode", 1, "Range");
+    const sc = this._sc;
+    const st = sc.nodeType;
+    if (st === 7 || st === 8 || ((st === 3 || st === 4) && !sc.parentNode) || _rngSame(sc, node)) {
+      throw new DOMException("Failed to execute 'insertNode' on 'Range': The node provided cannot be inserted here.", "HierarchyRequestError");
+    }
+    const startIsText = st === 3 || st === 4;
+    let reference = startIsText ? sc : (sc.childNodes[this._so] || null);
+    const parent = reference === null ? sc : reference.parentNode;
+    _ensureInsertionValidity(parent, node, reference, "insertNode", false);
+    if (startIsText) reference = sc.splitText(this._so);
+    if (reference === node) reference = node.nextSibling;
+    if (node.parentNode) node.parentNode.removeChild(node);
+    let newOffset = reference === null ? _rngNodeLength(parent) : _rngNodeIndex(reference);
+    newOffset += node.nodeType === 11 ? node.childNodes.length : 1;
+    const wasCollapsed = this.collapsed;
+    _preInsertNode(parent, node, reference, "insertNode");
+    if (wasCollapsed) { this._ec = parent; this._eo = newOffset; }
+  }
+  surroundContents(newParent) {
+    _requireNodeArgument(newParent, "surroundContents", 1, "Range");
+    const partial = (node) => node.nodeType !== 3 && _rngPartiallyContains(this, node);
+    for (let n = this._sc; n; n = n.parentNode) {
+      if (partial(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", "InvalidStateError");
+    }
+    for (let n = this._ec; n; n = n.parentNode) {
+      if (partial(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", "InvalidStateError");
+    }
+    const t = newParent.nodeType;
+    if (t === 9 || t === 10 || t === 11) {
+      throw new DOMException("Failed to execute 'surroundContents' on 'Range': The node provided is of an invalid type.", "InvalidNodeTypeError");
+    }
+    const fragment = this.extractContents();
+    if (newParent.firstChild) _replaceAllChildren(newParent, null, "surroundContents");
+    this.insertNode(newParent);
+    newParent.appendChild(fragment);
+    this.selectNode(newParent);
+  }
   detach() {}
   getBoundingClientRect() {
     if (this.collapsed) return new DOMRect();
@@ -13015,7 +13555,7 @@ _markNative(globalThis.Selection);
   Storage.prototype.removeItem, Storage.prototype.clear, Storage.prototype.key,
   Notification, Notification.requestPermission,
   window.chrome?.csi, window.chrome?.loadTimes,
-  MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver,
+  MutationObserver, MutationRecord, ResizeObserver, IntersectionObserver, PerformanceObserver,
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
@@ -13034,6 +13574,9 @@ class _IframeDocument {
     this._root = document.createElement('html');
     this._head = document.createElement('head');
     this._body = document.createElement('body');
+    _iframeDocumentRoots.add(this._root);
+    _registerForeignDocument();
+    _stampNodeDocument(this._root, this);
     this._root.appendChild(this._head);
     this._root.appendChild(this._body);
     var bodyContent = html
@@ -13081,11 +13624,11 @@ class _IframeDocument {
   getElementsByClassName(cls) {
     return _getElementsByClassName(this._root, cls);
   }
-  createElement(tag) { return document.createElement(tag); }
-  createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
-  createTextNode(text) { return document.createTextNode(text); }
-  createComment(text) { return document.createComment(text); }
-  createDocumentFragment() { return document.createDocumentFragment(); }
+  createElement(tag) { return _stampNodeDocument(document.createElement(tag), this); }
+  createElementNS(ns, tag) { return _stampNodeDocument(document.createElementNS(ns, tag), this); }
+  createTextNode(text) { return _stampNodeDocument(document.createTextNode(text), this); }
+  createComment(text) { return _stampNodeDocument(document.createComment(text), this); }
+  createDocumentFragment() { return _stampNodeDocument(document.createDocumentFragment(), this); }
   createEvent(type) { return document.createEvent(type); }
   createRange() { return new Range(); }
   hasFocus() { return false; }
@@ -15944,7 +16487,14 @@ if (typeof URLPattern === 'undefined') {
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
-  Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
+  Document.prototype.importNode = function(node, deep) {
+    _requireNodeArgument(node, "importNode", 1, "Document");
+    if (node.nodeType === 9 || node instanceof ShadowRoot) {
+      throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
+    }
+    const clone = node.cloneNode(!!deep);
+    return _stampNodeDocument(clone, this);
+  };
 }
 
 // Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
@@ -15953,7 +16503,19 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // transfer ownership from, the node is already ours, so return it as-is,
 // matching the observable effect of adoption into this document.
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
-  Document.prototype.adoptNode = function(node) { return node || null; };
+  Document.prototype.adoptNode = function(node) {
+    _requireNodeArgument(node, "adoptNode", 1, "Document");
+    if (node.nodeType === 9) {
+      throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", "NotSupportedError");
+    }
+    if (node instanceof ShadowRoot) {
+      throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a shadow root, which may not be adopted.", "HierarchyRequestError");
+    }
+    const parent = node.parentNode;
+    if (parent) parent.removeChild(node);
+    if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
+    return _stampNodeDocument(node, this);
+  };
 }
 
 // Element.toggleAttribute: standard DOM. Lit/Stencil and several ad SDKs call
