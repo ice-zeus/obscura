@@ -7793,9 +7793,9 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('language', function() { return _hostState.language || "en-US"; });
   defGetter('languages', function() {
-    const language = globalThis.__obscura_language || "en-US";
+    const language = _hostState.language || "en-US";
     const base = language.split('-')[0];
     return base !== language ? [language, base] : [language];
   });

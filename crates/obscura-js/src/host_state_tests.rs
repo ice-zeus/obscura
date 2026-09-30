@@ -236,6 +236,49 @@ fn page_owned_former_internal_names_remain_visible_and_cannot_change_emulation()
 }
 
 #[test]
+fn locale_override_is_private_and_still_applies() {
+    const REFLECTED: &str = r#"(() => {
+        const name = '__obscura_language';
+        let forIn = false;
+        for (const key in window) if (key === name) forIn = true;
+        return [navigator.language, navigator.languages, name in window,
+            Object.getOwnPropertyDescriptor(window, name) === undefined,
+            [Object.keys(window), Object.getOwnPropertyNames(window), Reflect.ownKeys(window),
+                Object.keys(Object.getOwnPropertyDescriptors(window))]
+                .some(keys => keys.includes(name)),
+            forIn];
+    })()"#;
+    let mut runtime = page();
+    runtime.set_stealth(true);
+    runtime.set_locale("de-DE");
+    assert_eq!(
+        runtime.evaluate(REFLECTED).unwrap(),
+        json!(["de-DE", ["de-DE", "de"], false, true, false, false])
+    );
+    // A page's own property with the former name is ordinary page state.
+    assert_eq!(
+        runtime
+            .evaluate(
+                "(() => { window.__obscura_language = 'fr-FR'; \
+                 return [navigator.language, Object.keys(window).includes('__obscura_language')]; })()"
+            )
+            .unwrap(),
+        json!(["de-DE", true])
+    );
+    runtime.evaluate("delete window.__obscura_language").unwrap();
+    runtime.run_page_init();
+    assert_eq!(
+        runtime.evaluate(REFLECTED).unwrap(),
+        json!(["de-DE", ["de-DE", "de"], false, true, false, false])
+    );
+    runtime.set_locale("en-US");
+    assert_eq!(
+        runtime.evaluate(REFLECTED).unwrap(),
+        json!(["en-US", ["en-US", "en"], false, true, false, false])
+    );
+}
+
+#[test]
 fn page_setters_cannot_intercept_private_input_or_emulation_state() {
     let mut runtime = page();
     runtime

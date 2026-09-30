@@ -1559,13 +1559,12 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Language reported by `navigator.language(s)`. It is private host
+    /// state, so the override is neither a page global nor page-writable.
     pub fn set_locale(&mut self, locale: &str) {
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_host_expression(
             "<set-locale>",
-            format!(
-                "globalThis.__obscura_language = {};",
-                js_string_literal(locale)
-            ),
+            format!("__hostState.language = {}", js_string_literal(locale)),
         );
     }
 
