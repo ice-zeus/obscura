@@ -2313,6 +2313,8 @@ function _mutationError(method, message, name, context) {
 
 function _isHostIncludingInclusiveAncestor(node, parent) {
   if (node === parent) return true;
+  const type = node.nodeType;
+  if (type !== 1 && type !== 9 && type !== 11) return false;
   // The native walk goes up from parent and through shadow hosts; leaves
   // that host no shadow root answer without walking.
   return _dom("is_host_including_inclusive_ancestor", node._nid, parent._nid) === "true";
@@ -2326,7 +2328,12 @@ function _ensureInsertionValidity(parent, node, child, method, replacing) {
   if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
     throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
   }
-  if (_isHostIncludingInclusiveAncestor(node, parent)) {
+  // Appending a parentless non-fragment node has no side effect before the
+  // native insert, whose cycle guard rejects the same case with the same
+  // error, so the walk is only needed when ordering or side effects matter.
+  const needsAncestorCheck = child !== null || node.nodeType === 11
+    || node._shadowParent || node.parentNode !== null;
+  if (needsAncestorCheck ? _isHostIncludingInclusiveAncestor(node, parent) : node === parent) {
     throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError", parent);
   }
   if (child !== null && child.parentNode !== parent) {
@@ -2520,7 +2527,8 @@ function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
     ? _dom("append_child", parent._nid, node._nid) === "true"
     : _dom("insert_before", node._nid, child._nid) === "true";
   if (!inserted) {
-    throw _mutationError(method, "The new child would create an invalid tree.", "HierarchyRequestError");
+    // The native guard rejects cycles, the case the skipped ancestor walk covers.
+    throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError", parent);
   }
   _seedUnchangedConnection(parent, parentConnected);
   _seedInsertedTreeState(node, parent, parentConnected);
@@ -2564,6 +2572,13 @@ function _preInsertNode(parent, node, child, method) {
 
 function _replaceChildNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, true);
+  if (node !== child && !_hasMutationObservers()) {
+    // Without observers the order of the two steps is not observable, so
+    // insert before child and remove it, which needs no sibling lookups.
+    _insertNode(parent, node, child, true, method);
+    _removeNode(parent, child, true, method);
+    return child;
+  }
   let reference = child.nextSibling;
   if (reference === node) reference = node.nextSibling;
   let previousSibling = child.previousSibling;
