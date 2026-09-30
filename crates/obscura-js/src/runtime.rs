@@ -989,6 +989,7 @@ impl ObscuraJsRuntime {
         frame.encoding = parent.encoding.clone();
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
+        frame.cdp_intercept_channel = parent.cdp_intercept_channel;
         frame.page_in_flight = parent.page_in_flight.clone();
         #[cfg(feature = "stealth")]
         {
@@ -1515,6 +1516,15 @@ impl ObscuraJsRuntime {
     ) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
+        state.cdp_intercept_channel = false;
+    }
+
+    /// CDP owns request-event routing; ordinary embedder channels do not.
+    pub fn set_cdp_intercept_tx(
+        &self, tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>,
+    ) {
+        self.set_intercept_tx(tx);
+        self.state.borrow_mut().cdp_intercept_channel = true;
     }
 
     pub fn set_intercept_enabled(&self, enabled: bool) {
@@ -3619,7 +3629,7 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
+    pub fn has_pending_network_requests(&self) -> bool {
         let state = self.state.borrow();
         state
             .page_in_flight
@@ -19359,6 +19369,66 @@ mod tests {
         )
     }
 
+    async fn embedder_continued_response_identity(stealth: bool) {
+        let mut rt = redirect_chain_runtime(1);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let resolver = tokio::spawn(async move {
+            let request: crate::ops::InterceptedRequest = rx.recv().await.unwrap();
+            let id = request.request_id.clone();
+            request.resolver.send(crate::ops::InterceptResolution::Continue {
+                url: None, method: None, headers: None, body: None,
+            }).unwrap();
+            id
+        });
+        let result = rt.call_function_on_for_cdp(
+            "async () => (await fetch('/hop/0')).text()", None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("arrived")));
+        let id = resolver.await.unwrap();
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, id);
+        assert!(!events[0].intercepted, "embedder is not a CDP event owner");
+        assert_eq!(rt.get_network_response_body(&id).unwrap().body, "arrived");
+        rt.clear_network_response_bodies();
+        assert!(rt.get_network_response_body(&id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_embedder_continue_retains_response_without_cdp_provenance() {
+        embedder_continued_response_identity(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_embedder_continue_retains_response_without_cdp_provenance() {
+        embedder_continued_response_identity(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_rejection_does_not_publish_success_or_store_body() {
+        let mut rt = cross_origin_redirect_runtime();
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        let result = rt.call_function_on_for_cdp(
+            "async () => { try { await fetch('/start', {mode:'cors'}); return 'allowed'; } catch (_) { return 'blocked'; } }",
+            None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("blocked")));
+        assert!(rt.take_js_network_events().is_empty());
+        assert!(rt.state.borrow().network_response_bodies.is_empty());
+    }
+
     // #973: in cors mode, a cross-origin redirect response that lacks
     // Access-Control-Allow-Origin must be rejected before it is followed, even
     // if the final destination would authorize the request.
@@ -19478,6 +19548,11 @@ mod tests {
 
         let events = rt.take_js_network_events();
         assert_eq!(events.len(), 2);
+        assert_ne!(events[0].request_id, events[1].request_id);
+        assert!(events.iter().all(|event| !event.intercepted && event.method == "GET"));
+        for event in &events {
+            assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "arrived");
+        }
         assert!(
             events[0].url.ends_with("/hop/0"),
             "network response event did not report the final URL: {:?}",
@@ -19488,7 +19563,7 @@ mod tests {
     #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_fetch_response_reports_the_final_redirect_url() {
-        let mut rt = redirect_chain_runtime(2);
+        let mut rt = redirect_chain_runtime(3);
         rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
             std::sync::Arc::new(obscura_net::CookieJar::new()),
         )));
@@ -19496,7 +19571,8 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/hop/1");
-                    return { url: response.url, redirected: response.redirected };
+                    const direct = await fetch("/hop/0");
+                    return { url: response.url, redirected: response.redirected, directRedirected: direct.redirected };
                 }"#,
                 None,
                 &[],
@@ -19514,6 +19590,17 @@ mod tests {
                 .ends_with("/hop/0")
         );
         assert_eq!(value["redirected"], true);
+        let events = rt.take_js_network_events();
+        assert_eq!(value["directRedirected"], false);
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].request_id, events[1].request_id);
+        assert!(events.iter().all(|event| !event.intercepted && event.method == "GET"));
+        for event in &events {
+            assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "arrived");
+        }
+        assert!(events[0].url.ends_with("/hop/0"));
+        assert_eq!(events[0].status, 200);
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "arrived");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19796,7 +19883,7 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/start", { mode: "no-cors" });
-                    return { type: response.type, url: response.url, redirected: response.redirected };
+                    return { type: response.type, url: response.url, redirected: response.redirected, status: response.status, text: await response.text(), headers: Array.from(response.headers).length };
                 }"#,
                 None,
                 &[],
@@ -19807,8 +19894,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false, "status": 0, "text": "", "headers": 0 })
         );
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, 200);
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "ok");
     }
 
     /// The other end of the same pair: the twenty-first redirect must

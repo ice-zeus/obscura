@@ -1180,7 +1180,7 @@ async fn cdp_processor(
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut intercepted_paused: InterceptedPauses = HashMap::new();
 
     // Issue #19 follow-up: messages deferred from inside
     // `process_with_interception` because routing them through
@@ -1289,7 +1289,7 @@ async fn cdp_processor(
                     if let Some(reply_tx) = connection_reply_tx.as_ref() {
                         emit_intercepted_request(
                             intercepted,
-                            &ctx,
+                            &mut ctx,
                             None,
                             reply_tx,
                             &mut intercepted_paused,
@@ -1388,25 +1388,29 @@ async fn cdp_processor(
     let _ = &ctx;
 }
 
+struct InterceptedPause {
+    page_id: Option<String>,
+    resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+}
+
+type InterceptedPauses = HashMap<(Option<String>, String), InterceptedPause>;
+
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
-    ctx: &CdpContext,
+    ctx: &mut CdpContext,
     navigating_page: Option<(&str, &str, Option<String>)>,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<
-        String,
-        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
-    >,
+    intercepted_paused: &mut InterceptedPauses,
 ) {
     // Navigation temporarily removes its Page from ctx. Other pages can still
     // have requests queued on the same channel, so never infer their owner.
     let route = navigating_page
         .filter(|(page_id, _, _)| *page_id == intercepted.page_id)
-        .map(|(_, frame_id, session_id)| (frame_id, session_id))
+        .map(|(_, frame_id, session_id)| (frame_id.to_string(), session_id))
         .or_else(|| {
             let page = ctx.pages.iter().find(|page| page.id == intercepted.page_id)?;
             let (session_id, _) = ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)?;
-            Some((page.frame_id.as_str(), Some(session_id.clone())))
+            Some((page.frame_id.clone(), Some(session_id.clone())))
         });
     let Some((frame_id, session_id)) = route else {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
@@ -1462,7 +1466,15 @@ fn emit_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_paused.to_string());
-    intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
+    // The request names its page, which is absent from ctx.pages while it
+    // navigates. Record the pause owner under that page.
+    let page_id = Some(intercepted.page_id.clone());
+    if let Some(owner) = session_id.as_deref() {
+        ctx.note_intercepted_network_request(&intercepted.page_id, &intercepted.request_id, owner);
+    }
+    intercepted_paused.insert((session_id, intercepted.request_id), InterceptedPause {
+        page_id, resolver: intercepted.resolver,
+    });
 }
 
 async fn pump_live_page_event_loop(
@@ -1532,7 +1544,7 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
         else {
             continue;
         };
-        let (frame_id, page_url, network_events, same_document_navigation) = {
+        let (frame_id, page_url, network_events, same_document_navigation, pending_network) = {
             let Some(page) = ctx.get_page_mut(&page_id) else {
                 continue;
             };
@@ -1546,15 +1558,13 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
                 page.url_string(),
                 page.network_events.drain(..).collect::<Vec<_>>(),
                 same_document_navigation,
+                page.has_pending_script_network_requests(),
             )
         };
         if same_document_navigation {
             crate::domains::page::emit_same_document_navigation(
                 ctx, &session_id, &frame_id, &page_url,
             );
-        }
-        if network_events.is_empty() {
-            continue;
         }
         crate::domains::page::emit_runtime_network_events(
             ctx,
@@ -1564,6 +1574,11 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
             &page_id,
             &network_events,
         );
+        // CORS, blocked rewrites, transport failures and canceled ops can have
+        // no response event. Once this page is idle, none can still complete.
+        if !pending_network {
+            ctx.clear_intercepted_network_requests(&page_id);
+        }
     }
 }
 
@@ -1673,16 +1688,20 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<St
 
 fn handle_fetch_resolution(
     text: &str,
-    _ctx: &mut CdpContext,
+    ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut InterceptedPauses,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
+        if !matches!(method, "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest") {
+            return false;
+        }
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
+        let paused_key = (req.session_id.clone(), request_id.to_string());
+        if let Some(paused) = intercepted_paused.remove(&paused_key) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
                 "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
@@ -1717,7 +1736,12 @@ fn handle_fetch_resolution(
                 }
                 _ => return false,
             };
-            let _ = resolver.send(resolution);
+            if method != "Fetch.continueRequest" {
+                if let Some(page) = paused.page_id {
+                    ctx.intercepted_network_requests.remove(&(page, request_id.to_string()));
+                }
+            }
+            let _ = paused.resolver.send(resolution);
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
@@ -1734,7 +1758,7 @@ async fn process_with_interception(
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut InterceptedPauses,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
     send_command_response: bool,
 ) {
@@ -1797,6 +1821,10 @@ async fn process_with_interception(
         process_cdp_message(text, ctx, reply_tx).await;
         return;
     }
+    // Take provenance only once this path owns the navigation. The gates above
+    // reject without touching the current document or its pending requests.
+    let previous_generation = page.network_document_generation();
+    let previous_requests = ctx.take_intercepted_network_requests(&page_id);
     let wait_until = crate::domains::page::parse_wait_until(&req.params);
     let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1804,7 +1832,7 @@ async fn process_with_interception(
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
     if let Some(tx) = &ctx.intercept_tx {
-        page.set_intercept_tx(tx.clone());
+        page.set_cdp_intercept_tx(tx.clone());
     }
 
     let session_for_events = req.session_id.clone();
@@ -1939,6 +1967,11 @@ async fn process_with_interception(
     // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
+    if page.network_document_generation() == previous_generation {
+        // Rejected navigation did not retire the old document or its requests.
+        ctx.restore_intercepted_network_requests(&page_id, previous_requests);
+    }
+
 
     // Fold in network events for script-initiated requests (fetch/XHR/dynamic
     // resource) so they emit as Network.requestWillBeSent / responseReceived
@@ -3129,7 +3162,9 @@ mod tests {
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([((None, "request-1".to_string()), super::InterceptedPause {
+            page_id: None, resolver: resolution_tx,
+        })]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut ctx = crate::dispatch::CdpContext::new();
 

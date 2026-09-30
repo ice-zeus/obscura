@@ -175,7 +175,8 @@ fn navigation_referrer(source: &Url, target: &Url) -> String {
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub request_id: String,
-    /// The live interception channel already emitted the request start.
+    /// A real CDP Fetch pause already announced this request to its owner
+    /// session. Embedder interception channels leave this false.
     pub intercepted: bool,
     pub url: String,
     pub method: String,
@@ -309,6 +310,8 @@ pub struct Page {
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
+    cdp_intercept_channel: bool,
+    network_document_generation: u64,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
@@ -1139,6 +1142,8 @@ impl Page {
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
+            cdp_intercept_channel: false,
+            network_document_generation: 0,
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
             console_messages_enabled: std::cell::Cell::new(false),
@@ -1804,6 +1809,7 @@ impl Page {
             .await
     }
     fn init_js(&mut self) {
+        self.network_document_generation = self.network_document_generation.saturating_add(1);
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
         // same DomTree is installed; a navigation must never inherit IDs from
@@ -1894,7 +1900,8 @@ impl Page {
 
         rt.set_intercept_page_id(&self.id);
         if let Some(tx) = &self.intercept_tx {
-            rt.set_intercept_tx(tx.clone());
+            if self.cdp_intercept_channel { rt.set_cdp_intercept_tx(tx.clone()); }
+            else { rt.set_intercept_tx(tx.clone()); }
         }
         // Re-apply intercept_enabled: enable_interception()/enable_intercept()
         // called before the first navigation sets this on the Page while the
@@ -4329,12 +4336,22 @@ impl Page {
             .unwrap_or_default()
     }
 
+    /// Identity of the currently initialized document for CDP bookkeeping.
+    #[doc(hidden)]
+    pub fn network_document_generation(&self) -> u64 { self.network_document_generation }
+
+    /// Whether a response may still arrive for the current document.
+    #[doc(hidden)]
+    pub fn has_pending_script_network_requests(&self) -> bool {
+        self.js.as_ref().is_some_and(|js| js.has_pending_network_requests())
+    }
+
     /// Move network events recorded for script-initiated requests
     /// (fetch/XHR/dynamic resource) from the JS runtime into this page's
     /// network_events, so the CDP layer emits Network.requestWillBeSent /
     /// responseReceived for them (issue #406). Idempotent: the runtime's queue
     /// is drained, so calling this repeatedly does not duplicate events. The
-    /// fetch-{N} request id is preserved so Network.getResponseBody resolves.
+    /// original request id is preserved so Network.getResponseBody resolves.
     pub fn sync_js_network_events(&mut self) {
         let events = match self.js.as_ref() {
             Some(js) => js.take_js_network_events(),
@@ -5019,9 +5036,19 @@ impl Page {
         tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
     ) {
         self.intercept_tx = Some(tx.clone());
+        self.cdp_intercept_channel = false;
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
         }
+    }
+
+    /// Mark a CDP-owned channel without changing the embedder interception API.
+    pub fn set_cdp_intercept_tx(
+        &mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    ) {
+        self.intercept_tx = Some(tx.clone());
+        self.cdp_intercept_channel = true;
+        if let Some(js) = &self.js { js.set_cdp_intercept_tx(tx); }
     }
 
     pub fn enable_intercept(&mut self, enabled: bool) {
