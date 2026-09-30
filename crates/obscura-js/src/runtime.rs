@@ -2681,11 +2681,11 @@ impl ObscuraJsRuntime {
                     try {{\n\
                         var __result = await (0, eval)({src});\n\
                         globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
+                        __hostState.awaitMeta = {meta_fn};\n\
                         __hostState.awaitRejected = false;\n\
                     }} catch(e) {{\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        __hostState.awaitMeta = {err_meta_fn};\n\
                         __hostState.awaitRejected = true;\n\
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
@@ -2697,9 +2697,9 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             )
         } else {
-            // The synchronous half writes the same two globals as the await
-            // half above, so one outcome protocol covers both and the reply
-            // builder does not have to care which path produced the value.
+            // The synchronous half writes the same two host-state fields as
+            // the await half above, so one outcome protocol covers both and the
+            // reply builder does not have to care which path produced the value.
             // Before this, a throw here became `__result = undefined`: the
             // command answered successfully with `undefined`, so a page error
             // was indistinguishable from an expression with no value.
@@ -2710,9 +2710,9 @@ impl ObscuraJsRuntime {
                         __result = (0, eval)({src});\n\
                     }} catch(e) {{\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        __hostState.awaitMeta = {err_meta_fn};\n\
                         __hostState.awaitRejected = true;\n\
-                        return globalThis.__obscura_await_meta;\n\
+                        return __hostState.awaitMeta;\n\
                     }}\n\
                     globalThis.__obscura_objects[{oid}] = __result;\n\
                     __hostState.awaitRejected = false;\n\
@@ -2762,7 +2762,7 @@ impl ObscuraJsRuntime {
                     preview,
                 );
             }
-            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            self.execute_host_expression("<readMeta>", "__hostState.awaitMeta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
@@ -2848,12 +2848,12 @@ impl ObscuraJsRuntime {
                     try {{\n\
                         __result = await __fn.call(__this, {args});\n\
                         globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
+                        __hostState.awaitMeta = {meta_fn};\n\
                         __hostState.awaitRejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        __hostState.awaitMeta = {err_meta_fn};\n\
                         __hostState.awaitRejected = true;\n\
                     }} finally {{\n\
                         globalThis.__obscura_done_{done_counter} = true;\n\
@@ -2928,7 +2928,7 @@ impl ObscuraJsRuntime {
             }
 
             let meta_result = self
-                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_host_expression("<readMeta>", "__hostState.awaitMeta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -4594,13 +4594,13 @@ impl ObscuraJsRuntime {
     /// rejected with.
     ///
     /// Both wrappers have already stored the value under `oid` and put its
-    /// metadata in `__obscura_await_meta`, so this reads them back and marks
-    /// the result. The mark is what lets the CDP layer answer the command with
-    /// `exceptionDetails` rather than fail it or, worse, present the value as
-    /// the evaluation result.
+    /// metadata in private host state (`awaitMeta`), so this reads them back
+    /// and marks the result. The mark is what lets the CDP layer answer the
+    /// command with `exceptionDetails` rather than fail it or, worse, present
+    /// the value as the evaluation result.
     fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
         let meta = self
-            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            .execute_host_expression("<readMeta>", "__hostState.awaitMeta".to_string())
             .map_err(|e| format!("JS error: {}", e))?;
         let meta = self.v8_to_json(meta)?;
         let meta_json = if let serde_json::Value::String(text) = &meta {

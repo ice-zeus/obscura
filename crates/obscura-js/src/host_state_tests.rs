@@ -278,6 +278,143 @@ fn locale_override_is_private_and_still_applies() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn awaited_evaluation_metadata_is_private_and_outcomes_are_unchanged() {
+    const REFLECTED: &str = r#"(() => {
+        const name = '__obscura_await_meta';
+        let forIn = false;
+        for (const key in window) if (key === name) forIn = true;
+        return [name in window, Object.getOwnPropertyDescriptor(window, name) === undefined,
+            [Object.keys(window), Object.getOwnPropertyNames(window), Reflect.ownKeys(window),
+                Object.keys(Object.getOwnPropertyDescriptors(window))]
+                .some(keys => keys.includes(name)),
+            forIn];
+    })()"#;
+    let hidden = json!([false, true, false, false]);
+    for stealth in [false, true] {
+        let mut runtime = page();
+        runtime.set_stealth(stealth);
+        let settled = runtime
+            .evaluate_for_cdp_with_timeout(
+                "new Promise(resolve => setTimeout(() => resolve('settled'), 5))",
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert!(!settled.thrown);
+        assert_eq!(settled.value, Some(json!("settled")));
+        let node = runtime
+            .evaluate_for_cdp_with_timeout(
+                "(async () => document.getElementById('target'))()",
+                false,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert!(!node.thrown);
+        assert_eq!(node.subtype.as_deref(), Some("node"));
+        assert!(node.object_id.is_some());
+        let called = runtime
+            .call_function_on_for_cdp_with_timeout(
+                "async function() { return this.id; }",
+                node.object_id.as_deref(),
+                &[],
+                true,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(called.value, Some(json!("target")));
+        let array = runtime
+            .call_function_on_for_cdp_with_timeout(
+                "async () => [1, 2, 3]",
+                None,
+                &[],
+                false,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (array.subtype.as_deref(), array.description.as_str()),
+            (Some("array"), "Array(3)")
+        );
+        assert_eq!(runtime.evaluate(REFLECTED).unwrap(), hidden);
+
+        // Rejections and throws keep their metadata and stay marked thrown.
+        let rejected = runtime
+            .evaluate_for_cdp_with_timeout("Promise.reject(new TypeError('boom'))", true, true, 1_000)
+            .await
+            .unwrap();
+        assert!(rejected.thrown);
+        assert_eq!(rejected.class_name, "TypeError");
+        assert!(rejected.description.contains("boom"));
+        let call_rejected = runtime
+            .call_function_on_for_cdp_with_timeout(
+                "() => Promise.reject({code: 7})",
+                None,
+                &[],
+                false,
+                true,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert!(call_rejected.thrown);
+        assert_eq!(call_rejected.js_type, "object");
+        assert!(call_rejected.object_id.is_some());
+        let thrown = runtime
+            .evaluate_for_cdp_with_timeout("undefined_name_xyz", false, false, 1_000)
+            .await
+            .unwrap();
+        assert!(thrown.thrown);
+        assert!(thrown.description.contains("ReferenceError"));
+        let after = runtime
+            .evaluate_for_cdp_with_timeout("Promise.resolve(3)", true, true, 1_000)
+            .await
+            .unwrap();
+        assert!(!after.thrown);
+        assert_eq!(after.value.as_ref().and_then(|value| value.as_f64()), Some(3.0));
+        assert_eq!(runtime.evaluate(REFLECTED).unwrap(), hidden);
+
+        // A page's own property with the former name is ordinary page state.
+        runtime
+            .evaluate("(() => { window.__obscura_await_meta = 'page'; })()")
+            .unwrap();
+        let object = runtime
+            .evaluate_for_cdp_with_timeout("(async () => ({a: 1}))()", false, true, 1_000)
+            .await
+            .unwrap();
+        assert_eq!((object.js_type.as_str(), object.thrown), ("object", false));
+        assert!(object.object_id.is_some());
+        assert_eq!(runtime.evaluate("window.__obscura_await_meta").unwrap(), json!("page"));
+        runtime.evaluate("delete window.__obscura_await_meta").unwrap();
+
+        // Unsettled promises still time out, and later evaluations still work.
+        let error = runtime
+            .evaluate_for_cdp_with_timeout("new Promise(() => {})", true, true, 25)
+            .await
+            .unwrap_err();
+        assert!(error.contains("did not settle within 25ms"), "{error}");
+        let error = runtime
+            .call_function_on_for_cdp_with_timeout("() => new Promise(() => {})", None, &[], false, true, 25)
+            .await
+            .unwrap_err();
+        assert!(error.contains("did not settle within 25ms"), "{error}");
+        let recovered = runtime
+            .evaluate_for_cdp_with_timeout("Promise.resolve('recovered')", true, true, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(recovered.value, Some(json!("recovered")));
+        assert_eq!(runtime.evaluate(REFLECTED).unwrap(), hidden);
+    }
+}
+
 #[test]
 fn page_setters_cannot_intercept_private_input_or_emulation_state() {
     let mut runtime = page();
