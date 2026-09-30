@@ -23,6 +23,7 @@ macro_rules! integration_tests {
 integration_tests!(
     accept_thread_survives_silent_connections,
     accessibility_names,
+    awaited_evaluation_meta_private,
     backspace_surrogate,
     binding_called_session,
     cdp_click_submit_parity,
