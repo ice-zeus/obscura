@@ -2340,8 +2340,8 @@ function _ensureInsertionValidity(parent, node, child, method, replacing) {
     );
   }
   const nodeType = node.nodeType;
-  if (nodeType !== 1 && nodeType !== 3 && nodeType !== 4 && nodeType !== 7
-      && nodeType !== 8 && nodeType !== 10 && nodeType !== 11) {
+  if ((nodeType !== 1 && nodeType !== 3 && nodeType !== 4 && nodeType !== 7
+      && nodeType !== 8 && nodeType !== 10 && nodeType !== 11) || node instanceof ShadowRoot) {
     throw _mutationError(
       method,
       `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
@@ -2413,11 +2413,68 @@ function _convertNodesIntoNode(nodes, context) {
   return fragment;
 }
 
+// ParentNode/ChildNode insertion of several nodes. The spec collects them in
+// a DocumentFragment and inserts that; for the common shape (an element or
+// fragment parent and plain nodes that are not already under it, not
+// repeated and not its ancestors) inserting them in order is observably the
+// same, including the one childList record, without the fragment round trip.
+// Anything else takes the fragment path. `reference` is read after conversion.
+function _preInsertConverted(parent, args, context, reference, method) {
+  if (args.length === 1 && _isDomNode(args[0])) return _preInsertNode(parent, args[0], reference(), method);
+  const parentType = parent.nodeType;
+  if (args.length > 1 && (parentType === 1 || parentType === 11) && !(parent instanceof ShadowRoot)) {
+    const nodes = _plainInsertionNodes(parent, args, context);
+    const child = nodes && reference();
+    if (nodes && (child === null || (!nodes.includes(child) && child.parentNode === parent))) {
+      const observed = _hasMutationObservers();
+      const previousSibling = observed
+        ? (child === null ? parent.lastChild : _recordSiblings(child)[0])
+        : null;
+      for (const n of nodes) _insertOneNode(parent, n, child, method, true);
+      if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
+      for (const n of nodes) {
+        __prepareInsertedSubtree(n);
+        if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+      }
+      return;
+    }
+  }
+  _preInsertNode(parent, _convertNodesIntoNode(args, context), reference(), method);
+}
+function _plainInsertionNodes(parent, args, context) {
+  let owner = null;
+  const nodes = [];
+  const seen = new Set();
+  for (let i = 0; i < args.length; i++) {
+    let n = args[i];
+    if (!_isDomNode(n)) {
+      owner = owner || _nodeDocumentForInsertion(context);
+      n = owner.createTextNode(String(n));
+    } else {
+      const type = n.nodeType;
+      if (type !== 1 && type !== 3 && type !== 4 && type !== 7 && type !== 8) return null;
+      if (seen.has(n) || n.parentNode === parent || n._shadowParent) return null;
+      if (type === 1 && _isHostIncludingInclusiveAncestor(n, parent)) return null;
+      seen.add(n);
+    }
+    nodes.push(n);
+  }
+  return nodes;
+}
+
 function _nodeDocumentForInsertion(node) {
   if (node.nodeType === 9) return node._detached ? node : globalThis.document;
   return _nodeDocumentOf(node);
 }
 
+// Previous and next sibling of a node as record values: node ids resolved
+// lazily by MutationRecord, captured in one native call.
+function _recordSiblings(node) {
+  if (node._shadowParent) return [node.previousSibling, node.nextSibling];
+  const pair = _dom("sibling_nids", node._nid) || "-1,-1";
+  const comma = pair.indexOf(",");
+  return [+pair.slice(0, comma), +pair.slice(comma + 1)];
+}
 function _hasMutationObservers() {
   const observers = globalThis.__mutationObservers;
   return !!(observers && observers.length);
@@ -2426,8 +2483,7 @@ function _hasMutationObservers() {
 // "Remove": `suppress` skips the record, as replace/replace-all queue their own.
 function _removeNode(parent, child, suppress, method = "removeChild") {
   const observed = !suppress && _hasMutationObservers();
-  const previousSibling = observed ? child.previousSibling : null;
-  const nextSibling = observed ? child.nextSibling : null;
+  const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
   const removedWindowNames = _windowNamedNamesInTree(child);
   if (child instanceof Element) _releaseLinkedStylesheetsIn(child);
   const parentConnected = parent.isConnected;
@@ -2453,7 +2509,8 @@ function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
     const oldParent = node.parentNode;
     if (oldParent) {
       if (queueOldParentRecord && _hasMutationObservers()) {
-        _queueTreeMutationRecord(oldParent, [], [node], node.previousSibling, node.nextSibling);
+        const [previousSibling, nextSibling] = _recordSiblings(node);
+        _queueTreeMutationRecord(oldParent, [], [node], previousSibling, nextSibling);
       }
       _detachStyleSheetsInSubtree(node);
     }
@@ -2485,7 +2542,9 @@ function _insertNode(parent, node, child, suppress, method) {
     nodes = [node];
   }
   const observed = !suppress && _hasMutationObservers();
-  const previousSibling = observed ? (child === null ? parent.lastChild : child.previousSibling) : null;
+  const previousSibling = observed
+    ? (child === null ? parent.lastChild : _recordSiblings(child)[0])
+    : null;
   for (const n of nodes) _insertOneNode(parent, n, child, method, !isFragment);
   if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
   for (const n of nodes) {
@@ -2509,6 +2568,7 @@ function _replaceChildNode(parent, node, child, method) {
   if (reference === node) reference = node.nextSibling;
   let previousSibling = child.previousSibling;
   if (previousSibling === node) previousSibling = node.previousSibling;
+
   const observed = _hasMutationObservers();
   const addedNodes = observed ? (node.nodeType === 11 ? Array.from(node.childNodes) : [node]) : null;
   // Adopting node removes it from its parent before child is removed, so its
@@ -5591,10 +5651,10 @@ class Element extends Node {
   getAnimations() { return _animationsForTarget(this); }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) {
-    _preInsertNode(this, _convertNodesIntoNode(nodes, this), null, "append");
+    _preInsertConverted(this, nodes, this, () => null, "append");
   }
   prepend(...nodes) {
-    _preInsertNode(this, _convertNodesIntoNode(nodes, this), this.firstChild, "prepend");
+    _preInsertConverted(this, nodes, this, () => this.firstChild, "prepend");
   }
   replaceChildren(...nodes) {
     const node = _convertNodesIntoNode(nodes, this);
@@ -8481,8 +8541,8 @@ if (!Element.prototype.before) {
     const parent = this.parentNode;
     if (!parent) return;
     const previous = _viableSibling(this, nodes, "previousSibling");
-    const node = _convertNodesIntoNode(nodes, this);
-    _preInsertNode(parent, node, previous ? previous.nextSibling : parent.firstChild, "before");
+    _preInsertConverted(parent, nodes, this,
+      () => (previous ? previous.nextSibling : parent.firstChild), "before");
   };
   _markNative(Element.prototype.before);
 }
@@ -8491,8 +8551,7 @@ if (!Element.prototype.after) {
     const parent = this.parentNode;
     if (!parent) return;
     const next = _viableSibling(this, nodes, "nextSibling");
-    const node = _convertNodesIntoNode(nodes, this);
-    _preInsertNode(parent, node, next, "after");
+    _preInsertConverted(parent, nodes, this, () => next, "after");
   };
   _markNative(Element.prototype.after);
 }
@@ -9985,34 +10044,49 @@ Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
 
 globalThis.__mutationObservers = [];
 // MutationRecord fields are prototype getters over internal state, as in
-// browsers; records are only built while an observer exists.
-const _mutationRecordData = new WeakMap();
+// browsers; records are only built while an observer exists. Node lists and
+// sibling wrappers are materialized on first read.
+const _mutationRecordToken = Symbol("MutationRecord");
+function _recordNode(value) {
+  if (typeof value !== "number") return value || null;
+  return value < 0 ? null : _wrap(value);
+}
 globalThis.MutationRecord = class MutationRecord {
-  constructor() { throw new TypeError("Illegal constructor"); }
-  get type() { return _mutationRecordData.get(this).type; }
-  get target() { return _mutationRecordData.get(this).target; }
-  get addedNodes() { return _mutationRecordData.get(this).addedNodes; }
-  get removedNodes() { return _mutationRecordData.get(this).removedNodes; }
-  get previousSibling() { return _mutationRecordData.get(this).previousSibling; }
-  get nextSibling() { return _mutationRecordData.get(this).nextSibling; }
-  get attributeName() { return _mutationRecordData.get(this).attributeName; }
-  get attributeNamespace() { return _mutationRecordData.get(this).attributeNamespace; }
-  get oldValue() { return _mutationRecordData.get(this).oldValue; }
+  #d;
+  constructor() {
+    if (arguments[0] !== _mutationRecordToken) throw new TypeError("Illegal constructor");
+    this.#d = arguments[1];
+  }
+  get type() { return this.#d.type; }
+  get target() { return this.#d.target; }
+  get addedNodes() {
+    const d = this.#d;
+    if (!(d.addedNodes instanceof NodeList)) d.addedNodes = _nodeList(d.addedNodes || []);
+    return d.addedNodes;
+  }
+  get removedNodes() {
+    const d = this.#d;
+    if (!(d.removedNodes instanceof NodeList)) d.removedNodes = _nodeList(d.removedNodes || []);
+    return d.removedNodes;
+  }
+  get previousSibling() { return _recordNode(this.#d.previousSibling); }
+  get nextSibling() { return _recordNode(this.#d.nextSibling); }
+  get attributeName() { return this.#d.attributeName ?? null; }
+  get attributeNamespace() { return this.#d.attributeNamespace ?? null; }
+  get oldValue() { return this.#d.oldValue; }
 };
 function _makeMutationRecord(type, target, init, includeOldValue) {
-  const record = Object.create(MutationRecord.prototype);
-  _mutationRecordData.set(record, {
+  return new MutationRecord(_mutationRecordToken, {
     type,
     target,
-    addedNodes: _nodeList(init.addedNodes || []),
-    removedNodes: _nodeList(init.removedNodes || []),
-    previousSibling: init.previousSibling || null,
-    nextSibling: init.nextSibling || null,
-    attributeName: init.attributeName ?? null,
-    attributeNamespace: init.attributeNamespace ?? null,
+    addedNodes: init.addedNodes,
+    removedNodes: init.removedNodes,
+    previousSibling: init.previousSibling,
+    nextSibling: init.nextSibling,
+    attributeName: init.attributeName,
+    attributeNamespace: init.attributeNamespace,
     oldValue: includeOldValue ? (init.oldValue ?? null) : null,
   });
-  return record;
 }
 
 let _mutationObserverMicrotaskQueued = false;
@@ -10110,7 +10184,6 @@ globalThis.MutationObserver = class MutationObserver {
 function _queueMutationRecord(type, target, init) {
   const observers = globalThis.__mutationObservers;
   if (!observers.length || !target) return;
-  let ancestors = null;
   for (const observer of observers) {
     let matched = false;
     let wantsOldValue = false;
@@ -10119,12 +10192,7 @@ function _queueMutationRecord(type, target, init) {
       const options = registration.options;
       if (!root) continue;
       if (root !== target && root._nid !== target._nid) {
-        if (!options.subtree) continue;
-        if (!ancestors) {
-          ancestors = new Set();
-          for (let cur = target.parentNode; cur; cur = cur.parentNode) ancestors.add(cur._nid);
-        }
-        if (!ancestors.has(root._nid)) continue;
+        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
       }
       if (type === "attributes") {
         if (!options.attributes) continue;
@@ -10141,6 +10209,15 @@ function _queueMutationRecord(type, target, init) {
     }
     if (matched) observer._enqueue(_makeMutationRecord(type, target, init, wantsOldValue));
   }
+}
+// Subtree registrations match inclusive ancestors. One native bounded walk
+// replaces a JS parentNode walk per mutation; JS-only shadow parents keep it.
+function _isObservedAncestor(root, target) {
+  if (target._shadowParent || root._shadowParent) {
+    for (let cur = target.parentNode; cur; cur = cur.parentNode) if (cur === root) return true;
+    return false;
+  }
+  return _dom("is_inclusive_ancestor", root._nid, target._nid) === "true";
 }
 function _queueAttributeMutationRecord(target, localName, namespace, oldValue) {
   _queueMutationRecord("attributes", target, { attributeName: localName, attributeNamespace: namespace, oldValue });
@@ -10530,22 +10607,22 @@ function _ioElementPaddingBox(element, style, measurements) {
   return _ioRect(rect.left + borderLeft, rect.top + borderTop, width, height);
 }
 // Entry fields are prototype getters over internal state, as in browsers.
-const _ioEntryData = new WeakMap();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
+  #d;
   constructor(init) {
     if (init === undefined) {
       throw new TypeError("Failed to construct 'IntersectionObserverEntry': 1 argument required, but only 0 present.");
     }
-    _ioEntryData.set(this, { isVisible: false, ...init });
+    this.#d = init;
   }
-  get time() { return _ioEntryData.get(this).time; }
-  get rootBounds() { return _ioEntryData.get(this).rootBounds ?? null; }
-  get boundingClientRect() { return _ioEntryData.get(this).boundingClientRect; }
-  get intersectionRect() { return _ioEntryData.get(this).intersectionRect; }
-  get isIntersecting() { return !!_ioEntryData.get(this).isIntersecting; }
-  get isVisible() { return !!_ioEntryData.get(this).isVisible; }
-  get intersectionRatio() { return _ioEntryData.get(this).intersectionRatio; }
-  get target() { return _ioEntryData.get(this).target; }
+  get time() { return this.#d.time; }
+  get rootBounds() { return this.#d.rootBounds ?? null; }
+  get boundingClientRect() { return this.#d.boundingClientRect; }
+  get intersectionRect() { return this.#d.intersectionRect; }
+  get isIntersecting() { return !!this.#d.isIntersecting; }
+  get isVisible() { return !!this.#d.isVisible; }
+  get intersectionRatio() { return this.#d.intersectionRatio; }
+  get target() { return this.#d.target; }
 };
 globalThis.IntersectionObserver = class IntersectionObserver {
   constructor(callback, options) {

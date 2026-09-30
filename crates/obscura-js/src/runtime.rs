@@ -7070,6 +7070,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parent_node_insertion_of_several_nodes_is_one_mutation() {
+        let mut rt = setup_runtime("<html><body><div id='p'><i id='first'></i></div><div id='q'><u></u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const p = document.getElementById("p");
+                    const q = document.getElementById("q");
+                    const first = document.getElementById("first");
+                    const observer = new MutationObserver(() => {});
+                    observer.observe(document.body, { childList: true, subtree: true });
+                    const describe = (records) => records.map(r => [
+                        r.target.id, Array.from(r.addedNodes, n => n.nodeName), Array.from(r.removedNodes, n => n.nodeName),
+                        r.previousSibling && r.previousSibling.nodeName, r.nextSibling && r.nextSibling.nodeName
+                    ]);
+                    const a = document.createElement("a");
+                    p.append(a, "t", q.firstChild);
+                    const appended = describe(observer.takeRecords());
+                    const b = document.createElement("b");
+                    p.prepend(b, "s");
+                    const prepended = describe(observer.takeRecords());
+                    first.after(first, "x");
+                    const withSelf = describe(observer.takeRecords());
+                    const errors = [];
+                    try { p.append(document.createElement("em"), document.body); } catch (e) { errors.push(e.name); }
+                    return [appended, prepended, withSelf, errors, Array.from(p.childNodes, n => n.nodeName)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [["q", [], ["U"], null, null], ["p", ["A", "#text", "U"], [], "I", null]],
+                [["p", ["B", "#text"], [], null, "I"]],
+                [["p", [], ["I"], "#text", "A"], ["p", ["I", "#text"], [], "#text", "A"]],
+                ["HierarchyRequestError"],
+                ["B", "#text", "I", "#text", "A", "#text", "U"]
+            ])
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mutation_observer_old_values_and_callback_this() {
         let mut rt = setup_runtime("<html><body><p id='p' title='a'>text</p></body></html>");
