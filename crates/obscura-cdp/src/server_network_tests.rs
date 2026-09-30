@@ -184,3 +184,257 @@ async fn ordinary_websocket_network_subscription_and_call_function_form_navigati
 async fn stealth_websocket_network_subscription_and_call_function_form_navigation() {
     websocket_navigation_subscriptions(true).await;
 }
+
+async fn receive_until(socket: &mut Socket, replies: &mut Vec<Value>, done: impl Fn(&[Value]) -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !done(replies) {
+            let Message::Text(text) = socket.next().await.expect("WebSocket event").unwrap()
+                else { panic!("unexpected WebSocket frame") };
+            replies.push(serde_json::from_str(&text).unwrap());
+        }
+    }).await.expect("bounded continued-response event");
+}
+
+async fn continued_script_response(stealth: bool) {
+    tokio::task::LocalSet::new().run_until(async {
+        let fixture_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", fixture_listener.local_addr().unwrap());
+        let release = Arc::new(Notify::new());
+        let wire_release = release.clone();
+        let (wire_tx, mut wire_rx) = mpsc::unbounded_channel();
+        let fixture = tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = fixture_listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut bytes = [0; 4096];
+                    let count = stream.read(&mut bytes).await.unwrap(); assert_ne!(count, 0);
+                    request.extend_from_slice(&bytes[..count]); assert!(request.len() < 65536);
+                }
+                let path = String::from_utf8_lossy(&request).split_whitespace().nth(1).unwrap().to_string();
+                wire_tx.send(path.clone()).unwrap();
+                let body = match path.as_str() {
+                    "/asset" | "/held" => "globalThis.__networkAsset=41;/*雪*/",
+                    "/during" => "<!doctype html><script>const s=document.createElement('script');s.src='/asset';document.head.appendChild(s);</script>",
+                    _ => "<!doctype html><body>response fixture</body>",
+                };
+                let content_type = if path == "/asset" || path == "/held" { "text/javascript; charset=utf-8" } else { "text/html; charset=utf-8" };
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: public, max-age=900\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                stream.write_all(reply.as_bytes()).await.unwrap();
+                if path == "/held" { wire_release.notified().await; }
+                stream.write_all(body.as_bytes()).await.unwrap();
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (server_tx, server_rx) = mpsc::unbounded_channel();
+        let connection = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection_ws(stream, server_tx).await.unwrap();
+        });
+        let context = obscura_browser::BrowserContext::with_storage_and_network(
+            "continued-response".into(), None, stealth, None, None, true);
+        let processor = tokio::task::spawn_local(cdp_processor(server_rx, Arc::new(context), Arc::new(Notify::new())));
+        let (mut socket, _) = tokio_tungstenite::connect_async(endpoint).await.unwrap();
+        let created = command(&mut socket, 1, "Target.createTarget", None, json!({"url":"about:blank"})).await;
+        let page = created.last().unwrap()["result"]["targetId"].as_str().unwrap().to_string();
+        let owner = format!("{page}-session");
+        command(&mut socket, 2, "Network.enable", Some(&owner), json!({})).await;
+        command(&mut socket, 3, "Runtime.enable", Some(&owner), json!({})).await;
+        command(&mut socket, 4, "Page.navigate", Some(&owner), json!({"url":format!("{origin}/page")})).await;
+        command(&mut socket, 5, "Fetch.enable", Some(&owner), json!({"patterns":[{"urlPattern":"*"}]})).await;
+        // Attach observers only after the pause. Focused's inherited pause
+        // selection among several live sessions is outside this regression.
+        let mut events = command(&mut socket, 6, "Runtime.callFunctionOn", Some(&owner), json!({
+            "functionDeclaration":"function(url) { const s=document.createElement('script');s.src=url;document.body.appendChild(s);return 'scheduled'; }",
+            "arguments":[{"value":format!("{origin}/asset")}],"returnByValue":true,
+        })).await;
+        receive_until(&mut socket, &mut events, |rows| rows.iter().any(|r| r["method"] == "Fetch.requestPaused")).await;
+        let paused = events.iter().find(|r| r["method"] == "Fetch.requestPaused").unwrap();
+        assert_eq!(paused["sessionId"], owner);
+        let request = paused["params"]["requestId"].as_str().unwrap().to_string();
+        assert_eq!(paused["params"]["networkId"], request);
+        let attached = command(&mut socket, 7, "Target.attachToTarget", None, json!({"targetId":page,"flatten":true})).await;
+        let audit = attached.last().unwrap()["result"]["sessionId"].as_str().unwrap().to_string();
+        command(&mut socket, 8, "Network.enable", Some(&audit), json!({})).await;
+        let attached = command(&mut socket, 9, "Target.attachToTarget", None, json!({"targetId":page,"flatten":true})).await;
+        let disabled = attached.last().unwrap()["result"]["sessionId"].as_str().unwrap().to_string();
+        command(&mut socket, 10, "Network.enable", Some(&disabled), json!({})).await;
+        command(&mut socket, 11, "Network.disable", Some(&disabled), json!({})).await;
+        let other = command(&mut socket, 12, "Target.createTarget", None, json!({"url":"about:blank"})).await;
+        let foreign_page = other.last().unwrap()["result"]["targetId"].as_str().unwrap().to_string();
+        let foreign = format!("{foreign_page}-session");
+        command(&mut socket, 13, "Network.enable", Some(&foreign), json!({})).await;
+        events.extend(command(&mut socket, 14, "Fetch.continueRequest", Some(&owner), json!({"requestId":request})).await);
+        receive_until(&mut socket, &mut events, |rows| rows.iter().filter(|r| r["method"] == "Network.loadingFinished" && r["params"]["requestId"] == request).count() == 2).await;
+        for session in [&owner, &audit] {
+            for method in ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"] {
+                assert_eq!(events.iter().filter(|r| r["sessionId"] == *session && r["method"] == method && r["params"]["requestId"] == request).count(), 1, "{session} {method}: {events:?}");
+            }
+            let response = events.iter().find(|r| r["sessionId"] == *session && r["method"] == "Network.responseReceived" && r["params"]["requestId"] == request).unwrap();
+            assert_eq!(response["params"]["response"]["status"], 200);
+            assert_eq!(response["params"]["response"]["headers"]["cache-control"], "public, max-age=900");
+        }
+        assert!(!network(&events).iter().any(|r| r["sessionId"] == disabled || r["sessionId"] == foreign));
+        assert_eq!(events.iter().filter(|r| r["method"] == "Fetch.requestPaused").count(), 1);
+        let body = command(&mut socket, 15, "Network.getResponseBody", Some(&audit), json!({"requestId":request})).await;
+        assert_eq!(body.last().unwrap()["result"]["body"], "globalThis.__networkAsset=41;/*雪*/");
+        assert_eq!(body.last().unwrap()["result"]["base64Encoded"], false);
+        command(&mut socket, 16, "Target.detachFromTarget", None, json!({"sessionId":audit})).await;
+        command(&mut socket, 17, "Target.detachFromTarget", None, json!({"sessionId":disabled})).await;
+        command(&mut socket, 18, "Target.closeTarget", None, json!({"targetId":foreign_page})).await;
+
+        // A rejected navigation must not retire a still-pending old response.
+        let mut held = command(&mut socket, 19, "Runtime.evaluate", Some(&owner), json!({
+            "expression":format!("fetch('{origin}/held').then(r=>r.text()).then(t=>globalThis.heldText=t);'scheduled'"),"returnByValue":true,
+        })).await;
+        receive_until(&mut socket, &mut held, |rows| rows.iter().any(|r| r["method"] == "Fetch.requestPaused")).await;
+        let held_id = held.iter().find(|r| r["method"] == "Fetch.requestPaused").unwrap()["params"]["requestId"].as_str().unwrap().to_string();
+        held.extend(command(&mut socket, 20, "Fetch.continueRequest", Some(&owner), json!({"requestId":held_id})).await);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while wire_rx.recv().await.unwrap() != "/held" {}
+        }).await.unwrap();
+        for (id, url) in [(21, "http://["), (22, "file:///not-permitted-response-fixture")] {
+            socket.send(Message::Text(json!({"id":id,"method":"Page.navigate","sessionId":owner,"params":{"url":url}}).to_string().into())).await.unwrap();
+            let mut rejected = Vec::new();
+            receive_until(&mut socket, &mut rejected, |rows| rows.iter().any(|r| r["id"] == id)).await;
+            assert!(rejected.iter().find(|r| r["id"] == id).unwrap().get("error").is_some());
+            held.extend(rejected);
+        }
+        release.notify_one();
+        receive_until(&mut socket, &mut held, |rows| rows.iter().any(|r| r["method"] == "Network.loadingFinished" && r["params"]["requestId"] == held_id)).await;
+        assert_eq!(held.iter().filter(|r| r["method"] == "Network.requestWillBeSent" && r["params"]["requestId"] == held_id).count(), 1);
+        let body = command(&mut socket, 23, "Network.getResponseBody", Some(&owner), json!({"requestId":held_id})).await;
+        assert_eq!(body.last().unwrap()["result"]["body"], "globalThis.__networkAsset=41;/*雪*/");
+
+        // Runtime replacement may restart intercept counters. Navigation-time
+        // scripts must not receive a second synthetic Fetch pause afterwards.
+        socket.send(Message::Text(json!({"id":24,"method":"Page.navigate","sessionId":owner,"params":{"url":format!("{origin}/during"),"waitUntil":"load"}}).to_string().into())).await.unwrap();
+        let mut during = Vec::new();
+        let mut continued = std::collections::HashSet::new();
+        let mut next = 100;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else { panic!("text frame") };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["method"] == "Fetch.requestPaused" && value["params"]["request"]["url"] == format!("{origin}/asset") {
+                    let id = value["params"]["requestId"].as_str().unwrap().to_string();
+                    assert!(continued.insert(id.clone()), "duplicate actual/synthetic pause");
+                    socket.send(Message::Text(json!({"id":next,"method":"Fetch.continueRequest","sessionId":owner,"params":{"requestId":id}}).to_string().into())).await.unwrap();next += 1;
+                }
+                let done = value["method"] == "Page.loadEventFired";
+                during.push(value);
+                if done { break; }
+            }
+        }).await.unwrap();
+        assert_eq!(continued.len(), 1);
+        let current = continued.into_iter().next().unwrap();
+        let response = command(&mut socket, 25, "Network.getResponseBody", Some(&owner), json!({"requestId":current})).await;
+        during.extend(response.clone());
+        assert_eq!(response.last().unwrap()["result"]["body"], "globalThis.__networkAsset=41;/*雪*/");
+        assert_eq!(during.iter().filter(|r| r["method"] == "Network.requestWillBeSent" && r["params"]["requestId"] == current).count(), 1);
+        assert_eq!(during.iter().filter(|r| r["method"] == "Fetch.requestPaused" && r["params"]["requestId"] == current).count(), 1);
+        assert_eq!(during.iter().filter(|r| r["method"] == "Network.responseReceived" && r["params"]["requestId"] == current).count(), 1);
+        assert_eq!(during.iter().filter(|r| r["method"] == "Network.loadingFinished" && r["params"]["requestId"] == current).count(), 1);
+        command(&mut socket, 26, "Fetch.disable", Some(&owner), json!({})).await;
+        let mut recovery = command(&mut socket, 27, "Runtime.evaluate", Some(&owner), json!({"expression":format!("fetch('{origin}/asset').then(r=>r.text());'scheduled'"),"returnByValue":true})).await;
+        receive_until(&mut socket, &mut recovery, |rows| rows.iter().any(|r| r["method"] == "Network.loadingFinished")).await;
+        assert!(!recovery.iter().any(|r| r["method"] == "Fetch.requestPaused"));
+        let id = recovery.iter().find(|r| r["method"] == "Network.responseReceived").unwrap()["params"]["requestId"].clone();
+        let body = command(&mut socket, 28, "Network.getResponseBody", Some(&owner), json!({"requestId":id})).await;
+        assert_eq!(body.last().unwrap()["result"]["body"], "globalThis.__networkAsset=41;/*雪*/");
+        socket.close(None).await.unwrap();connection.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), processor).await.unwrap().unwrap();
+        fixture.abort();let _ = fixture.await;
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_websocket_continued_script_response_identity_body_and_recovery() {
+    continued_script_response(false).await;
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_websocket_continued_script_response_identity_body_and_recovery() {
+    continued_script_response(true).await;
+}
+
+#[test]
+fn continued_response_resolutions_preserve_session_scope_and_cleanup() {
+    use obscura_js::ops::InterceptResolution;
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    let foreign = ctx.create_page();
+    ctx.sessions.insert("owner".into(), page.clone());
+    ctx.sessions.insert("foreign".into(), foreign.clone());
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    let mut paused = InterceptedPauses::new();
+    let mut receivers = Vec::new();
+    for (session, target) in [("owner", &page), ("foreign", &foreign)] {
+        let (resolver, receiver) = tokio::sync::oneshot::channel();
+        paused.insert((Some(session.into()), "same-id".into()), InterceptedPause {
+            page_id: Some(target.clone()), resolver,
+        });
+        ctx.note_intercepted_network_request(target, "same-id", session);
+        receivers.push(receiver);
+    }
+    let command = |session: &str, method: &str| json!({
+        "id": 71, "sessionId": session, "method": method,
+        "params": {"requestId":"same-id", "errorReason":"Aborted", "responseCode":201,
+            "responseHeaders":[{"name":"X-Fixture","value":"kept"}], "body":"aGVsbG8="},
+    }).to_string();
+    assert!(!handle_fetch_resolution(&command("unrelated", "Fetch.failRequest"), &mut ctx, &reply_tx, &mut paused));
+    assert!(!handle_fetch_resolution(&command("owner", "Fetch.getResponseBody"), &mut ctx, &reply_tx, &mut paused));
+    assert_eq!(paused.len(), 2);
+    assert_eq!(ctx.intercepted_network_requests.len(), 2);
+    assert!(reply_rx.try_recv().is_err());
+    assert!(handle_fetch_resolution(&command("owner", "Fetch.failRequest"), &mut ctx, &reply_tx, &mut paused));
+    assert!(matches!(receivers[0].try_recv(), Ok(InterceptResolution::Fail { reason }) if reason == "Aborted"));
+    assert!(!ctx.intercepted_network_requests.contains_key(&(page.clone(), "same-id".into())));
+    assert!(ctx.intercepted_network_requests.contains_key(&(foreign.clone(), "same-id".into())));
+    assert_eq!(paused.len(), 1);
+    assert!(handle_fetch_resolution(&command("foreign", "Fetch.fulfillRequest"), &mut ctx, &reply_tx, &mut paused));
+    match receivers[1].try_recv().unwrap() {
+        InterceptResolution::Fulfill { status, headers, body, body_base64 } => {
+            assert_eq!(status, 201);
+            assert_eq!(headers.get("X-Fixture").map(String::as_str), Some("kept"));
+            assert_eq!(body, "hello");
+            assert_eq!(body_base64, "aGVsbG8=");
+        }
+        other => panic!("unexpected resolution: {other:?}"),
+    }
+    assert!(paused.is_empty());
+    assert!(ctx.intercepted_network_requests.is_empty());
+    assert!(!handle_fetch_resolution(&command("foreign", "Fetch.fulfillRequest"), &mut ctx, &reply_tx, &mut paused));
+    let replies = std::iter::from_fn(|| reply_rx.try_recv().ok())
+        .map(|text| serde_json::from_str::<Value>(&text).unwrap()).collect::<Vec<_>>();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["sessionId"], "owner");
+    assert_eq!(replies[1]["sessionId"], "foreign");
+    assert!(replies.iter().all(|reply| reply["id"] == 71 && reply.get("error").is_none()));
+    assert!(ctx.pending_events.is_empty(), "Fail/Fulfill do not invent completion telemetry");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn continued_response_idle_cleanup_retires_residual_records_only_for_live_page() {
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    let foreign = ctx.create_page();
+    let session = Some("owner".to_string());
+    ctx.sessions.insert("owner".into(), page.clone());
+    crate::domains::page::handle("navigate", &json!({
+        "url":"data:text/html,<body>idle cleanup</body>", "waitUntil":"load",
+    }), &mut ctx, &session).await.unwrap();
+    ctx.pending_events.clear();
+    // Each of these paths can settle without a successful response event.
+    for request in ["cors-rejected", "rewrite-blocked", "network-error", "canceled"] {
+        ctx.note_intercepted_network_request(&page, request, "owner");
+    }
+    ctx.note_intercepted_network_request(&foreign, "same-id", "foreign");
+    assert!(!ctx.get_page_mut(&page).unwrap().has_pending_script_network_requests());
+    sync_live_page_background_events(&mut ctx);
+    assert_eq!(ctx.intercepted_network_requests.len(), 1);
+    assert!(ctx.intercepted_network_requests.contains_key(&(foreign, "same-id".into())));
+    assert!(ctx.pending_events.is_empty(), "idle cleanup must not fabricate successful events");
+}

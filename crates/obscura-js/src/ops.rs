@@ -81,10 +81,11 @@ pub struct StoredNetworkResponseBody {
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
-    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Matches the `fetch-{N}` id allocated before interception, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
-    /// The interception consumer already received the request start.
+    /// A CDP-owned interception pause already announced the request start to
+    /// its owner session. Embedder interception channels leave this false.
     pub intercepted: bool,
     pub url: String,
     pub method: String,
@@ -92,6 +93,61 @@ pub struct JsNetworkEvent {
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
+}
+
+// Transport work returns owned data only; OpState stays on its isolate thread.
+struct ScriptNetworkCompletion {
+    event: JsNetworkEvent,
+    body: Option<StoredNetworkResponseBody>,
+}
+
+#[cfg(feature = "stealth")]
+struct ScriptNetworkOutput {
+    result: String,
+    completion: Option<ScriptNetworkCompletion>,
+}
+
+#[cfg(feature = "stealth")]
+impl From<String> for ScriptNetworkOutput {
+    fn from(result: String) -> Self { Self { result, completion: None } }
+}
+
+fn script_network_completion(
+    request_id: String, intercepted: bool, url: String, method: String,
+    status: u16, headers: HashMap<String, String>, bytes: &[u8], text: &str,
+) -> ScriptNetworkCompletion {
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    let body = (max_entries > 0 && max_bytes > 0 && bytes.len() <= max_bytes)
+        .then(|| StoredNetworkResponseBody { body: text.to_string(), base64_encoded: false });
+    ScriptNetworkCompletion {
+        event: JsNetworkEvent {
+            request_id, intercepted, url, method, status, response_headers: headers,
+            body_size: bytes.len(), timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+        },
+        body,
+    }
+}
+
+fn retain_script_network_completion(state: &mut ObscuraState, completion: ScriptNetworkCompletion) {
+    if let Some(body) = completion.body {
+        let request_id = completion.event.request_id.clone();
+        state.network_response_bodies.insert(request_id.clone(), body);
+        state.network_response_body_order.push_back(request_id);
+        let max_entries = response_body_entry_limit();
+        while state.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = state.network_response_body_order.pop_front() {
+                state.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    state.js_network_events.push(completion.event);
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if state.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = state.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        state.js_network_events.drain(0..overflow);
+    }
 }
 
 #[cfg(feature = "render")]
@@ -143,6 +199,7 @@ pub struct ObscuraState {
     /// the page can move its cursor instead of appending an entry.
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub cdp_intercept_channel: bool,
     pub intercept_enabled: bool,
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
     /// sent to the interception channel; empty means every request.
@@ -379,6 +436,7 @@ impl ObscuraState {
             session_history: SessionHistory::default(),
             pending_history_traversal: None,
             intercept_tx: None,
+            cdp_intercept_channel: false,
             intercept_enabled: false,
             intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
@@ -3207,7 +3265,9 @@ async fn op_fetch_url(
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
-            gs.intercept_tx.clone()
+            gs.intercept_tx
+                .clone()
+                .map(|tx| (tx, gs.cdp_intercept_channel))
         } else {
             None
         };
@@ -3263,9 +3323,10 @@ async fn op_fetch_url(
     let mut override_method: Option<String> = None;
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
+    // Only a CDP-owned pause announced the request start to a CDP session.
+    let mut continued_by_cdp = false;
 
-    let mut was_intercepted = false;
-    if let Some(tx) = intercept_tx {
+    if let Some((tx, cdp_channel)) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
@@ -3279,7 +3340,6 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            was_intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
                     status,
@@ -3317,6 +3377,7 @@ async fn op_fetch_url(
                     headers,
                     body,
                 }) => {
+                    continued_by_cdp = cdp_channel;
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
@@ -3515,13 +3576,17 @@ async fn op_fetch_url(
         }
     }
 
+    // The identity allocated before interception names the completion and
+    // the retained body, so a continued request keeps its announced id.
+    let response_request_id = request_id.clone();
+
     // Stealth mode: route scripted requests through wreq after the CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
     {
         if let Some(stealth) = stealth {
-            return stealth_fetch_all(
+            let output = stealth_fetch_all(
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -3533,8 +3598,16 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                response_request_id,
+                continued_by_cdp,
             )
-            .await;
+            .await?;
+            if let Some(completion) = output.completion {
+                let state_borrow = state.borrow();
+                let shared = state_borrow.borrow::<SharedState>().clone();
+                retain_script_network_completion(&mut shared.borrow_mut(), completion);
+            }
+            return Ok(output.result);
         }
     }
 
@@ -3777,52 +3850,15 @@ async fn op_fetch_url(
             cbs.fire_response(&info, &resp).await;
         }
     }
-    let response_request_id = {
+    let completion = script_network_completion(
+        response_request_id.clone(), continued_by_cdp, current_url.clone(),
+        current_method.as_str().to_string(), status, resp_headers.clone(), &resp_bytes, &resp_body,
+    );
+    {
         let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            intercepted: was_intercepted,
-            url: current_url.clone(),
-            method: current_method.as_str().to_string(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+        let shared = state_borrow.borrow::<SharedState>().clone();
+        retain_script_network_completion(&mut shared.borrow_mut(), completion);
+    }
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -3874,8 +3910,8 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar. Owned completion metadata crosses the transport boundary so
+/// the isolate can retain the same bounded CDP body/events as ordinary fetches.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
@@ -3889,7 +3925,9 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
-) -> Result<String, deno_error::JsErrorBox> {
+    response_request_id: String,
+    intercepted: bool,
+) -> Result<ScriptNetworkOutput, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
@@ -3910,7 +3948,7 @@ async fn stealth_fetch_all(
                 return Ok(serde_json::json!({
                     "status": 0, "body": "", "url": current_url, "headers": {},
                 })
-                .to_string());
+                .to_string().into());
             }
         };
 
@@ -3972,7 +4010,7 @@ async fn stealth_fetch_all(
                         current_url, allowed
                     ),
                 })
-                .to_string());
+                .to_string().into());
             }
         }
         let Some(location) = r.headers.get("location").cloned() else {
@@ -3990,7 +4028,7 @@ async fn stealth_fetch_all(
                 "blocked": true,
                 "error": format!("Redirect to forbidden URL blocked: {}", reason),
             })
-            .to_string());
+            .to_string().into());
         }
         redirects_followed += 1;
         if redirects_followed > FETCH_REDIRECT_LIMIT {
@@ -3999,7 +4037,7 @@ async fn stealth_fetch_all(
                 "blocked": true,
                 "error": format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT),
             })
-            .to_string());
+            .to_string().into());
         }
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         let downgraded_to_get = r.status == 301 || r.status == 302 || r.status == 303;
@@ -4042,7 +4080,7 @@ async fn stealth_fetch_all(
                     )
                 },
             })
-            .to_string());
+            .to_string().into());
         }
     }
 
@@ -4074,7 +4112,12 @@ async fn stealth_fetch_all(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
-    Ok(serde_json::json!({
+    let completion = script_network_completion(
+        response_request_id.clone(), intercepted, current_url.clone(), current_method,
+        status, resp_headers, &resp_bytes, &resp_body,
+    );
+    let result = serde_json::json!({
+        "requestId": response_request_id,
         "status": if opaque { 0 } else { status },
         "body": if opaque { String::new() } else { resp_body },
         "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
@@ -4083,7 +4126,8 @@ async fn stealth_fetch_all(
         "opaque": opaque,
         "headers": script_headers,
     })
-    .to_string())
+    .to_string();
+    Ok(ScriptNetworkOutput { result, completion: Some(completion) })
 }
 
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
@@ -4115,6 +4159,69 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn script_response_retention_preserves_configured_body_and_event_bounds() {
+        struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    unsafe { if let Some(value) = value { std::env::set_var(name, value); }
+                        else { std::env::remove_var(name); } }
+                }
+            }
+        }
+        let _restore = Environment(["OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "OBSCURA_NETWORK_BODY_BUFFER_BYTES"]
+            .into_iter().map(|name| (name, std::env::var_os(name))).collect());
+        // nextest runs this configuration test in its own process.
+        unsafe {
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "6");
+        }
+        #[cfg(feature = "stealth")]
+        { fn requires_send<T: Send>() {} requires_send::<super::ScriptNetworkOutput>(); }
+        // Eligibility uses raw bytes, as before; lossy UTF-8 can expand storage.
+        let raw = [0xff_u8; 6];
+        let lossy = String::from_utf8_lossy(&raw);
+        let expanded = super::script_network_completion(
+            "lossy".into(), false, "https://fixture.test/body".into(), "GET".into(),
+            200, Default::default(), &raw, &lossy,
+        );
+        assert_eq!(expanded.event.body_size, 6);
+        assert_eq!(expanded.body.unwrap().body.len(), 18);
+        let mut state = super::ObscuraState::new();
+        let completion = |id: &str, body: &str| super::script_network_completion(
+            id.into(), true, "https://fixture.test/body".into(), "GET".into(), 200,
+            std::collections::HashMap::from([("cache-control".into(), "public, max-age=900".into())]),
+            body.as_bytes(), body,
+        );
+        for (id, body) in [("first", "one"), ("second", "雪雪"), ("third", "three"), ("large", "1234567")] {
+            super::retain_script_network_completion(&mut state, completion(id, body));
+        }
+        assert_eq!(state.network_response_bodies.len(), 2);
+        assert!(!state.network_response_bodies.contains_key("first"));
+        assert!(!state.network_response_bodies.contains_key("large"));
+        assert_eq!(state.network_response_bodies["second"].body, "雪雪");
+        assert_eq!(state.js_network_events[1].body_size, 6);
+        assert_eq!(state.js_network_events[3].body_size, 7);
+        assert!(state.js_network_events.iter().all(|event| event.intercepted && event.status == 200));
+        unsafe { std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "0"); }
+        let disabled = completion("disabled", "");
+        assert!(disabled.body.is_none());
+        super::retain_script_network_completion(&mut state, disabled);
+        unsafe {
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "0");
+        }
+        assert!(completion("zero-bytes", "").body.is_none());
+        for index in 0..4097 {
+            super::retain_script_network_completion(&mut state, completion(&format!("bounded-{index}"), "x"));
+        }
+        assert_eq!(state.js_network_events.len(), 4096);
+        assert_eq!(state.js_network_events.first().unwrap().request_id, "bounded-1");
+        assert_eq!(state.js_network_events.last().unwrap().request_id, "bounded-4096");
+        assert_eq!(state.network_response_bodies.len(), 2);
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn exhausted_canvas_epochs_never_wrap_to_an_old_owner() {
