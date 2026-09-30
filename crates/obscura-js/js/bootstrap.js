@@ -2482,6 +2482,16 @@ function _recordSiblings(node) {
   const comma = pair.indexOf(",");
   return [+pair.slice(0, comma), +pair.slice(comma + 1)];
 }
+// Attribute records need the old value only when a registration asked for
+// it; removals still read it, since a removal of a missing attribute is none.
+function _attributeOldValuesWanted() {
+  const observers = globalThis.__mutationObservers;
+  if (!observers || !observers.length) return false;
+  for (const observer of observers) {
+    for (const registration of observer._targets) if (registration.options.attributeOldValue) return true;
+  }
+  return false;
+}
 function _hasMutationObservers() {
   const observers = globalThis.__mutationObservers;
   return !!(observers && observers.length);
@@ -4034,7 +4044,7 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
-    const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
+    const observedOldValue = _attributeOldValuesWanted() ? this.getAttribute(n) : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (n === "src" && this.localName === "iframe") {
@@ -4077,7 +4087,7 @@ class Element extends Node {
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
     const localName = n.includes(":") ? n.slice(n.indexOf(":") + 1) : n;
-    const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, localName) : null;
+    const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
