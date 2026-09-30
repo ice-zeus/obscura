@@ -7210,7 +7210,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head><style id='s'>#t { color: black; } @media all { #t { color: blue; } }</style></head><body><div id='t'></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r##"
                 const sheet = document.getElementById("s").sheet;
                 const media = sheet.cssRules[1];
                 const before = [media instanceof CSSMediaRule, media instanceof CSSGroupingRule, media.type, media.conditionText, media.cssRules.length];
@@ -7218,7 +7218,7 @@ mod tests {
                 const inserted = [index, media.cssRules.length, media.cssRules[1].parentRule === media, media.cssRules[1].parentStyleSheet === sheet];
                 media.deleteRule(1);
                 return [before, inserted, media.cssRules.length, typeof CSSSupportsRule];
-                "#,
+                "##,
             )
             .unwrap();
         assert_eq!(
