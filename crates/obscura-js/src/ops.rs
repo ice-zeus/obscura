@@ -2474,6 +2474,15 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .contains(&NodeId::new(other))
                 .to_string()
         }
+        // arg1 is a host-including inclusive ancestor of arg2. Walks up from
+        // arg2 instead of enumerating arg1's descendants.
+        "is_host_including_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_host_including_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
+                .to_string()
+        }
         // Connectivity is maintained incrementally by DomTree. Exposing the
         // cached bit avoids an ancestor op crossing for every level when JS
         // builds a deep detached subtree.
