@@ -10666,7 +10666,8 @@ globalThis.IntersectionObserver = class IntersectionObserver {
       intersectionRatio,
       boundingClientRect: _ioRect(rect.x, rect.y, rect.width, rect.height),
       intersectionRect: edgesTouch ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
-      rootBounds: root,
+      // A target outside the root's tree is not measured against the root.
+      rootBounds: inRootTree ? root : _ioRect(0, 0, 0, 0),
       time: performance.now(),
     });
   }
