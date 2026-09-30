@@ -1206,3 +1206,177 @@ fn activation_failure_after_creation_loses_context() {
         assert_eq!(context.get_error(), glow::NO_ERROR);
     }
 }
+
+fn is_swiftshader(renderer: &str) -> bool {
+    renderer.contains("SwiftShader")
+}
+fn creation_attributes(fail_if_major_performance_caveat: bool) -> Attributes {
+    Attributes {
+        antialias: false,
+        fail_if_major_performance_caveat,
+        ..Attributes::default()
+    }
+}
+/// Restores an environment variable when the test ends, including on panic.
+/// nextest runs every test in its own process; this also keeps the change
+/// out of later tests when the binary is run another way.
+struct EnvOverride(&'static str, Option<std::ffi::OsString>);
+impl EnvOverride {
+    fn set(name: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self(name, previous)
+    }
+}
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "real driver: every automatic context is labelled with the device that backs it"]
+fn auto_mode_labels_match_the_actual_device() {
+    let requested = backend();
+    let contexts = [1, 2, 1]
+        .map(|version| CanvasContext::create(version, 8, 8, creation_attributes(false), Mode::Auto).unwrap());
+    let first = contexts[0].diagnostics.backend;
+    for context in &contexts {
+        let d = &context.diagnostics;
+        eprintln!("AUTO_CONTEXT backend={:?} renderer={} attempts={:?}", d.backend, d.renderer, d.attempts);
+        assert_eq!(d.backend == Backend::SwiftShader, is_swiftshader(&d.renderer), "{d:?}");
+        // The selected device must not depend on earlier contexts.
+        assert_eq!(d.backend, first, "{d:?}");
+    }
+    if requested == Backend::Metal {
+        assert_eq!(first, Backend::Metal);
+    }
+}
+
+#[test]
+#[ignore = "real driver: a SwiftShader display is never adopted by a hardware request"]
+fn software_display_is_never_reused_for_hardware() {
+    if backend() == Backend::Metal {
+        // macOS has only the Metal display, shared by every context.
+        let (a, b) = (context(1), context(2));
+        assert_eq!(a.display_handle(), b.display_handle());
+        return;
+    }
+    let options = SurfaceOptions {
+        alpha: true,
+        depth: false,
+        stencil: false,
+        antialias: false,
+    };
+    let software = Context::create(Backend::SwiftShader, 1, 8, 8, options).unwrap();
+    let renderer = unsafe { software.gl.get_parameter_string(glow::RENDERER) };
+    assert!(is_swiftshader(&renderer), "{renderer}");
+    // One ANGLE display per process: once SwiftShader is live, a hardware
+    // request neither adopts its display nor starts a second device.
+    for version in [1, 2] {
+        let reason = match Context::create(Backend::Vulkan, version, 8, 8, options) {
+            Err(reason) => reason,
+            Ok(hardware) => panic!(
+                "hardware context created (same display: {}, renderer: {})",
+                hardware.display_handle() == software.display_handle(),
+                unsafe { hardware.gl.get_parameter_string(glow::RENDERER) }
+            ),
+        };
+        eprintln!("HARDWARE_RESULT {reason}");
+        assert!(reason.contains("SwiftShader WebGL display is already active"), "{reason}");
+    }
+    // Hardware attempts leave the software display usable and unchanged.
+    let again = Context::create(Backend::SwiftShader, 2, 8, 8, options).unwrap();
+    assert_eq!(again.display_handle(), software.display_handle());
+    unsafe {
+        again.make_current().unwrap();
+        again.gl.clear_color(0.0, 1.0, 0.0, 1.0);
+        again.gl.clear(glow::COLOR_BUFFER_BIT);
+        assert_eq!(pixel(&again), [0, 255, 0, 255]);
+    }
+}
+
+#[test]
+#[ignore = "real driver: failIfMajorPerformanceCaveat never yields SwiftShader, before or after a software context"]
+fn caveat_context_after_software_context_is_rejected() {
+    let _ = backend();
+    let check = |phase: &str| {
+        for version in [1, 2] {
+            match CanvasContext::create(version, 8, 8, creation_attributes(true), Mode::Auto) {
+                Ok(context) => {
+                    let d = &context.diagnostics;
+                    eprintln!("CAVEAT_RESULT {phase} webgl{version} backend={:?} renderer={}", d.backend, d.renderer);
+                    assert_ne!(d.backend, Backend::SwiftShader, "{d:?}");
+                    assert!(!is_swiftshader(&d.renderer), "{d:?}");
+                }
+                Err(failure) => {
+                    eprintln!("CAVEAT_RESULT {phase} webgl{version} null attempts={:?}", failure.attempts);
+                    let last = failure.attempts.last().expect("a backend was attempted");
+                    assert_eq!(last.backend, Backend::SwiftShader, "{failure:?}");
+                    assert!(last.reason.contains("failIfMajorPerformanceCaveat"), "{failure:?}");
+                }
+            }
+        }
+    };
+    check("before");
+    let normal = CanvasContext::create(1, 8, 8, creation_attributes(false), Mode::Auto).unwrap();
+    let mut software = None;
+    if crate::selection::Platform::current() == crate::selection::Platform::Linux {
+        let context = CanvasContext::create(2, 8, 8, creation_attributes(false), Mode::Software).unwrap();
+        assert_eq!(context.diagnostics.backend, Backend::SwiftShader);
+        assert!(is_swiftshader(&context.diagnostics.renderer));
+        software = Some(context);
+    }
+    check("after");
+    // Where automatic selection itself fell back to software, the caveat
+    // request must fail however many software contexts exist.
+    if normal.diagnostics.backend == Backend::SwiftShader {
+        for version in [1, 2] {
+            assert!(CanvasContext::create(version, 8, 8, creation_attributes(true), Mode::Auto).is_err());
+        }
+    }
+    drop(software);
+}
+
+#[test]
+#[ignore = "real driver: forced hardware rejects a CPU Vulkan ICD exposed through VK_ICD_FILENAMES"]
+fn hardware_rejects_cpu_vulkan_icd() {
+    if backend() == Backend::Metal {
+        eprintln!("macOS selects Metal only; no Vulkan ICD is consulted");
+        return;
+    }
+    // Expose the bundled SwiftShader ICD to the system loader before this
+    // process creates any Vulkan instance, as a system lavapipe would be.
+    let icd = crate::bundle::Bundle::discover()
+        .and_then(|bundle| bundle.library("vk_swiftshader_icd.json"))
+        .unwrap();
+    let _icd = EnvOverride::set("VK_ICD_FILENAMES", Some(icd.as_os_str()));
+    let _drivers = EnvOverride::set("VK_DRIVER_FILES", None);
+    for version in [1, 2] {
+        let failure = match CanvasContext::create(version, 8, 8, creation_attributes(false), Mode::Hardware) {
+            Ok(context) => panic!("hardware accepted {:?}", context.diagnostics),
+            Err(failure) => failure,
+        };
+        eprintln!("CPU_ICD_HARDWARE webgl{version} attempts={:?}", failure.attempts);
+        assert_eq!(failure.attempts.len(), 1);
+        assert_eq!(failure.attempts[0].backend, Backend::Vulkan);
+        assert!(failure.attempts[0].reason.contains("unexpected CPU device"), "{failure:?}");
+    }
+    let auto = CanvasContext::create(1, 8, 8, creation_attributes(false), Mode::Auto).unwrap();
+    let d = &auto.diagnostics;
+    eprintln!("CPU_ICD_AUTO backend={:?} renderer={} attempts={:?}", d.backend, d.renderer, d.attempts);
+    assert_eq!(d.backend, Backend::SwiftShader);
+    assert!(is_swiftshader(&d.renderer), "{d:?}");
+    assert!(d.attempts[0].reason.contains("unexpected CPU device"), "{d:?}");
+    assert!(CanvasContext::create(1, 8, 8, creation_attributes(true), Mode::Auto).is_err());
+}

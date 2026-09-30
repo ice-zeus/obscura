@@ -1452,3 +1452,78 @@ fn real_instanced_draws_use_version_correct_entry_points_and_keep_attribute_vali
       return true;
     })()"#).unwrap(),json!(true));
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "mandatory real-driver failIfMajorPerformanceCaveat after a normal context, within and across documents"]
+async fn real_caveat_context_after_a_normal_context_follows_the_backing_device() {
+    require_driver();
+    // Automatic selection is the mode that falls back to SwiftShader on a
+    // GPU-less host. nextest runs each test in its own process, and the
+    // previous value is restored even if an assertion fails.
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("OBSCURA_WEBGL_BACKEND", value),
+                    None => std::env::remove_var("OBSCURA_WEBGL_BACKEND"),
+                }
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os("OBSCURA_WEBGL_BACKEND"));
+    unsafe {
+        std::env::set_var("OBSCURA_WEBGL_BACKEND", "auto");
+    }
+    const PROBE: &str = r#"window.events=[];window.keep=[];
+      window.probe=(label,kind,caveat)=>{const c=document.createElement('canvas');c.width=c.height=2;
+        c.addEventListener('webglcontextcreationerror',e=>events.push([label,e.type,e instanceof WebGLContextEvent,typeof e.statusMessage==='string'&&e.statusMessage.length>0]));
+        const gl=c.getContext(kind,{antialias:false,failIfMajorPerformanceCaveat:caveat});if(gl)keep.push(gl);
+        return [label,gl?gl.getContextAttributes().failIfMajorPerformanceCaveat:null];};"#;
+    // Every native context in the current document runs on one device.
+    fn software(runtime: &ObscuraJsRuntime) -> bool {
+        let state = runtime.state.borrow();
+        let devices = state.webgl.entries.values()
+            .map(|entry| (format!("{:?}", entry.context.diagnostics.backend), entry.context.diagnostics.renderer.contains("SwiftShader")))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        let (backend, renderer) = devices.into_iter().next().unwrap();
+        assert_eq!(backend == "SwiftShader", renderer, "label must match the device");
+        renderer
+    }
+    async fn settle(runtime: &mut ObscuraJsRuntime) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), runtime.run_event_loop())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let expected = |software: bool, rows: &[(&str, bool)]| {
+        let results = rows.iter().map(|&(label, caveat)| {
+            json!([label, if !caveat { json!(false) } else if software { json!(null) } else { json!(true) }])
+        }).collect::<Vec<_>>();
+        let events = rows.iter().filter(|&&(_, caveat)| caveat && software)
+            .map(|&(label, _)| json!([label, "webglcontextcreationerror", true, true]))
+            .collect::<Vec<_>>();
+        (json!(results), json!(events))
+    };
+    // One document: a normal context, then caveat contexts.
+    let mut runtime = page();
+    runtime.execute_script("<fixture-setup>", PROBE).unwrap();
+    let first = runtime.evaluate("[probe('a-normal','webgl',false),probe('a-caveat-1','webgl',true),probe('a-caveat-2','webgl2',true)]").unwrap();
+    let software_device = software(&runtime);
+    settle(&mut runtime).await;
+    let rows = [("a-normal", false), ("a-caveat-1", true), ("a-caveat-2", true)];
+    assert_eq!((first, runtime.evaluate("events").unwrap()), expected(software_device, &rows));
+    // A second document in the same process: caveat contexts before and
+    // after its own normal context. The first document's contexts are gone,
+    // but the process-wide displays remain initialized.
+    runtime.set_dom(parse_html("<html><body><canvas id='c' width='8' height='8'></canvas></body></html>"));
+    runtime.run_page_init();
+    assert!(runtime.state.borrow().webgl.entries.is_empty());
+    runtime.execute_script("<fixture-setup>", PROBE).unwrap();
+    let second = runtime.evaluate("[probe('b-caveat-1','webgl',true),probe('b-caveat-2','webgl2',true),probe('b-normal','webgl',false),probe('b-caveat-3','webgl',true)]").unwrap();
+    assert_eq!(software(&runtime), software_device);
+    settle(&mut runtime).await;
+    let rows = [("b-caveat-1", true), ("b-caveat-2", true), ("b-normal", false), ("b-caveat-3", true)];
+    assert_eq!((second, runtime.evaluate("events").unwrap()), expected(software_device, &rows));
+}

@@ -113,6 +113,12 @@ impl Display {
         if let Some(display) = displays.get(&backend) {
             return Ok(display.clone());
         }
+        // ANGLE's Vulkan backend keeps Vulkan entry points in process-wide
+        // tables and reloads them only on some calls. A second live device
+        // would run another device's entry points, so keep one display.
+        if let Some(active) = active_other(displays.keys().copied(), backend) {
+            return Err(format!("the {active:?} WebGL display is already active in this process"));
+        }
         if backend == Backend::SwiftShader {
             libraries.bundle.library("libvk_swiftshader.so")?;
             libraries.bundle.library("vk_swiftshader_icd.json")?;
@@ -129,6 +135,15 @@ impl Display {
             let handle = get_display(0x3202, ptr::null_mut(), attributes.as_ptr());
             if handle.is_null() {
                 return Err(libraries.error("get ANGLE display"));
+            }
+            // An initialized ANGLE display ignores new attributes and
+            // eglInitialize succeeds again. Never adopt, initialize or
+            // terminate a display that another backend owns.
+            let owned = displays.values().map(|d| (d.backend, d.handle));
+            if let Some(owner) = alias_owner(owned, backend, handle as usize) {
+                return Err(format!(
+                    "ANGLE returned the initialized {owner:?} display for {backend:?}"
+                ));
             }
             if (libraries.functions.initialize)(handle, ptr::null_mut(), ptr::null_mut()) == 0 {
                 return Err(libraries.error("initialize ANGLE display"));
@@ -152,6 +167,16 @@ impl Display {
                     (libraries.functions.terminate)(handle);
                     return Err(format!("ANGLE display lacks {required}"));
                 }
+            }
+            // The Vulkan loader can expose CPU devices (SwiftShader, lavapipe)
+            // to the hardware request. Only accept the device each backend
+            // names; any query failure rejects the display.
+            #[cfg(target_os = "linux")]
+            if let Err(reason) = physical_device(&libraries, handle)
+                .and_then(|device| device_policy(backend, device))
+            {
+                (libraries.functions.terminate)(handle);
+                return Err(reason);
             }
             let display = Arc::new(Self {
                 backend,
@@ -179,9 +204,146 @@ fn display_attributes(backend: Backend) -> Vec<Int> {
     if backend != Backend::Metal {
         // Explicit offscreen Vulkan platform, independent of DISPLAY/Wayland.
         attributes.extend_from_slice(&[0x348F, 0x31DD]);
+        // ANGLE caches platform displays by key, and the device type is not
+        // part of that key. EGL_PLATFORM_ANGLE_DISPLAY_KEY_ANGLE keeps the
+        // hardware and SwiftShader displays separate.
+        let key = if backend == Backend::SwiftShader { 2 } else { 1 };
+        attributes.extend_from_slice(&[0x34DC, key]);
     }
     attributes.push(NONE);
     attributes
+}
+
+/// Another backend whose display this process already uses, if any.
+fn active_other(active: impl IntoIterator<Item = Backend>, backend: Backend) -> Option<Backend> {
+    active.into_iter().find(|&other| other != backend)
+}
+
+/// The backend that already owns `handle`, if it is not `backend`.
+fn alias_owner(
+    owned: impl IntoIterator<Item = (Backend, usize)>,
+    backend: Backend,
+    handle: usize,
+) -> Option<Backend> {
+    owned
+        .into_iter()
+        .find(|&(owner, owned)| owned == handle && owner != backend)
+        .map(|(owner, _)| owner)
+}
+
+/// VkPhysicalDeviceProperties identity of the device behind a display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct PhysicalDevice {
+    vendor: u32,
+    device: u32,
+    kind: i32,
+    name: String,
+}
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SWIFTSHADER_DEVICE: (u32, u32) = (0x1AE0, 0xC0DE);
+
+/// Hardware must be a real GPU (integrated, discrete or virtual). The
+/// software backend must be the bundled SwiftShader device.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn device_policy(backend: Backend, device: PhysicalDevice) -> Result<(), String> {
+    let swiftshader = (device.vendor, device.device) == SWIFTSHADER_DEVICE;
+    let accepted = match backend {
+        Backend::Vulkan => matches!(device.kind, 1..=3) && !swiftshader,
+        Backend::SwiftShader => swiftshader,
+        Backend::Metal => true,
+    };
+    if accepted {
+        return Ok(());
+    }
+    let kind = match device.kind {
+        0 => "other",
+        1 => "integrated GPU",
+        2 => "discrete GPU",
+        3 => "virtual GPU",
+        4 => "CPU",
+        _ => "unknown",
+    };
+    Err(format!(
+        "ANGLE {backend:?} display uses an unexpected {kind} device {:?} (vendor 0x{:04x}, device 0x{:04x})",
+        device.name, device.vendor, device.device
+    ))
+}
+
+/// Read the Vulkan physical device ANGLE initialized for `display`, through
+/// the bundled loader that ANGLE already loaded from the verified bundle.
+#[cfg(target_os = "linux")]
+unsafe fn physical_device(libraries: &Libraries, display: Handle) -> Result<PhysicalDevice, String> {
+    type Query = unsafe extern "C" fn(Handle, Int, *mut isize) -> u32;
+    type GetInstanceProcAddr = unsafe extern "C" fn(Handle, *const c_char) -> *const c_void;
+    type GetProperties = unsafe extern "C" fn(Handle, *mut DeviceProperties);
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct DeviceProperties {
+        api_version: u32,
+        driver_version: u32,
+        vendor_id: u32,
+        device_id: u32,
+        device_type: i32,
+        device_name: [c_char; 256],
+        pipeline_cache_uuid: [u8; 16],
+        // VkPhysicalDeviceLimits and sparse properties (824 bytes in all).
+        rest: [u64; 128],
+    }
+    // glibc and musl on every Linux architecture.
+    const RTLD_NOLOAD: std::os::raw::c_int = 0x4;
+    let query = |name: &CStr| {
+        let address = libraries.symbol(name);
+        (!address.is_null()).then(|| std::mem::transmute::<*const c_void, Query>(address))
+    };
+    let (Some(query_display), Some(query_device)) =
+        (query(c"eglQueryDisplayAttribEXT"), query(c"eglQueryDeviceAttribEXT"))
+    else {
+        return Err("ANGLE has no EGL device query".into());
+    };
+    let mut device = 0;
+    if query_display(display, 0x322C, &mut device) == 0 || device == 0 {
+        return Err(libraries.error("query ANGLE display device"));
+    }
+    let (mut instance, mut physical) = (0, 0);
+    for (name, value) in [(0x34A9, &mut instance), (0x34AB, &mut physical)] {
+        if query_device(device as Handle, name, value) == 0 || *value == 0 {
+            return Err(libraries.error("query ANGLE Vulkan device"));
+        }
+    }
+    // ANGLE opens the first loader name present in its module directory.
+    let name = if libraries.bundle.directory.join("libvulkan.so").exists() {
+        "libvulkan.so"
+    } else {
+        "libvulkan.so.1"
+    };
+    let path = libraries.bundle.library(name)?;
+    // Only reuse the loader ANGLE already mapped; never load another one.
+    let loader = libloading::os::unix::Library::open(
+        Some(&path),
+        libloading::os::unix::RTLD_NOW | RTLD_NOLOAD,
+    )
+    .map_err(|e| format!("Vulkan loader is not loaded: {e}"))?;
+    let get_proc: GetInstanceProcAddr = *loader
+        .get::<GetInstanceProcAddr>(b"vkGetInstanceProcAddr\0")
+        .map_err(|e| e.to_string())?;
+    let address = get_proc(instance as Handle, c"vkGetPhysicalDeviceProperties".as_ptr());
+    if address.is_null() {
+        return Err("Vulkan loader has no vkGetPhysicalDeviceProperties".into());
+    }
+    let get_properties = std::mem::transmute::<*const c_void, GetProperties>(address);
+    let mut properties: DeviceProperties = std::mem::zeroed();
+    get_properties(physical as Handle, &mut properties);
+    let last = properties.device_name.len() - 1;
+    properties.device_name[last] = 0;
+    Ok(PhysicalDevice {
+        vendor: properties.vendor_id,
+        device: properties.device_id,
+        kind: properties.device_type,
+        name: CStr::from_ptr(properties.device_name.as_ptr())
+            .to_string_lossy()
+            .into_owned(),
+    })
 }
 fn context_attributes(version: u8) -> Result<Vec<Int>, String> {
     let major = match version {
@@ -606,6 +768,10 @@ impl Context {
     pub fn proc_address(&self, name: &CStr) -> *const c_void {
         unsafe { self.display.libraries.symbol(name) }
     }
+    #[cfg(test)]
+    pub(crate) fn display_handle(&self) -> usize {
+        self.display.handle
+    }
 }
 impl Drop for Context {
     fn drop(&mut self) {
@@ -1006,5 +1172,71 @@ mod tests {
         assert!(display_attributes(Backend::Metal)
             .windows(2)
             .any(|p| p == [0x3203, 0x3489]));
+    }
+    #[test]
+    fn linux_backends_request_distinct_angle_display_keys_and_metal_none() {
+        let key = |backend| {
+            let a = display_attributes(backend);
+            assert_eq!(a.last(), Some(&NONE));
+            let pairs = a[..a.len() - 1].chunks_exact(2).collect::<Vec<_>>();
+            let keys = pairs.iter().filter(|p| p[0] == 0x34DC).map(|p| p[1]).collect::<Vec<_>>();
+            assert!(keys.len() <= 1, "{a:?}");
+            keys.first().copied()
+        };
+        let (vulkan, swiftshader) = (key(Backend::Vulkan), key(Backend::SwiftShader));
+        assert_eq!((vulkan, swiftshader), (Some(1), Some(2)));
+        assert_eq!(key(Backend::Metal), None);
+        // Only the key and the requested device type differ between them.
+        let strip = |backend| {
+            display_attributes(backend)
+                .chunks(2)
+                .filter(|p| p[0] != 0x34DC && p[0] != 0x3209)
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(Backend::Vulkan), strip(Backend::SwiftShader));
+    }
+    #[test]
+    fn a_process_never_initializes_a_second_backend_display() {
+        assert_eq!(active_other([], Backend::Vulkan), None);
+        assert_eq!(active_other([Backend::Vulkan], Backend::Vulkan), None);
+        assert_eq!(active_other([Backend::SwiftShader], Backend::Vulkan), Some(Backend::SwiftShader));
+        assert_eq!(active_other([Backend::Vulkan], Backend::SwiftShader), Some(Backend::Vulkan));
+    }
+    #[test]
+    fn a_display_owned_by_another_backend_is_never_adopted() {
+        let owned = [(Backend::SwiftShader, 0x10), (Backend::Metal, 0x30)];
+        assert_eq!(alias_owner(owned, Backend::Vulkan, 0x10), Some(Backend::SwiftShader));
+        assert_eq!(alias_owner(owned, Backend::SwiftShader, 0x30), Some(Backend::Metal));
+        // A fresh handle, or the backend's own handle, is not an alias.
+        assert_eq!(alias_owner(owned, Backend::Vulkan, 0x20), None);
+        assert_eq!(alias_owner(owned, Backend::SwiftShader, 0x10), None);
+        assert_eq!(alias_owner([], Backend::Vulkan, 0x10), None);
+    }
+    #[test]
+    fn hardware_requires_a_gpu_device_and_software_requires_swiftshader() {
+        let device = |vendor, device, kind| PhysicalDevice {
+            vendor,
+            device,
+            kind,
+            name: "fixture".into(),
+        };
+        let swiftshader = device(0x1AE0, 0xC0DE, 4);
+        for kind in [1, 2, 3] {
+            assert!(device_policy(Backend::Vulkan, device(0x10DE, 0x2184, kind)).is_ok());
+            // SwiftShader stays software even if it reported a GPU type.
+            assert!(device_policy(Backend::Vulkan, device(0x1AE0, 0xC0DE, kind)).is_err());
+        }
+        for kind in [0, 4, 5, -1] {
+            let reason = device_policy(Backend::Vulkan, device(0x10005, 0, kind)).unwrap_err();
+            assert!(reason.starts_with("ANGLE Vulkan display uses an unexpected"), "{reason}");
+        }
+        let reason = device_policy(Backend::Vulkan, swiftshader.clone()).unwrap_err();
+        assert!(reason.contains("CPU device \"fixture\" (vendor 0x1ae0, device 0xc0de)"), "{reason}");
+        assert!(device_policy(Backend::SwiftShader, swiftshader).is_ok());
+        for other in [device(0x1AE0, 0xC0DF, 4), device(0x10005, 0, 4), device(0x10DE, 0x2184, 2)] {
+            assert!(device_policy(Backend::SwiftShader, other).is_err());
+        }
     }
 }
