@@ -155,8 +155,8 @@ pub async fn handle(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
                             if (!target) return;\
-                            var old = globalThis.__obscura_hover_target || null;\
-                            globalThis.__obscura_hover_target = target;\
+                            var old = __hostState.hoverTarget || null;\
+                            __hostState.hoverTarget = target;\
                             globalThis.__obscura_setHovered(target);\
                             var init = {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
                             if (old !== target) {{\
@@ -175,7 +175,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_host_expression(&code);
                 }
             } else if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {

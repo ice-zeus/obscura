@@ -2299,7 +2299,10 @@ mod tests {
 
         // Live interception already sent requestWillBeSent/requestPaused.
         // Replaying either leaves Playwright waiting for a second request.
+        // The pause recorded its owner session, as emit_intercepted_request does.
         ctx.pending_events.clear();
+        let owner = session_id.clone().unwrap();
+        ctx.note_intercepted_network_request(&page_id, "fetch-7", &owner);
         let event = obscura_browser::NetworkEvent { intercepted: true, ..event };
         emit_runtime_network_events(
             &mut ctx, &session_id, "frame-1", "https://example.test/", &page_id,
@@ -2311,6 +2314,7 @@ mod tests {
 
         ctx.pending_events.clear();
         ctx.fetch_intercept.enabled = true;
+        ctx.note_intercepted_network_request(&page_id, "fetch-7", &owner);
         emit_navigation_events(
             &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
             &page_id, &[event], WaitUntil::Load, true,
@@ -2358,6 +2362,7 @@ mod tests {
             let page_id = ctx.create_page();
             let session_id = Some(format!("{page_id}-session"));
             ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+            ctx.network_enabled_sessions.insert(session_id.clone().unwrap());
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.iter().map(|p| p.to_string()).collect();
             emit_navigation_events(

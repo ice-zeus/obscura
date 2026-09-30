@@ -455,6 +455,48 @@ async fn mouse_move_applies_hover_styles_to_the_target_ancestry() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn mouse_move_keeps_the_hover_target_private() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            globalThis.hoverLog = [];
+            for (const id of ['hover-host', 'hit-target'])
+                for (const type of ['mouseover', 'mouseout'])
+                    document.getElementById(id).addEventListener(type, () => hoverLog.push(id + ':' + type));
+        })()"#,
+        &sid,
+    )
+    .await;
+    for (id, x, y) in [(3, 410, 110), (4, 550, 50)] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0}),
+            &sid,
+        )
+        .await;
+    }
+    // The previous hover target survives between moves without a page global.
+    let result = evaluate(
+        &mut ctx,
+        5,
+        r#"JSON.stringify([hoverLog, '__obscura_hover_target' in window,
+            [Object.keys(window), Object.getOwnPropertyNames(window), Reflect.ownKeys(window)]
+                .some(keys => keys.includes('__obscura_hover_target'))])"#,
+        &sid,
+    )
+    .await;
+    let result: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        result,
+        json!([["hover-host:mouseover", "hover-host:mouseout", "hit-target:mouseover"], false, false])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn press_release_orders_events_and_defers_click_activation() {
     let (mut ctx, sid) = setup().await;
     evaluate(

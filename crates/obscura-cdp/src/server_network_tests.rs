@@ -121,7 +121,11 @@ async fn websocket_navigation_subscriptions(stealth: bool) {
             "functionDeclaration":"function(utility) { return utility.run(() => { document.getElementById('form').submit(); return 'submitted'; }); }",
             "objectId":object,"arguments":[{"objectId":object}],"awaitPromise":true,"returnByValue":true,
         })).await;
+        let mut submitted = submitted;
         assert_eq!(submitted.last().unwrap()["result"]["result"]["value"], "submitted");
+        // The connection processor performs page-initiated document navigation
+        // after acknowledging the command, so its events follow the reply.
+        receive_until(&mut socket, &mut submitted, |rows| rows.iter().any(|r| r["method"] == "Page.loadEventFired")).await;
         let events = network(&submitted);
         assert!(!events.iter().any(|value| value["sessionId"] == foreign));
         let navigated = submitted.iter().position(|value| value["method"] == "Page.frameNavigated").unwrap();
