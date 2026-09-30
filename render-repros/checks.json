@@ -1,4 +1,9 @@
 {
+  "retained-cssom-raster": [
+    {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
+    {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},
+    {"name": "four raster images preserve authored height", "color": "#d03020", "y": 80, "height": 40, "count": 4}
+  ],
   "sparse-grid-scroll": [
     {"name": "last contents-wrapped cell reaches scrollport bottom", "color": "#087f5b", "x": 20, "y": 90, "width": 200, "height": 30},
     {"name": "empty tracks retain a full scroll viewport", "color": "#7048e8", "x": 260, "y": 20, "width": 200, "height": 100},

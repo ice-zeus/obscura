@@ -2875,6 +2875,176 @@ mod tests {
         assert!(parse_cdp_headers(&json!({"url": "https://example.com"})).is_none());
     }
 
+    async fn assert_navigation_intercept_reply_without_timer(method: &str) {
+        use super::{process_with_interception, CdpMessage, ServerMessage, MAX_DEFERRED_MESSAGES};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let fixture = tokio::task::spawn_local(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                requested_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                let body = b"<!doctype html><title>Finished</title><h1>Finished</h1>";
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            });
+
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "interception-test".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let session_id = format!("{page_id}-session");
+            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (intercept_tx, intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+            ctx.intercept_tx = Some(intercept_tx.clone());
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session_id,
+                "params": {"url": format!("http://{address}/"), "waitUntil": "load"}}).to_string();
+            let navigation_reply = reply_tx.clone();
+            let navigation = tokio::task::spawn_local(async move {
+                let mut intercept_rx = Some(intercept_rx);
+                let mut paused = HashMap::new();
+                let mut deferred = std::collections::VecDeque::new();
+                process_with_interception(&command, &mut ctx, &navigation_reply,
+                    &mut server_rx, &mut intercept_rx, &mut paused, &mut deferred, true).await;
+                (ctx, paused, deferred)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), requested_rx)
+                .await.expect("navigation must reach the held response").unwrap();
+
+            // The real socket is already connected and its response is gated.
+            // Only the channel handshake below runs with a paused clock. An
+            // unconditional timer auto-advances it, independent of host load.
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            let (resolution_tx, resolution_rx) = tokio::sync::oneshot::channel();
+            intercept_tx.send(InterceptedRequest {
+                page_id: page_id.clone(),
+                request_id: "pending-test".into(), url: format!("http://{address}/pending"),
+                method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
+                resolver: resolution_tx,
+            }).unwrap();
+            loop {
+                let value: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx.recv())
+                        .await.expect("paused notification").unwrap()).unwrap();
+                assert_ne!(value["id"], 1, "navigation must wait for its response");
+                if value["method"] == "Fetch.requestPaused" {
+                    assert_eq!(value["params"]["requestId"], "pending-test");
+                    break;
+                }
+            }
+            let send = |value: serde_json::Value| {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            let foreign_count = if method == "failRequest" { MAX_DEFERRED_MESSAGES + 1 } else { 1 };
+            for index in 0..foreign_count {
+                send(json!({"id": 100 + index, "method": "Runtime.evaluate",
+                    "sessionId": session_id, "params": {"expression": "globalThis.foreignRan=true"}}));
+            }
+            let mut params = json!({"requestId": "pending-test"});
+            match method {
+                "continueRequest" => {
+                    params["url"] = json!("https://example.com/rewritten");
+                    params["method"] = json!("POST");
+                    params["headers"] = json!([{"name": "X-Check", "value": "kept"}]);
+                    params["postData"] = json!("payload");
+                }
+                "fulfillRequest" => {
+                    params["responseCode"] = json!(201);
+                    params["responseHeaders"] = json!([{"name": "X-Check", "value": "kept"}]);
+                    params["body"] = json!("aGVsbG8=");
+                }
+                "failRequest" => params["errorReason"] = json!("Aborted"),
+                _ => unreachable!(),
+            }
+            send(json!({"id": 10, "method": format!("Fetch.{method}"),
+                "sessionId": session_id, "params": params}));
+            let mut overflow_responses = 0;
+            loop {
+                let value: serde_json::Value = serde_json::from_str(
+                    &tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx.recv())
+                        .await.expect("Fetch resolution reply").unwrap()).unwrap();
+                assert_ne!(value["id"], 1, "must not acknowledge unfinished navigation");
+                if value["id"] == 10 {
+                    assert!(value.get("error").is_none(), "{value}");
+                    break;
+                }
+                if value.get("id").is_some() {
+                    assert_eq!(value["id"], 100 + MAX_DEFERRED_MESSAGES);
+                    assert_eq!(value["error"]["code"], -32000);
+                    overflow_responses += 1;
+                }
+            }
+            let elapsed = started.elapsed();
+            match (method, resolution_rx.await.unwrap()) {
+                ("continueRequest", InterceptResolution::Continue { url, method, headers, body }) => {
+                    assert_eq!(url.as_deref(), Some("https://example.com/rewritten"));
+                    assert_eq!(method.as_deref(), Some("POST"));
+                    assert_eq!(headers.unwrap().get("X-Check").map(String::as_str), Some("kept"));
+                    assert_eq!(body.as_deref(), Some("payload"));
+                }
+                ("fulfillRequest", InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
+                    assert_eq!(status, 201);
+                    assert_eq!(headers.get("X-Check").map(String::as_str), Some("kept"));
+                    assert_eq!(body, "hello");
+                    assert_eq!(body_base64, "aGVsbG8=");
+                }
+                ("failRequest", InterceptResolution::Fail { reason }) => assert_eq!(reason, "Aborted"),
+                _ => panic!("resolution kind changed"),
+            }
+            tokio::time::resume();
+            release_tx.send(()).unwrap();
+            let (ctx, paused, deferred) = tokio::time::timeout(std::time::Duration::from_secs(5), navigation)
+                .await.expect("navigation completion").unwrap();
+            fixture.await.unwrap();
+            assert_eq!(ctx.pages.len(), 1);
+            assert_eq!(ctx.pages[0].url_string(), format!("http://{address}/"));
+            assert!(paused.is_empty());
+            assert_eq!(deferred.len(), foreign_count.min(MAX_DEFERRED_MESSAGES));
+            assert_eq!(overflow_responses, usize::from(foreign_count > MAX_DEFERRED_MESSAGES));
+            let replies: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                .map(|text| serde_json::from_str(&text).unwrap()).collect();
+            assert_eq!(replies.iter().filter(|reply| reply["id"] == 1).count(), 1);
+            let navigation_reply = replies.iter().find(|reply| reply["id"] == 1).unwrap();
+            assert!(navigation_reply.get("error").is_none(), "{navigation_reply}");
+            assert!(!replies.iter().any(|reply| reply["id"] == 10), "no duplicate resolution reply");
+            assert_eq!(elapsed, std::time::Duration::ZERO, "ready replies must not wait for a timer");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_intercept_continue_has_no_timer_delay() {
+        assert_navigation_intercept_reply_without_timer("continueRequest").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_intercept_fulfill_has_no_timer_delay() {
+        assert_navigation_intercept_reply_without_timer("fulfillRequest").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_intercept_fail_keeps_deferral_bounded_without_delay() {
+        assert_navigation_intercept_reply_without_timer("failRequest").await;
+    }
+
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();

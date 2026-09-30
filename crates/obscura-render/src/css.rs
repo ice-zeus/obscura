@@ -616,17 +616,11 @@ fn invalidation_compounds(selector: &str) -> (Vec<(String, InvalidationReaches)>
     } else if compounds.is_empty() {
         malformed = true;
     }
-    let mut descendants_to_right = false;
-    for (_, reaches) in compounds.iter_mut().rev() {
-        if reaches.contains(InvalidationReaches::DESCENDANTS) {
-            descendants_to_right = true;
-        } else if descendants_to_right && reaches.contains(InvalidationReaches::SIBLINGS) {
-            // `.foo ~ .bar .child`: a change to `.foo` can affect descendants
-            // of following siblings. A flat Siblings reach is insufficient
-            // unless phase 2 also carries the remaining descendant path.
-            *reaches = reaches.union(InvalidationReaches::CONSERVATIVE);
-        }
-    }
+    // The renderer expands SIBLINGS into entire following-sibling subtrees.
+    // An ordinary chain such as `.foo ~ .bar .child` therefore remains within
+    // that scope: later combinators move only down or to later siblings.
+    // Nested selector-list composition still uses its separate conservative
+    // fallback when a flat reach cannot describe the outer continuation.
     (compounds, malformed)
 }
 
@@ -3461,6 +3455,7 @@ impl Stylesheet {
             None,
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3528,6 +3523,7 @@ impl Stylesheet {
             Some(evaluator),
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3552,6 +3548,7 @@ impl Stylesheet {
         evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         self.apply_internal(
             tree,
@@ -3568,6 +3565,7 @@ impl Stylesheet {
             evaluator,
             animation_sample,
             animation_timeline,
+            ancestor_display_none,
         )
     }
 
@@ -3587,6 +3585,7 @@ impl Stylesheet {
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         let shadow_host_declarations = shadow_host_sheet
             .map(|sheet| {
@@ -4023,35 +4022,24 @@ impl Stylesheet {
         if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
+            // The winning display declaration participates in animation
+            // eligibility, including !important and shadow-scope declarations.
             for &(_, _, i) in &important_matched {
                 let rule = &self.rules[i];
-                if !rule.important_flags.has_animation {
-                    continue;
-                }
                 let expanded = substitute_declarations(
-                    &rule.important_decls,
-                    props,
-                    rule.important_flags.has_var,
+                    &rule.important_decls, props, rule.important_flags.has_var,
                 );
                 crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             }
-            if inline_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &inline_important,
-                    props,
-                    inline_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if shadow_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &shadow_scope_declarations.important,
-                    props,
-                    shadow_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if let Some(name) = animation_style.animation_name.as_deref() {
+            let expanded = substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            let expanded = substitute_declarations(
+                &shadow_scope_declarations.important, props, shadow_important_flags.has_var,
+            );
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            if ancestor_display_none || animation_style.display == crate::Display::None {
+                animation_timeline.suppress_css_animation(nid, animation_sample);
+            } else if let Some(name) = animation_style.animation_name.as_deref() {
                 if let Some(keyframes) = self.keyframes.get(name) {
                     style.animation_has_render_effect = !keyframes.tracks.is_empty();
                     style.animation_effect_impact = keyframes
@@ -7645,7 +7633,7 @@ mod tests {
             trigger,
             InvalidationReaches::SIBLINGS,
         ));
-        assert!(dependencies_reach(
+        assert!(!dependencies_reach(
             trigger,
             InvalidationReaches::CONSERVATIVE,
         ));
@@ -7711,7 +7699,10 @@ mod tests {
         assert!(!entries[2].text_side_effect);
         assert!(entries[3].structural_side_effect);
         assert!(entries[3].text_side_effect);
-        assert!(entries[4].unrepresentable_outer_path);
+        assert!(entries[4]
+            .anchor_reaches
+            .contains(InvalidationReaches::SIBLINGS));
+        assert!(!entries[4].unrepresentable_outer_path);
 
         let tree = obscura_dom::parse_html(
             "<section id=host class=host></section><section id=other class=other></section>",
