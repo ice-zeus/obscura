@@ -13316,7 +13316,7 @@ function _rngOrder(a, b) {
 function _rngCmp(nA, oA, nB, oB) {
   if (_rngSame(nA, nB)) return oA < oB ? -1 : (oA > oB ? 1 : 0);
   if (_rngOrder(nA, nB) > 0) return -_rngCmp(nB, oB, nA, oA);
-  if (nA.contains && nA.contains(nB)) { // nA is a strict ancestor of nB
+  if (_dom("is_inclusive_ancestor", nA._nid, nB._nid) === "true") { // nA is a strict ancestor of nB
     let child = nB;
     while (child && child.parentNode && child.parentNode._nid !== nA._nid) child = child.parentNode;
     if (child && child.parentNode && child.parentNode._nid === nA._nid && _rngNodeIndex(child) < oA) return 1;
@@ -13328,8 +13328,9 @@ function _rngIsCharacterData(n) {
   const t = n.nodeType;
   return t === 3 || t === 4 || t === 7 || t === 8;
 }
+// One native walk up from n; Node.contains enumerates a's whole subtree.
 function _rngIsInclusiveAncestor(a, n) {
-  return _rngSame(a, n) || (a.contains ? a.contains(n) : false);
+  return _rngSame(a, n) || _dom("is_inclusive_ancestor", a._nid, n._nid) === "true";
 }
 // A node is contained when all of it lies between the boundary points, and
 // partially contained when it is an inclusive ancestor of just one of them.
@@ -13519,15 +13520,36 @@ globalThis.Range = class Range {
       sc.replaceData(so, eo - so, "");
       return;
     }
-    // Contained nodes in tree order, skipping those whose parent is contained.
+    // The contained nodes whose parent is not contained, in tree order, read
+    // off the two boundary paths instead of testing every node in the range.
+    const common = this.commonAncestorContainer;
     const toRemove = [];
-    const collect = (node) => {
-      for (const child of Array.from(node.childNodes)) {
-        if (_rngContains(this, child)) toRemove.push(child);
-        else collect(child);
+    const childrenOf = (node) => Array.from(node.childNodes);
+    let startIndex = so;
+    if (!_rngSame(sc, common)) {
+      if (!_rngIsCharacterData(sc)) toRemove.push(...childrenOf(sc).slice(so));
+      let node = sc;
+      while (!_rngSame(node.parentNode, common)) {
+        for (let sibling = node.nextSibling; sibling; sibling = sibling.nextSibling) toRemove.push(sibling);
+        node = node.parentNode;
       }
-    };
-    collect(this.commonAncestorContainer);
+      startIndex = _rngNodeIndex(node) + 1;
+    }
+    const endSide = [];
+    let endIndex = eo;
+    if (!_rngSame(ec, common)) {
+      if (!_rngIsCharacterData(ec)) endSide.push(childrenOf(ec).slice(0, eo));
+      let node = ec;
+      while (!_rngSame(node.parentNode, common)) {
+        const preceding = [];
+        for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) preceding.unshift(sibling);
+        endSide.push(preceding);
+        node = node.parentNode;
+      }
+      endIndex = _rngNodeIndex(node);
+    }
+    toRemove.push(...childrenOf(common).slice(startIndex, Math.max(startIndex, endIndex)));
+    for (let i = endSide.length - 1; i >= 0; i--) toRemove.push(...endSide[i]);
     const [newNode, newOffset] = _rngCollapsePoint(sc, so, ec);
     if (_rngIsCharacterData(sc)) sc.replaceData(so, _rngNodeLength(sc) - so, "");
     for (const node of toRemove) {
