@@ -10746,24 +10746,10 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   // rendering update and schedules both observer families.
   globalThis.__obscura_recompute_intersections = _scheduleIntersectionRenderCheckpoint;
   globalThis.addEventListener("resize", renderingUpdate);
-  const wireUp = () => {
-    if (!globalThis.document) return;
-    // DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
-    // MutationObserver is only needed for intersection geometry. Scheduling RO
-    // again here would escape its depth-bounded delivery cycle and allow a
-    // self-resizing callback to create an infinite chain of zero-delay tasks.
-    const observer = new MutationObserver(_scheduleIntersectionRenderCheckpoint);
-    try {
-      observer.observe(globalThis.document, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        characterData: true,
-      });
-    } catch {}
-  };
-  if (globalThis.document) wireUp();
-  else Promise.resolve().then(wireUp);
+  // DOM mutations need no MutationObserver here: every mutating `_dom`
+  // command already schedules the intersection checkpoint synchronously. A
+  // document-wide observer would make every page build spec mutation records
+  // (siblings, old values) for every DOM write without reading them.
 })();
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 // Feature detection reads this static before deciding to observe anything;
