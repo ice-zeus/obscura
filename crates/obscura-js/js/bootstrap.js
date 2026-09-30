@@ -2299,8 +2299,16 @@ function _requireNodeArgument(value, method, position, iface = "Node") {
   }
 }
 
-function _mutationError(method, message, name) {
-  return new DOMException(`Failed to execute '${method}' on 'Node': ${message}`, name);
+// Exceptions come from the relevant global of the node the method was called
+// on, so a node of an iframe document throws that frame's DOMException.
+function _mutationError(method, message, name, context) {
+  let Ctor = DOMException;
+  if (context && _foreignDocumentCount) {
+    const doc = context.nodeType === 9 ? context : _nodeDocumentOf(context);
+    const view = doc && doc !== globalThis.document ? doc.defaultView : null;
+    if (view && view !== globalThis && typeof view.DOMException === "function") Ctor = view.DOMException;
+  }
+  return new Ctor(`Failed to execute '${method}' on 'Node': ${message}`, name);
 }
 
 function _isHostIncludingInclusiveAncestor(node, parent) {
@@ -2316,10 +2324,10 @@ function _isHostIncludingInclusiveAncestor(node, parent) {
 function _ensureInsertionValidity(parent, node, child, method, replacing) {
   const parentType = parent.nodeType;
   if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
-    throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError");
+    throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
   }
   if (_isHostIncludingInclusiveAncestor(node, parent)) {
-    throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError");
+    throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError", parent);
   }
   if (child !== null && child.parentNode !== parent) {
     throw _mutationError(
@@ -2328,6 +2336,7 @@ function _ensureInsertionValidity(parent, node, child, method, replacing) {
         ? "The node to be replaced is not a child of this node."
         : "The node before which the new node is to be inserted is not a child of this node.",
       "NotFoundError",
+      parent,
     );
   }
   const nodeType = node.nodeType;
@@ -2337,6 +2346,7 @@ function _ensureInsertionValidity(parent, node, child, method, replacing) {
       method,
       `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
       "HierarchyRequestError",
+      parent,
     );
   }
   if (((nodeType === 3 || nodeType === 4) && parentType === 9)
@@ -2345,12 +2355,14 @@ function _ensureInsertionValidity(parent, node, child, method, replacing) {
       method,
       `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
       "HierarchyRequestError",
+      parent,
     );
   }
   if (parentType === 9) _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing);
 }
 
-function _ensureDocumentChildValidity(doc, node, nodeType, child, method, replacing) {
+function _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing) {
+  const doc = parent;
   const children = Array.from(doc.childNodes);
   const childIndex = child === null ? children.length : children.indexOf(child);
   const hasElementOtherThanChild = children.some(c => c.nodeType === 1 && !(replacing && c === child));
@@ -2359,7 +2371,7 @@ function _ensureDocumentChildValidity(doc, node, nodeType, child, method, replac
   const elementPrecedesChild = children.slice(0, childIndex).some(c => c.nodeType === 1);
   const oneElement = () => {
     if (hasElementOtherThanChild || (!replacing && child !== null && child.nodeType === 10) || doctypeFollowsChild) {
-      throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError");
+      throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError", parent);
     }
   };
   if (nodeType === 11) {
@@ -2368,18 +2380,18 @@ function _ensureDocumentChildValidity(doc, node, nodeType, child, method, replac
       const t = c.nodeType;
       if (t === 1) elements++;
       else if (t === 3 || t === 4) {
-        throw _mutationError(method, "Nodes of type '#text' may not be inserted inside nodes of type '#document'.", "HierarchyRequestError");
+        throw _mutationError(method, "Nodes of type '#text' may not be inserted inside nodes of type '#document'.", "HierarchyRequestError", parent);
       }
     }
-    if (elements > 1) throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError");
+    if (elements > 1) throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError", parent);
     if (elements === 1) oneElement();
   } else if (nodeType === 1) {
     oneElement();
   } else if (nodeType === 10) {
     const hasOtherDoctype = children.some(c => c.nodeType === 10 && !(replacing && c === child));
-    if (hasOtherDoctype) throw _mutationError(method, "Only one doctype on document allowed.", "HierarchyRequestError");
+    if (hasOtherDoctype) throw _mutationError(method, "Only one doctype on document allowed.", "HierarchyRequestError", parent);
     if (child !== null ? elementPrecedesChild : children.some(c => c.nodeType === 1)) {
-      throw _mutationError(method, "Can't insert a doctype after the document element.", "HierarchyRequestError");
+      throw _mutationError(method, "Can't insert a doctype after the document element.", "HierarchyRequestError", parent);
     }
   }
 }
@@ -2640,7 +2652,7 @@ class Node {
   removeChild(child) {
     _requireNodeArgument(child, "removeChild", 1);
     if (child.parentNode !== this) {
-      throw _mutationError("removeChild", "The node to be removed is not a child of this node.", "NotFoundError");
+      throw _mutationError("removeChild", "The node to be removed is not a child of this node.", "NotFoundError", this);
     }
     _removeNode(this, child, false);
     return child;
@@ -9649,6 +9661,9 @@ class CSSStyleSheet extends StyleSheet {
   }
   _serializeText() { return this._rules.map(rule => rule.cssText).join("\n"); }
   _ruleChanged(change) {
+    // A rule change restyles like a DOM mutation: computed-style snapshots
+    // taken before it must not be reused.
+    _domMutationEpoch++;
     const state = _cssStyleSheetPrivate.get(this);
     if (state?.linked && this._ownerNode) {
       // ponytail: linked imports retain the existing whole-sheet write path;
