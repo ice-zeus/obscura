@@ -7049,7 +7049,10 @@ mod tests {
                 ],
                 "fragment": [["childList", "p", ["X", "Y"], [], "I", null, null, null, null]],
                 "replaceFromOtherParent": [["childList", "p", ["U"], ["I"], "A", "X", null, null, null]],
-                "replaceSelf": [["childList", "p", ["A"], ["A"], "B", "U", null, null, null]],
+                "replaceSelf": [
+                    ["childList", "p", [], ["A"], "B", "U", null, null, null],
+                    ["childList", "p", ["A"], [], "B", "U", null, null, null]
+                ],
                 "emptyTextContent": [],
                 "appendTwo": [["childList", "EM", ["#text", "#text"], [], null, null, null, null, null]],
                 "normalize": [

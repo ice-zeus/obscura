@@ -13149,7 +13149,12 @@ fn build(
         // the CSS tie-break. Taffy has no CSS `order` style field, so feeding
         // it the correctly ordered item sequence is the missing translation.
         dom_children.sort_by_key(|cid| styles.get(cid).map(|style| style.order).unwrap_or(0));
-    } else if style.display == crate::Display::Block {
+    } else if style.display == crate::Display::Block
+        || (style.display == crate::Display::Inline && style.is_inline_block && !has_inline_ish_content)
+    {
+        // An inline-block's inner display is flow-root, so the same applies
+        // to formatting whitespace around its block children.
+        //
         // Formatting whitespace between block lines does not generate an
         // inline line box. Keeping a zero-height taffy leaf here still breaks
         // sibling margin adjacency, turning `margin-bottom:30px` followed by

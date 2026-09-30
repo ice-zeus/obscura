@@ -2287,7 +2287,8 @@ function _childNodeOfType(parent, type) {
 
 function _isDomNode(value) {
   return value instanceof Node
-    || (value !== null && typeof value === "object" && typeof value._nid === "number");
+    || (value !== null && typeof value === "object"
+      && (typeof value._nid === "number" || value._documentShim === true));
 }
 
 function _requireNodeArgument(value, method, position, iface = "Node") {
@@ -2494,12 +2495,23 @@ function _replaceChildNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, true);
   let reference = child.nextSibling;
   if (reference === node) reference = node.nextSibling;
+  let previousSibling = child.previousSibling;
+  if (previousSibling === node) previousSibling = node.previousSibling;
   const observed = _hasMutationObservers();
-  const previousSibling = observed ? child.previousSibling : null;
   const addedNodes = observed ? (node.nodeType === 11 ? Array.from(node.childNodes) : [node]) : null;
-  _removeNode(parent, child, true, method);
+  // Adopting node removes it from its parent before child is removed, so its
+  // old parent (possibly this one) sees that removal first.
+  if (node.nodeType !== 11) {
+    const oldParent = node._shadowParent || node.parentNode;
+    if (oldParent) oldParent.removeChild(node);
+  }
+  const removedNodes = [];
+  if (child.parentNode === parent) {
+    removedNodes.push(child);
+    _removeNode(parent, child, true, method);
+  }
   _insertNode(parent, node, reference, true, method);
-  if (observed) _queueTreeMutationRecord(parent, addedNodes, [child], previousSibling, reference);
+  if (observed) _queueTreeMutationRecord(parent, addedNodes, removedNodes, previousSibling, reference);
   return child;
 }
 
@@ -6554,6 +6566,14 @@ class DocumentType extends Node {
   get systemId() { return this._systemId; }
   get nodeValue() { return null; }
   set nodeValue(v) {}
+  cloneNode() {
+    const clone = new DocumentType(
+      +_dom("create_doctype", this._name, this._publicId), this._name, this._publicId, this._systemId,
+    );
+    _seedDetachedTreeState(clone);
+    _cache.set(clone._nid, clone);
+    return _stampNodeDocument(clone, this.ownerDocument);
+  }
 }
 
 const _cache = new Map();
@@ -8470,6 +8490,11 @@ if (!Element.prototype.after) {
 // These are the same implementations as Element.prototype — frameworks
 // (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
 if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
+for (const name of ["before", "after", "replaceWith", "remove"]) {
+  if (!Object.prototype.hasOwnProperty.call(DocumentType.prototype, name)) {
+    DocumentType.prototype[name] = Element.prototype[name];
+  }
+}
 if (!CharacterData.prototype.after) CharacterData.prototype.after = Element.prototype.after;
 if (!CharacterData.prototype.replaceWith) CharacterData.prototype.replaceWith = Element.prototype.replaceWith;
 if (!CharacterData.prototype.remove) CharacterData.prototype.remove = Element.prototype.remove;
@@ -9436,8 +9461,7 @@ class CSSGroupingRule extends CSSRule {
     if (!child) throw new DOMException("The rule could not be parsed", "SyntaxError");
     child._parentRule = this;
     this._rules.splice(idx, 0, child);
-    // A nested rule changes its top-level rule's text, so the sheet resyncs.
-    this.parentStyleSheet?._ruleChanged();
+    this._nestedRulesChanged();
     return idx;
   }
   deleteRule(index) {
@@ -9445,7 +9469,18 @@ class CSSGroupingRule extends CSSRule {
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
     const [removed] = this._rules.splice(idx, 1);
     if (removed) removed._parentRule = null;
-    this.parentStyleSheet?._ruleChanged();
+    this._nestedRulesChanged();
+  }
+  // A nested rule changes its top-level rule's text: replace that one rule in
+  // the sheet, the same incremental path as CSSStyleSheet.insertRule.
+  _nestedRulesChanged() {
+    let top = this;
+    while (top._parentRule) top = top._parentRule;
+    const sheet = top.parentStyleSheet;
+    if (!sheet) return;
+    const index = sheet._rules.indexOf(top);
+    if (index < 0) sheet._ruleChanged();
+    else sheet._ruleChanged({ index, deleteCount: 1, rules: [top.cssText] });
   }
 }
 
@@ -11580,6 +11615,7 @@ globalThis.DOMParser = class DOMParser {
       removeChild: function (n) { try { root.removeChild(n); } catch (e) {} return n; },
       insertBefore: function (n, ref) { try { root.insertBefore(n, ref); } catch (e) {} return n; },
       _docType: null,
+      _documentShim: true,
       get doctype() { return this._docType; },
       cloneNode: function (deep) {
         return new DOMParser().parseFromString(root.outerHTML, mimeType);
@@ -13560,6 +13596,7 @@ _markNative(globalThis.Selection);
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
 class _IframeDocument {
+  get _documentShim() { return true; }
   constructor(html, url, iframeEl) {
     this._url = url;
     this._iframeEl = iframeEl;
