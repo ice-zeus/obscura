@@ -10216,20 +10216,23 @@ function _queueMutationRecord(type, target, init) {
       const root = registration.target;
       const options = registration.options;
       if (!root) continue;
-      if (root !== target && root._nid !== target._nid) {
-        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
-      }
+      // Filter by record type first: the ancestry check is the costly part.
+      let oldValue = false;
       if (type === "attributes") {
         if (!options.attributes) continue;
         if (options.attributeFilter
             && (init.attributeNamespace != null || !options.attributeFilter.includes(init.attributeName))) continue;
-        if (options.attributeOldValue) wantsOldValue = true;
+        oldValue = !!options.attributeOldValue;
       } else if (type === "characterData") {
         if (!options.characterData) continue;
-        if (options.characterDataOldValue) wantsOldValue = true;
+        oldValue = !!options.characterDataOldValue;
       } else if (!options.childList) {
         continue;
       }
+      if (root !== target && root._nid !== target._nid) {
+        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
+      }
+      if (oldValue) wantsOldValue = true;
       matched = true;
     }
     if (matched) observer._enqueue(_makeMutationRecord(type, target, init, wantsOldValue));
