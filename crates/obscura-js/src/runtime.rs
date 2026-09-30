@@ -1221,6 +1221,9 @@ impl ObscuraJsRuntime {
     /// Embedding-only expression used by input dispatch; not a CDP evaluator.
     #[doc(hidden)]
     pub fn evaluate_host_expression(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        // Input hit testing sees the same applied resources as `evaluate`.
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.begin_javascript_task();
         let value = self.execute_host_expression("<host-input>", expression.to_string())?;
         self.v8_to_json(value)
@@ -4743,28 +4746,36 @@ mod tests {
             rt.set_screen_size_override(Some((width as f64, height as f64)), true);
             assert_eq!(rt.evaluate("[screen.width, screen.height, screen.availWidth, screen.availHeight]").unwrap(),
                 serde_json::json!([width, height, width, height]));
+            // The override slots are private host state. No global property
+            // exists for page initialization to recreate as read-only.
             assert_eq!(rt.evaluate(r#"(() => {
                 const names = ['__obscura_screen_w', '__obscura_screen_h'];
-                return names.every(name => {
-                    const descriptor = Object.getOwnPropertyDescriptor(window, name);
-                    return descriptor.writable && descriptor.configurable && !descriptor.enumerable
-                        && !Reflect.ownKeys(window).includes(name);
-                });
+                return names.every(name => !(name in window)
+                    && Object.getOwnPropertyDescriptor(window, name) === undefined
+                    && !Reflect.ownKeys(window).includes(name));
             })()"#).unwrap(), serde_json::json!(true));
+            assert_eq!(rt.evaluate_host_expression("[__hostState.screenWidth, __hostState.screenHeight]").unwrap(),
+                serde_json::json!([width, height]));
             rt.set_screen_size_override(None, false);
-            assert_eq!(rt.evaluate("[__obscura_screen_w, __obscura_screen_h].every(value => value === undefined)").unwrap(),
+            assert_eq!(rt.evaluate_host_expression(
+                "[__hostState.screenWidth, __hostState.screenHeight].every(value => value === undefined)").unwrap(),
                 serde_json::json!(true));
         }
     }
 
-    #[test]
-    fn late_runtime_internal_names_use_the_existing_reflection_registry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_runtime_internal_names_use_the_existing_reflection_registry() {
         let mut rt = setup_runtime("<button id='target'>Click</button>");
         rt.set_viewport(900.0, 700.0);
         rt.set_screen_size_override(Some((1280.0, 800.0)), true);
+        // Drive the real evaluation path instead of writing the former global:
+        // its outcome is private host state and never reaches the page.
+        for source in ["Promise.reject(new Error('late'))", "1"] {
+            rt.evaluate_for_cdp(source, true, true).await.unwrap();
+        }
         assert_eq!(rt.evaluate(r#"(() => {
             document.getElementById('target').click();
-            globalThis.__obscura_await_rejected = false;
+            document.getElementById('target').focus();
             globalThis.__obscura_page_owned = 42;
             const names = ['__obscura_await_rejected', '__obscura_click_target',
                 '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
