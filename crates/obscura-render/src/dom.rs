@@ -13293,6 +13293,21 @@ fn build(
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
     }
 
+    // An inline-block is a flow-root inside. With only block-level in-flow
+    // children there is no inline formatting context to emulate, so its
+    // children stack and stretch as in a block instead of sharing a row.
+    if style.display == crate::Display::Inline
+        && style.is_inline_block
+        && !has_inline_ish_content
+        && !native_float_band
+        && !has_float_child
+        && dom_children
+            .iter()
+            .any(|cid| styles.get(cid).is_some_and(is_in_flow_block_level))
+    {
+        taffy_style.display = taffy::style::Display::Block;
+    }
+
     if native_float_band {
         // Native float placement is only selected for the guarded flat-band
         // shape. It requires a real block formatting context on the parent.

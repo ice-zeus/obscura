@@ -10640,14 +10640,17 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     const width = Math.max(0, right - left);
     const height = Math.max(0, bottom - top);
     const targetArea = Math.max(0, rect.width) * Math.max(0, rect.height);
-    const isIntersecting = edgesTouch;
-    const area = isIntersecting ? width * height : 0;
+    const area = edgesTouch ? width * height : 0;
+    const intersectionRatio = targetArea > 0 ? area / targetArea : (edgesTouch ? 1 : 0);
+    // As in Chromium, an entry below the first threshold is reported as not
+    // intersecting even when the boxes overlap.
+    const isIntersecting = edgesTouch && this._thresholdIndex(intersectionRatio) > 0;
     return new IntersectionObserverEntry({
       target,
       isIntersecting,
-      intersectionRatio: targetArea > 0 ? area / targetArea : (isIntersecting ? 1 : 0),
+      intersectionRatio,
       boundingClientRect: _ioRect(rect.x, rect.y, rect.width, rect.height),
-      intersectionRect: isIntersecting ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
+      intersectionRect: edgesTouch ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
       rootBounds: root,
       time: performance.now(),
     });
