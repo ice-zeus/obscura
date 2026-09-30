@@ -7067,8 +7067,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mutation_observer_old_values_and_callback_this() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_observer_old_values_and_callback_this() {
         let mut rt = setup_runtime("<html><body><p id='p' title='a'>text</p></body></html>");
         let result = rt
             .evaluate(
@@ -7095,6 +7095,7 @@ mod tests {
             result,
             serde_json::json!([["attributes", "title", "a"], ["characterData", null, "text"]])
         );
+        rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
             rt.evaluate("__callbackThis()").unwrap(),
             serde_json::json!([true, true, 2, true])
