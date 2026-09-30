@@ -7232,12 +7232,12 @@ mod tests {
                         out.push([
                             node.ownerDocument === doc,
                             error && error.name,
-                            error instanceof child.DOMException,
-                            error instanceof DOMException,
+                            error && error.constructor === child.DOMException,
+                            error && error.constructor === DOMException,
                         ]);
                     }
                     const local = caught(() => document.body.removeChild(document.createElement("p")));
-                    out.push([local.name, local instanceof DOMException, local instanceof child.DOMException]);
+                    out.push([local.name, local.constructor === DOMException, local.constructor === child.DOMException]);
                     return [child.DOMException !== DOMException, out];
                 })()"#,
             )
