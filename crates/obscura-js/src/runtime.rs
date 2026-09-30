@@ -7210,6 +7210,53 @@ mod tests {
     }
 
     #[test]
+    fn mutation_errors_use_the_dom_exception_of_the_node_frame() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const iframe = document.createElement("iframe");
+                    document.body.appendChild(iframe);
+                    const child = iframe.contentWindow;
+                    const doc = child.document;
+                    const caught = (fn) => { try { fn(); return null; } catch (error) { return error; } };
+                    const out = [];
+                    for (const make of [
+                        () => doc.createElement("a"),
+                        () => doc.createTextNode("t"),
+                        () => doc.createComment("c"),
+                    ]) {
+                        const node = make();
+                        doc.body.appendChild(node);
+                        const error = caught(() => node.removeChild(doc));
+                        out.push([
+                            node.ownerDocument === doc,
+                            error && error.name,
+                            error instanceof child.DOMException,
+                            error instanceof DOMException,
+                        ]);
+                    }
+                    const local = caught(() => document.body.removeChild(document.createElement("p")));
+                    out.push([local.name, local instanceof DOMException, local instanceof child.DOMException]);
+                    return [child.DOMException !== DOMException, out];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                [
+                    [true, "NotFoundError", true, false],
+                    [true, "NotFoundError", true, false],
+                    [true, "NotFoundError", true, false],
+                    ["NotFoundError", true, false]
+                ]
+            ])
+        );
+    }
+
+    #[test]
     fn media_rules_expose_nested_rules_and_accept_insert_rule() {
         let mut rt = setup_runtime("<html><head><style id='s'>#t { color: black; } @media all { #t { color: blue; } }</style></head><body><div id='t'></div></body></html>");
         let result = rt
