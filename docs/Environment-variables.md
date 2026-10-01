@@ -129,6 +129,22 @@ Pin the seed of the randomized fingerprint surfaces (WebGL vendor/renderer, scre
 OBSCURA_FINGERPRINT_SEED=profile-17 obscura serve --stealth
 ```
 
+### `OBSCURA_HTTP_CACHE`
+
+HTTP cache of the stealth transport (`--stealth`). Default `memory`: each browser context keeps a private in-memory cache for subresources (scripts, stylesheets, fonts, images), partitioned like Chrome's by top-level site, frame site and URL, honouring `Cache-Control`, `Expires`, `Age` and revalidating stale entries with `If-None-Match` / `If-Modified-Since`. `disk` also persists the entries under `<storage dir>/http-cache` (with `--storage-dir`), so a restarted profile keeps them. `off` sends every request to the network. Documents are never served from this cache.
+
+```bash
+OBSCURA_HTTP_CACHE=disk obscura serve --stealth --storage-dir ./profile-17
+```
+
+### `OBSCURA_HTTP_CACHE_MAX_MB`
+
+Size budget of each context's HTTP cache in MiB. Default 64. The least recently used entries are evicted first; a single response may use at most an eighth of the budget.
+
+### `OBSCURA_RENDER_RESOURCE_WARMUP_MS`
+
+Render-build budget, in milliseconds, for the resources a navigation discovers while parsing (default 1000). Web fonts are awaited before page scripts run, because text metrics are what layout reads depend on. Images keep loading while scripts run, as in Chrome, and the window `load` event waits for them within the same budget. A screenshot, screencast or PDF taken right after navigation waits up to 1 s for loads the navigation left running (`OBSCURA_RENDER_RESOURCE_DEADLINE_MS` overrides that wait and also starts loads; `0` disables it). Set `OBSCURA_RENDER_RESOURCE_WARMUP_IMAGES=1` to wait for images before scripts as well.
+
 ### `OBSCURA_PROFILE`
 
 Pin a specific browser profile from the built-in pool by index (`0`-based). Each profile keeps `navigator.platform`, `userAgentData`, the UA string, and the GPU renderer internally consistent. Without it a single stable profile is used.

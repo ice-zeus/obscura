@@ -2568,6 +2568,27 @@ impl ObscuraJsRuntime {
         !self.state.borrow().render_resource_in_flight.is_empty()
     }
 
+    /// The page-transport loads running now.
+    #[cfg(feature = "render")]
+    pub fn render_resources_in_flight(&self) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        self.state.borrow().render_resource_in_flight.iter().cloned().collect()
+    }
+
+    /// Whether any of `loads` is still running.
+    #[cfg(feature = "render")]
+    pub fn any_render_resource_in_flight(&self, loads: &[(String, Option<crate::ops::ImageRequestProfile>, bool)]) -> bool {
+        let state = self.state.borrow();
+        loads.iter().any(|load| state.render_resource_in_flight.contains(load))
+    }
+
+    /// Whether web-font loads are still running for this document. Fonts
+    /// decide text metrics, so layout reads depend on them; images only change
+    /// their own box when it has no specified size.
+    #[cfg(feature = "render")]
+    pub fn has_pending_render_font_resources(&self) -> bool {
+        self.state.borrow().render_resource_in_flight.iter().any(|(_, _, is_font)| *is_font)
+    }
+
     /// Apply every finished page-transport load without waiting. Called at
     /// the runtime's own event-loop turns and promise waits and by the page
     /// around protocol commands, so late bytes reach layout, paint and the
