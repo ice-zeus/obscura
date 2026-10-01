@@ -1236,6 +1236,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "glow"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29038e1c483364cc6bb3cf78feee1816002e127c331a1eec55a4d202b9e1adb5"
+dependencies = [
+ "js-sys",
+ "slotmap",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "grid"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2044,6 +2056,7 @@ dependencies = [
  "obscura-dom",
  "obscura-net",
  "obscura-render",
+ "obscura-webgl",
  "pbkdf2",
  "psl",
  "reqwest",
@@ -2104,6 +2117,7 @@ dependencies = [
  "base64",
  "cosmic-text",
  "cssparser",
+ "flate2",
  "image",
  "log",
  "obscura-dom",
@@ -2115,6 +2129,17 @@ dependencies = [
  "url",
  "usvg",
  "wuff",
+]
+
+[[package]]
+name = "obscura-webgl"
+version = "0.1.0"
+dependencies = [
+ "glow",
+ "libloading",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

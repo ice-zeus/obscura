@@ -96,6 +96,8 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+pub mod image_pixels;
+#[cfg(feature = "paint")]
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
@@ -297,6 +299,29 @@ pub mod inline {
             "meter" => Some((font_size * 5.0, font_size)),
             _ => None,
         }
+    }
+
+    pub(crate) fn constrained_intrinsic_replaced_size(
+        intrinsic: crate::ReplacedIntrinsic,
+        style: &crate::LayoutStyle,
+    ) -> taffy::Size<f32> {
+        let (width, height) = intrinsic.natural_size().unwrap_or((300.0, 150.0));
+        if intrinsic.canvas_bitmap && intrinsic.ratio.is_none()
+            && !style.aspect_ratio.is_some_and(|ratio| ratio.is_finite() && ratio > 0.0)
+        {
+            let axis = |natural: f32, preferred, min, max| {
+                let px = |dimension| match dimension {
+                    crate::Dimension::Px(value) => Some(value.max(0.0)), _ => None,
+                };
+                px(preferred).unwrap_or(natural)
+                    .min(px(max).unwrap_or(f32::INFINITY)).max(px(min).unwrap_or(0.0))
+            };
+            return taffy::Size {
+                width: axis(width, style.width, style.min_width, style.max_width),
+                height: axis(height, style.height, style.min_height, style.max_height),
+            };
+        }
+        constrained_auto_replaced_size(width, height, style)
     }
 
     pub(crate) fn constrained_auto_replaced_size(
@@ -1642,6 +1667,8 @@ pub(crate) struct BorderCascadeOp {
 /// declare one dimension, both dimensions, or only a `viewBox` ratio.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ReplacedIntrinsic {
+    /// Canvas bitmap axes are definite even when zero; image fallback rules do not apply.
+    pub(crate) canvas_bitmap: bool,
     pub(crate) width: Option<f32>,
     pub(crate) height: Option<f32>,
     pub(crate) ratio: Option<f32>,
@@ -1650,6 +1677,7 @@ pub(crate) struct ReplacedIntrinsic {
 impl ReplacedIntrinsic {
     pub fn from_dimensions(width: f32, height: f32) -> Self {
         Self {
+            canvas_bitmap: false,
             width: Some(width),
             height: Some(height),
             ratio: (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
@@ -1657,10 +1685,18 @@ impl ReplacedIntrinsic {
         }
     }
 
+    #[cfg(feature = "paint")]
+    pub fn from_canvas_dimensions(width: u32, height: u32) -> Self {
+        Self { canvas_bitmap: true, ..Self::from_dimensions(width as f32, height as f32) }
+    }
+
     /// Resolve the concrete natural size from CSS Images' 300x150 default
     /// object size. A definite authored layout axis still overrides this
     /// fallback and transfers through the intrinsic ratio.
     pub fn natural_size(self) -> Option<(f32, f32)> {
+        if self.canvas_bitmap {
+            return self.width.zip(self.height);
+        }
         let width = self.width.filter(|value| value.is_finite() && *value > 0.0);
         let height = self
             .height
@@ -2047,8 +2083,9 @@ pub struct WaapiAnimation {
 
 /// Page-owned CSS animation instance history retained across layout rebuilds.
 /// Node ids are document-scoped, so navigation must replace this value.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AnimationTimelineState {
+    display_suppressed: std::collections::HashSet<obscura_dom::tree::NodeId>,
     instances: std::collections::HashMap<obscura_dom::tree::NodeId, AnimationInstance>,
     start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
     subtree_start_candidates: std::collections::HashMap<obscura_dom::tree::NodeId, f32>,
@@ -2098,6 +2135,7 @@ impl AnimationTimelineState {
     ) {
         for node in nodes {
             self.instances.remove(node);
+            self.display_suppressed.remove(node);
             self.start_candidates.remove(node);
             self.subtree_start_candidates.remove(node);
             self.waapi.retain(|_, animation| animation.node != *node);
@@ -2238,6 +2276,7 @@ impl AnimationTimelineState {
             return sample.time;
         }
         let document_time_ms = sample.time.milliseconds;
+        let was_suppressed = self.display_suppressed.remove(&node);
         let transition_time_ms = self.start_candidates.remove(&node);
         let retained = self
             .instances
@@ -2246,7 +2285,11 @@ impl AnimationTimelineState {
         let instance = match retained {
             Some(instance) => instance,
             None => {
-                let candidate = transition_time_ms.unwrap_or(0.0);
+                let candidate = transition_time_ms.unwrap_or(if was_suppressed {
+                    document_time_ms
+                } else {
+                    0.0
+                });
                 let paused = play_state == AnimationPlayState::Paused;
                 self.instances.insert(
                     node,
@@ -2281,6 +2324,16 @@ impl AnimationTimelineState {
     pub(crate) fn clear_animation(&mut self, node: obscura_dom::tree::NodeId, sample: AnimationSample) {
         if sample.mode == AnimationSampleMode::DocumentTime {
             self.instances.remove(&node);
+            self.display_suppressed.remove(&node);
+        }
+    }
+
+    /// CSS animations terminate below display:none. Remember the suppression
+    /// so revealing an ancestor starts a new instance at the next style flush.
+    pub(crate) fn suppress_css_animation(&mut self, node: obscura_dom::tree::NodeId, sample: AnimationSample) {
+        if sample.mode == AnimationSampleMode::DocumentTime {
+            self.instances.remove(&node);
+            self.display_suppressed.insert(node);
         }
     }
 
@@ -2288,6 +2341,7 @@ impl AnimationTimelineState {
         &mut self,
         mut keep: impl FnMut(obscura_dom::tree::NodeId) -> bool,
     ) {
+        self.display_suppressed.retain(|node| keep(*node));
         self.instances.retain(|node, _| keep(*node));
         self.start_candidates.retain(|node, _| keep(*node));
         self.subtree_start_candidates.retain(|node, _| keep(*node));
@@ -2526,9 +2580,19 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         width: dimension(style.max_width),
         height: dimension(style.max_height),
     };
-    if let Some(ar) = style.aspect_ratio {
-        if ar.is_finite() && ar > 0.0 {
-            s.aspect_ratio = Some(ar);
+    // Two definite replaced axes size independently of the preferred ratio.
+    // Keep the decoded ratio in LayoutStyle for object fitting, but do not let
+    // Taffy transfer min/max constraints to the other authored axis. Percentage
+    // and calc axes must retain their ratio until their basis is resolved.
+    let definite_replaced_axes = style.has_replaced_sizing
+        && matches!(style.width, Dimension::Px(_))
+        && matches!(style.height, Dimension::Px(_))
+        && style.size_expressions[..2].iter().all(Option::is_none);
+    if !definite_replaced_axes {
+        if let Some(ar) = style.aspect_ratio {
+            if ar.is_finite() && ar > 0.0 {
+                s.aspect_ratio = Some(ar);
+            }
         }
     }
     if style.ignores_used_box_sizes() {

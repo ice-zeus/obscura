@@ -164,13 +164,13 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
 
     navigate(&mut ctx, &url, session_id).await;
 
-    // Point the CDP click resolver at the submit button explicitly so the test
-    // does not depend on layout coordinates.
+    // Focus the submit button through its public DOM API so the test does not
+    // depend on layout coordinates or a page-writable engine global.
     cdp(
         &mut ctx,
         2,
         "Runtime.evaluate",
-        json!({"expression": "globalThis.__obscura_click_target = document.getElementById('b')"}),
+        json!({"expression": "document.getElementById('b').focus()"}),
         session_id,
     )
     .await;

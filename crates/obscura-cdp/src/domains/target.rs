@@ -243,9 +243,19 @@ pub async fn handle(
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 let page_id = ctx.sessions.get(session_id).cloned();
+                let owned_fetch = page_id.as_ref().is_some_and(|page_id|
+                    ctx.fetch_intercept.owners.get(page_id).map(String::as_str) == Some(session_id));
                 ctx.sessions.remove(session_id);
+                ctx.fetch_intercept.owners.retain(|_, owner| owner != session_id);
+                ctx.fetch_intercept.enabled = !ctx.fetch_intercept.owners.is_empty();
                 ctx.runtime_enabled_sessions.remove(session_id);
+                ctx.network_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
+                    if owned_fetch {
+                        if let Some(page) = ctx.pages.iter_mut().find(|page| page.id == page_id) {
+                            page.enable_intercept(false);
+                        }
+                    }
                     ctx.refresh_runtime_event_collection(&page_id);
                 }
                 #[cfg(feature = "render")]

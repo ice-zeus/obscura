@@ -137,11 +137,11 @@ pub async fn handle(
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || __hostState.clickTarget || document.activeElement || document.body;\
                             if (!target) return;\
-                            globalThis.__obscura_click_target = target;\
-                            globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
-                            var previousTarget = globalThis.__obscura_mouse_over_target || null;\
+                            __hostState.clickTarget = target;\
+                            __hostState.mouseDown = {{target:target,button:{button_code},clickCount:{click_count}}};\
+                            var previousTarget = __hostState.mouseOverTarget || null;\
                             if (previousTarget !== target) {{\
                                 function ancestry(node) {{ var path=[]; while (node) {{ path.push(node); node=node.parentNode || null; }} return path; }}\
                                 function pointerEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
@@ -159,7 +159,7 @@ pub async fn handle(
                                 for (var mi=0; mi<exited.length; mi++) mouseEvent(exited[mi],'mouseleave',false,target);\
                                 mouseEvent(target,'mouseover',true,previousTarget);\
                                 for (var me=entered.length-1; me>=0; me--) mouseEvent(entered[me],'mouseenter',false,previousTarget);\
-                                globalThis.__obscura_mouse_over_target = target;\
+                                __hostState.mouseOverTarget = target;\
                             }}\
                             var focusTarget = target.closest && target.closest('input,select,textarea,button,a[href],[tabindex],[contenteditable]');\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
@@ -179,16 +179,16 @@ pub async fn handle(
                         shift_key = shift_key,
                         pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
                     );
-                    page.evaluate(&code);
+                    page.evaluate_host_expression(&code);
                 }
             } else if event_type == "mouseReleased" {
                 let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || __hostState.clickTarget || document.activeElement || document.body;\
                             if (!target) return;\
-                            var down = globalThis.__obscura_mouse_down;\
-                            globalThis.__obscura_mouse_down = null;\
+                            var down = __hostState.mouseDown;\
+                            __hostState.mouseDown = null;\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
@@ -268,7 +268,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_host_expression(&code);
                     if !page.has_pending_navigation() && page.sync_virtual_url() {
                         Some((page.id.clone(), page.frame_id.clone(), page.url_string()))
                     } else {
@@ -345,7 +345,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_host_expression(&code);
                 }
             }
 

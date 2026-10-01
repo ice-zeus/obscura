@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Opt in to real ANGLE graphics; default feature sets remain unchanged.
+webgl = ["render", "obscura-js/webgl"]
 default = []
 stealth = ["obscura-net/stealth", "obscura-js/stealth"]
 render = ["obscura-js/render", "dep:image"]
@@ -23,3 +25,6 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

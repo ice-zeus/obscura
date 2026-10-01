@@ -4,6 +4,7 @@ pub mod encoding;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
+pub mod transport;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
@@ -26,3 +27,6 @@ pub use wreq_client::{
     StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
 };
+
+#[cfg(test)]
+mod http_identity_tests;

@@ -19,7 +19,7 @@ use crate::client::{
     cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
-    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    validate_url, CallbackRegistry, InFlightGuard, NavigationExchange, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
@@ -184,12 +184,26 @@ async fn send_get_with_connection_reset_retry(
 }
 
 #[cfg(feature = "stealth")]
+fn explicit_header_map(headers: &HashMap<String, String>) -> Result<wreq::header::HeaderMap, ObscuraNetError> {
+    let mut map = wreq::header::HeaderMap::new();
+    for (name, value) in headers {
+        let name = wreq::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| ObscuraNetError::Network("Invalid explicit HTTP header name".into()))?;
+        let value = wreq::header::HeaderValue::from_str(value)
+            .map_err(|_| ObscuraNetError::Network("Invalid explicit HTTP header value".into()))?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
+    user_agent_override: RwLock<Option<String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -269,6 +283,7 @@ impl StealthHttpClient {
             ),
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
+            user_agent_override: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
@@ -282,7 +297,7 @@ impl StealthHttpClient {
         url: &Url,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks)
+        self.fetch_with_profile(wreq::Method::GET, url, None, ResourceRequest::navigation(), callbacks)
             .await
     }
 
@@ -292,14 +307,50 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, request, callbacks).await
+        self.fetch_with_profile(wreq::Method::GET, url, None, request, callbacks).await
+    }
+
+    pub async fn post_form_with_callbacks(
+        &self,
+        url: &Url,
+        body: &str,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(wreq::Method::POST, url, Some(body.as_bytes().to_vec()), ResourceRequest::navigation(), callbacks).await
     }
 
     async fn fetch_with_profile(
         &self,
+        initial_method: wreq::Method,
         url: &Url,
+        initial_body: Option<Vec<u8>>,
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile_traced(initial_method,url,initial_body,request,callbacks,None).await
+    }
+
+    /// Navigation-only transport observations, separate from logical callbacks.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_with_trace(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        let mut trace=Vec::new();
+        let method=if form.is_some() {wreq::Method::POST} else {wreq::Method::GET};
+        let result=self.fetch_with_profile_traced(method,url,form.map(|body|body.as_bytes().to_vec()),ResourceRequest::navigation(),callbacks,Some(&mut trace)).await;
+        if result.is_err() {
+            if let Some(last)=trace.last_mut() { last.failed=true; }
+        }
+        (result,trace)
+    }
+
+    async fn fetch_with_profile_traced(
+        &self,
+        initial_method: wreq::Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+        mut trace: Option<&mut Vec<NavigationExchange>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -308,6 +359,9 @@ impl StealthHttpClient {
         }
 
         let mut current_url = url.clone();
+        let mut method = initial_method;
+        let mut body = initial_body;
+        let mut request_headers = self.request_headers().await;
 
         if is_tracker_blocked(&current_url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", current_url);
@@ -328,7 +382,7 @@ impl StealthHttpClient {
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
-            let mut req = self.client.get(current_url.as_str());
+            let mut req = self.client.request(method.clone(), current_url.as_str());
 
             req = req
                 .header("accept", request.accept())
@@ -351,7 +405,7 @@ impl StealthHttpClient {
                     same_site_context(
                         &request,
                         &current_url,
-                        request.mode == crate::RequestMode::Navigate,
+                        method == wreq::Method::GET || method == wreq::Method::HEAD,
                     ),
                 )
             } else {
@@ -361,20 +415,30 @@ impl StealthHttpClient {
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
-                if k.eq_ignore_ascii_case("origin") {
-                    continue;
-                }
-                req = req.header(k.as_str(), v.as_str());
-            }
+            // wreq's single-header builder appends. Replace browser-derived
+            // values explicitly so Accept/Cookie and caller overrides stay singular.
+            let mut explicit = explicit_header_map(&request_headers)?;
+            explicit.remove(wreq::header::ORIGIN);
+            req = req.headers(explicit);
             if cors_required(&request, &current_url) {
                 req = req.header("origin", &request_origin);
             }
 
+            let mut observed_headers = request_headers.clone();
+            observed_headers.remove("origin");
+            if cors_required(&request, &current_url) {
+                observed_headers.insert("origin".into(), request_origin.clone());
+            }
+            if let Some(bytes) = &body {
+                let mut form_headers = wreq::header::HeaderMap::new();
+                form_headers.insert(wreq::header::CONTENT_TYPE, wreq::header::HeaderValue::from_static("application/x-www-form-urlencoded"));
+                req = req.headers(form_headers).body(bytes.clone());
+                observed_headers.insert("content-type".into(), "application/x-www-form-urlencoded".into());
+            }
             let request_info = RequestInfo {
                 url: current_url.clone(),
-                method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                method: method.to_string(),
+                headers: observed_headers,
                 resource_type: request.resource_type,
             };
             if !request_callback_fired {
@@ -384,10 +448,17 @@ impl StealthHttpClient {
                 request_callback_fired = true;
             }
 
+            let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            if let Some(trace)=trace.as_mut() {
+                trace.push(NavigationExchange::started(&request_info,body.as_deref(),timestamp));
+            }
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = send_get_with_connection_reset_retry(req, &current_url)
-                .await
-                .map_err(|e| {
+            let result = if method == wreq::Method::GET && body.is_none() {
+                send_get_with_connection_reset_retry(req, &current_url).await
+            } else {
+                req.send().await
+            };
+            let resp = result.map_err(|e| {
                     ObscuraNetError::Network(format!(
                         "{}: {} (source: {:?})",
                         current_url,
@@ -421,6 +492,11 @@ impl StealthHttpClient {
                 );
             }
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) {
+                last.status=Some(status.as_u16());
+                last.response_headers=response_headers.clone();
+            }
+
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location") {
                     let location_str = location.to_str().map_err(|_| {
@@ -433,8 +509,16 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    let discard_body = matches!(status.as_u16(), 301 | 302 | 303);
+                    crate::client::strip_navigation_redirect_headers(
+                        &mut request_headers, &current_url, &next_url, discard_body,
+                    );
                     redirects.push(current_url.clone());
                     current_url = next_url;
+                    if discard_body {
+                        method = wreq::Method::GET;
+                        body = None;
+                    }
                     continue;
                 }
             }
@@ -443,6 +527,7 @@ impl StealthHttpClient {
                 .await?;
             drop(in_flight);
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) { last.response_body_size=Some(body.len()); }
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
@@ -493,6 +578,21 @@ impl StealthHttpClient {
         cookie_context: Option<SameSiteContext>,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let mut merged = self.request_headers().await;
+        crate::client::merge_request_headers(&mut merged, headers);
+        self.send_single_with_resolved_headers(method, url, &merged, body, cookie_context, store_cookies).await
+    }
+
+    /// Internal workspace entry point for an already resolved redirect snapshot.
+    pub async fn send_single_with_resolved_headers(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+    ) -> Result<Response, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
             return Ok(Response {
@@ -515,12 +615,7 @@ impl StealthHttpClient {
                 req = req.header("cookie", &cookie_header);
             }
         }
-        for (k, v) in self.extra_headers.read().await.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        for (k, v) in headers.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        req = req.headers(explicit_header_map(headers)?);
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
@@ -553,6 +648,24 @@ impl StealthHttpClient {
             body: resp_body,
             redirected_from: Vec::new(),
         })
+    }
+
+    /// None preserves the selected emulation profile's existing User-Agent.
+    pub async fn set_user_agent_override(&self, user_agent: &str) {
+        *self.user_agent_override.write().await = if user_agent.is_empty() {
+            None
+        } else {
+            Some(user_agent.to_string())
+        };
+    }
+
+    pub async fn request_headers(&self) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        if let Some(user_agent) = self.user_agent_override.read().await.as_ref() {
+            headers.insert("user-agent".to_string(), user_agent.clone());
+        }
+        crate::client::merge_request_headers(&mut headers, &*self.extra_headers.read().await);
+        headers
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
@@ -794,6 +907,7 @@ mod tests {
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_agent_override: tokio::sync::RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();

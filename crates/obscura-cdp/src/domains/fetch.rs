@@ -32,6 +32,7 @@ pub enum FetchResolution {
 
 pub struct FetchInterceptState {
     pub enabled: bool,
+    pub owners: HashMap<String, String>, // page id -> session that enabled Fetch
     pub patterns: Vec<String>,
     pub paused: HashMap<String, PausedRequest>,
     request_counter: u64,
@@ -41,6 +42,7 @@ impl FetchInterceptState {
     pub fn new() -> Self {
         FetchInterceptState {
             enabled: false,
+            owners: HashMap::new(),
             patterns: Vec::new(),
             paused: HashMap::new(),
             request_counter: 0,
@@ -76,12 +78,17 @@ pub async fn handle(
                 .unwrap_or_else(|| vec!["*".to_string()]);
 
             ctx.fetch_intercept.enabled = true;
+            if let Some(session_id) = session_id {
+                if let Some(page_id) = ctx.sessions.get(session_id) {
+                    ctx.fetch_intercept.owners.insert(page_id.clone(), session_id.clone());
+                }
+            }
             ctx.fetch_intercept.patterns = patterns.clone();
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns = patterns.clone();
                 if let Some(tx) = tx_clone {
-                    page.set_intercept_tx(tx);
+                    page.set_cdp_intercept_tx(tx);
                 }
                 page.enable_intercept(true);
             }
@@ -90,7 +97,17 @@ pub async fn handle(
             Ok(json!({}))
         }
         "disable" => {
-            ctx.fetch_intercept.enabled = false;
+            if let Some(session_id) = session_id {
+                if let Some(page_id) = ctx.sessions.get(session_id) {
+                    if ctx.fetch_intercept.owners.get(page_id) != Some(session_id) {
+                        return Ok(json!({}));
+                    }
+                }
+            }
+            if let Some(session_id) = session_id {
+                ctx.fetch_intercept.owners.retain(|_, owner| owner != session_id);
+            }
+            ctx.fetch_intercept.enabled = !ctx.fetch_intercept.owners.is_empty();
             ctx.fetch_intercept.patterns.clear();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns.clear();

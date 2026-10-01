@@ -65,6 +65,17 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "setObscuraStandardSearchScriptSuppression" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            if let Some(value) = params.get("enabled") {
+                page.suppress_standard_search_scripts = value.as_bool().ok_or("enabled must be boolean")?;
+            }
+            Ok(json!({
+                "enabled": page.suppress_standard_search_scripts,
+                "lastNavigationSuppressed": page.last_navigation_scripts_suppressed,
+                "implementation": "pulse-standard-scripts-v1"
+            }))
+        }
         "setDeviceMetricsOverride" => {
             let width = metric_dimension(params, "width")?;
             let height = metric_dimension(params, "height")?;

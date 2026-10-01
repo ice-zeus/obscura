@@ -52,7 +52,16 @@ async fn emit_post_eval_nav(
     let page = ctx
         .get_session_page_mut(session_id)
         .ok_or("No page")?;
-    let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+    let did_navigate = match page.process_pending_navigation().await {
+        Ok(navigated) => navigated,
+        Err(error) => {
+            let page_id=page.id.clone();
+            let frame_id=page.frame_id.clone();
+            let loader_id=format!("loader-{}",uuid::Uuid::new_v4());
+            super::page::emit_failed_navigation_events(ctx,&page_id,&frame_id,&loader_id);
+            return Err(error.to_string());
+        }
+    };
     if !did_navigate {
         return Ok(());
     }

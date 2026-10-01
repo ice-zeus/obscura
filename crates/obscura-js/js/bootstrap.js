@@ -7,6 +7,12 @@
 // browser APIs below close over this reference.
 const __obscuraCore = globalThis.Deno.core;
 
+// Shared only with the embedding runtime. The host takes this handoff before
+// page code runs and stores it under a V8 private key; no reflection filtering
+// or reserved page-property names are needed for these values.
+const _hostState = Object.create(null);
+globalThis.__obscura_host_state_handoff = _hostState;
+
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
 // declarations or property assignments below: once a property is defined
@@ -65,7 +71,7 @@ const __obscuraCore = globalThis.Deno.core;
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
-    'HTMLAudioElement', 'WebGL2RenderingContext',
+    'HTMLAudioElement', 'HTMLScriptElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
   ];
@@ -1081,9 +1087,11 @@ let _rafFrameScheduled = false;
 let _rafRunningFrame = false;
 let _renderOpportunityScheduled = false;
 let _renderOpportunityRunning = false;
+let _canvasPresentationPending = false;
+let _runCanvasPresentation = () => { _canvasPresentationPending = false; };
 
 function _renderOpportunityHasWork() {
-  return _rafFrameScheduled || _resizeRenderCheckpointPending
+  return _canvasPresentationPending || _rafFrameScheduled || _resizeRenderCheckpointPending
     || _intersectionRenderCheckpointPending;
 }
 
@@ -1108,6 +1116,9 @@ function _runRenderingOpportunity() {
   _renderOpportunityScheduled = false;
   _renderOpportunityRunning = true;
   try {
+    // Offscreen snapshots publish before the document's frame callbacks, so
+    // dimensions, observer records and pixels share one rendering boundary.
+    if (_canvasPresentationPending) _runCanvasPresentation();
     if (_rafFrameScheduled) _runAnimationFrameBatch();
     if (_resizeRenderCheckpointPending) _runResizeRenderCheckpoint();
     if (_intersectionRenderCheckpointPending) _runIntersectionRenderCheckpoint();
@@ -2070,6 +2081,10 @@ function __prepareInsertedScript(script) {
   if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
     return;
   }
+  // HTML's preparation algorithm marks the element started before this
+  // check. Moving it, or removing nomodule afterwards, must not run it again.
+  // The attribute only suppresses classic scripts; modules still execute.
+  if (!isModule && script.hasAttribute('nomodule')) return;
   const src = script.getAttribute('src');
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
@@ -3667,6 +3682,8 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     const value = String(v);
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute", this._nid, n) : null;
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (n === "src" && this.localName === "iframe") {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
@@ -3690,7 +3707,7 @@ class Element extends Node {
       if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n, oldValue);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3707,12 +3724,17 @@ class Element extends Node {
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
+    const localName = n.includes(':') ? n.slice(n.indexOf(':') + 1) : n;
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute_ns", this._nid, ns + "\0" + localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (globalThis.__mutationObservers?.length)
+      globalThis.__notifyMutation('attributes', this._nid, [], [], localName, oldValue, ns || null);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -3720,6 +3742,8 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute", this._nid, n) : null;
     _dom("remove_attribute", this._nid, n);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
@@ -3735,6 +3759,8 @@ class Element extends Node {
       if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
+    if (oldValue !== null && globalThis.__mutationObservers?.length)
+      globalThis.__notifyMutation('attributes', this._nid, [], [], n, oldValue);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3749,9 +3775,13 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    const oldValue = globalThis.__mutationObservers?.length
+      ? _domParse("get_attribute_ns", this._nid, ns + "\0" + n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (oldValue !== null && globalThis.__mutationObservers?.length)
+      globalThis.__notifyMutation('attributes', this._nid, [], [], n, oldValue, ns || null);
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -3999,7 +4029,7 @@ class Element extends Node {
       previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
     }
     globalThis.__obscura_focused = this;
-    globalThis.__obscura_click_target = this;
+    _hostState.clickTarget = this;
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
   }
@@ -4711,11 +4741,13 @@ class Element extends Node {
         const opt = f.querySelector('option[selected]') || f.querySelector('option');
         val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
       } else if (tag === 'textarea') {
-        val = f.value || f.textContent || '';
+        val = f.value; // An explicitly cleared textarea must stay empty.
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
+      // HTML form entry names and string values normalize line breaks before
+      // the shared application/x-www-form-urlencoded serializer runs.
+      const enc = (s) => _formEncode(String(s).replace(/\r\n|\r|\n/g, '\r\n'));
       pairs.push(enc(name) + '=' + enc(val));
     }
 
@@ -5049,7 +5081,7 @@ class Element extends Node {
     }
   }
   getBoundingClientRect() {
-    globalThis.__obscura_click_target = this;
+    _hostState.clickTarget = this;
     // Real layout when the render feature is compiled in: ask the Rust layout
     // cache for this element's border box. The op is absent in the default
     // build, so probe with typeof and fall through to the synthetic rect below.
@@ -5133,7 +5165,7 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView(arg) {
-    globalThis.__obscura_click_target = this;
+    _hostState.clickTarget = this;
     const rect = this.getBoundingClientRect();
     // A viewport-fixed subtree is already expressed in the viewport's
     // coordinate space and cannot be brought closer by moving the document.
@@ -6747,6 +6779,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
+    if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
@@ -7311,16 +7344,16 @@ function _applyScreenSize(w, h, emulated) {
     globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
   }
 }
-globalThis.__obscura_set_screen_override = function(w, h, emulated) {
-  globalThis.__obscura_screen_emulated = !!emulated;
+_hostState.setScreenOverride = function(w, h, emulated) {
+  _hostState.screenEmulated = !!emulated;
   if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
-    globalThis.__obscura_screen_w = w;
-    globalThis.__obscura_screen_h = h;
+    _hostState.screenWidth = w;
+    _hostState.screenHeight = h;
     _applyScreenSize(w, h, !!emulated);
     return;
   }
-  delete globalThis.__obscura_screen_w;
-  delete globalThis.__obscura_screen_h;
+  delete _hostState.screenWidth;
+  delete _hostState.screenHeight;
   const fallback = _fp('screen');
   _applyScreenSize(fallback[0], fallback[1], !!emulated);
 };
@@ -9376,8 +9409,16 @@ globalThis.MutationObserver = class MutationObserver {
     this._records = [];
   }
   observe(target, options) {
-    this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+    const normalized = { ...(options || {}) };
+    if (normalized.attributes === undefined &&
+        (normalized.attributeOldValue !== undefined || normalized.attributeFilter !== undefined))
+      normalized.attributes = true;
+    if (normalized.attributeFilter !== undefined)
+      normalized.attributeFilter = Array.from(normalized.attributeFilter, String);
+    const existing = this._targets.find(entry => entry.target === target);
+    if (existing) existing.options = normalized;
+    else this._targets.push({ target, options: normalized });
+    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
   }
   disconnect() {
     this._targets = [];
@@ -9399,7 +9440,7 @@ globalThis.MutationObserver = class MutationObserver {
     });
   }
 };
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue) {
+globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue, attributeNamespace = null) {
   if (!globalThis.__mutationObservers.length) return;
   // Use `_wrap` (the canonical node-id → wrapper resolver) instead of a
   // direct cache poke. The previous code referenced `globalThis._cache`,
@@ -9417,6 +9458,7 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
     addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     attributeName: attributeName || null,
+    attributeNamespace,
     oldValue: oldValue ?? null,
     previousSibling: null,
     nextSibling: null,
@@ -9427,31 +9469,32 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   // any Element), so subtree=true silently behaved like subtree=false and
   // every nested mutation missed its subscriber.
   for (const obs of globalThis.__mutationObservers) {
-    let matched = false;
+    let matched = false, retainOldValue = false;
     for (const t of obs._targets) {
       const root = t.target;
       if (!root) continue;
-      // Filter by type per the observer options. Default behaviour matches
-      // real MutationObserver: attribute mutations need options.attributes,
-      // characterData mutations need options.characterData, childList
-      // needs options.childList.
       const wantsType =
         (type === 'attributes' && t.options.attributes) ||
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
-      if (root._nid === target_nid) { matched = true; break; }
-      if (t.options.subtree) {
-        // Walk parents until we hit the observed root or run off the tree.
+      if (type === 'attributes' && t.options.attributeFilter &&
+          (attributeNamespace !== null || !t.options.attributeFilter.includes(attributeName))) continue;
+      let inScope = root._nid === target_nid;
+      if (!inScope && t.options.subtree) {
         let cur = target.parentNode;
         while (cur) {
-          if (cur._nid === root._nid) { matched = true; break; }
+          if (cur._nid === root._nid) { inScope = true; break; }
           cur = cur.parentNode;
         }
-        if (matched) break;
       }
+      if (!inScope) continue;
+      matched = true;
+      retainOldValue ||= type !== 'attributes' || !!t.options.attributeOldValue;
     }
-    if (matched) obs._notify([record]);
+    // Each observer receives its own record. One observer's old-value option
+    // must not leak through the record shared with another registration.
+    if (matched) obs._notify([{ ...record, oldValue: retainOldValue ? record.oldValue : null }]);
   }
 };
 
@@ -12041,7 +12084,18 @@ globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
+globalThis.HTMLScriptElement = class HTMLScriptElement extends Element {
+  get noModule() {
+    if (!(this instanceof HTMLScriptElement)) throw new TypeError('Illegal invocation');
+    return this.hasAttribute('nomodule');
+  }
+  set noModule(value) {
+    if (!(this instanceof HTMLScriptElement)) throw new TypeError('Illegal invocation');
+    if (value) this.setAttribute('nomodule', '');
+    else this.removeAttribute('nomodule');
+  }
+};
+Object.defineProperty(globalThis.HTMLScriptElement.prototype, 'noModule', { enumerable: true });
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = Element;
@@ -13219,7 +13273,7 @@ class _IframeWindow {
 // This produces a larger file than a real browser but the hash is unique
 // per session (from _fpNoise) and valid, so it does not match the known
 // headless stub.
-function _encodePNG(w, h, rgba) {
+function _encodePNG(w, h, rgba, bytesOnly = false) {
   // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
   var rowLen = 1 + w * 4;
   var raw = new Uint8Array(h * rowLen);
@@ -13275,6 +13329,7 @@ function _encodePNG(w, h, rgba) {
   p = putChunk(png, p, 'IHDR', ihd);
   p = putChunk(png, p, 'IDAT', def);
   putChunk(png, p, 'IEND', new Uint8Array(0));
+  if (bytesOnly) return png;
   // Base64 encode
   var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   var b64 = 'data:image/png;base64,';
@@ -13289,13 +13344,54 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+let _canvas2DPixels, _canvas2DTaint, _canvas2DTake;
+const _canvas2DContexts = new WeakMap();
+const _canvas2DContext = canvas => _canvas2DContexts.get(canvas);
+const _canvasDOMOwners = new WeakMap();
+let _canvasDocumentEpoch = 0;
+function _canvasDOMOwner(canvas) {
+  const owner = _canvasDOMOwners.get(canvas);
+  if (!owner || owner.frame !== _realmFrameId || owner.epoch !== _canvasDocumentEpoch
+      || owner.generation !== _hostState.documentGeneration || owner.node !== canvas._nid
+      || _cache.get(owner.node) !== canvas) return null;
+  return owner;
+}
+function _requireCanvasOwner(canvas) {
+  if (!_canvasDOMOwners.has(canvas)) throw new TypeError('Illegal invocation');
+  const owner = _canvasDOMOwner(canvas);
+  if (!owner) throw new DOMException('Canvas document is unavailable', 'InvalidStateError');
+  return owner;
+}
+let _canvasBitmapDraw = () => false;
 class _Canvas2D {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this._damageQueued = false;
+  #buf; #w; #h; #damageQueued; #stateStack; #path; #originClean = true; #owner; #domOwner;
+  static {
+    // These accessors stay in the bootstrap closure, not on a constructor or
+    // prototype reachable by page code. Private fields keep the hot pixel
+    // operations free of repeated WeakMap lookups.
+    _canvas2DPixels = context => context && typeof context === 'object' && #buf in context
+      ? {width:context.#w,height:context.#h,bytes:context.#buf,originClean:context.#originClean,alpha:context.#owner?.alpha!==false} : null;
+    _canvas2DTaint = context => { context.#originClean = false; };
+    _canvas2DTake = context => {
+      if (!context.#owner) throw new TypeError('Standalone canvas required');
+      const replacement = context.#blankBuffer(context.#w, context.#h);
+      const previous = _canvas2DPixels(context);
+      context.#buf = replacement;
+      context.#originClean = true;
+      context._markPaintDamage();
+      return previous;
+    };
+  }
+  constructor(canvas, owner = null) {
+    this.#owner = owner;
+    this.#domOwner = owner ? null : _requireCanvasOwner(canvas);
+    Object.defineProperty(this, 'canvas', {value:canvas,enumerable:true});
+    this.#damageQueued = false;
     this._resizeFromCanvas();
+    if (!owner) _canvas2DContexts.set(canvas, this);
   }
   _canvasDimension(name, fallback) {
+    if (this.#owner) return this.#owner.dimensions()[name];
     const raw = this.canvas.getAttribute(name);
     if (raw === null || raw === '') return fallback;
     const parsed = Number.parseInt(raw, 10);
@@ -13310,39 +13406,54 @@ class _Canvas2D {
     this.textBaseline = 'alphabetic';
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
-    this._stateStack = [];
+    this.#stateStack = [];
+    this.#path = [];
+  }
+  #blankBuffer(width, height) {
+    const bytes = new Uint8ClampedArray(width * height * 4);
+    if (this.#owner?.alpha === false) for (let i = 3; i < bytes.length; i += 4) bytes[i] = 255;
+    return bytes;
   }
   _resizeFromCanvas() {
+    if (!this.#owner) _requireCanvasOwner(this.canvas);
     const requestedWidth = this._canvasDimension('width', 300);
     const requestedHeight = this._canvasDimension('height', 150);
     const valid = requestedWidth <= _MAX_CANVAS_DIMENSION
       && requestedHeight <= _MAX_CANVAS_DIMENSION
       && requestedWidth * requestedHeight <= _MAX_CANVAS_PIXELS;
-    this._w = valid ? requestedWidth : 0;
-    this._h = valid ? requestedHeight : 0;
-    this._buf = new Uint8ClampedArray(this._w * this._h * 4);
+    const width = valid ? requestedWidth : 0, height = valid ? requestedHeight : 0;
+    const replacement = this.#blankBuffer(width, height);
+    this.#w = width;
+    this.#h = height;
+    this.#buf = replacement;
+    this.#originClean = true;
     this._resetDrawingState();
     const register = __obscuraCore.ops.op_canvas_register_surface;
-    if (typeof register === 'function') {
+    if (!this.#owner && typeof register === 'function') {
       // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
       // second view shares the exact backing store; no pixel copy is made.
       const bytes = new Uint8Array(
-        this._buf.buffer,
-        this._buf.byteOffset,
-        this._buf.byteLength,
+        this.#buf.buffer,
+        this.#buf.byteOffset,
+        this.#buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      const native = this.#domOwner;
+      if (!register(native.frame, native.epoch, native.node, this.#w, this.#h, bytes)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
   }
   _markPaintDamage() {
-    if (this._damageQueued) return;
-    this._damageQueued = true;
+    // Standalone canvases do not participate in DOM paint or retain a native
+    // V8 backing-store root. Their pixel storage is owned entirely by JS.
+    if (this.#owner) { this.#owner.changed(); return; }
+    if (this.#damageQueued) return;
+    this.#damageQueued = true;
     queueMicrotask(() => {
-      this._damageQueued = false;
+      this.#damageQueued = false;
       const damage = __obscuraCore.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      const native = this.#domOwner;
+      if (typeof damage === 'function') damage(native.frame, native.epoch, native.node);
     });
   }
   _parseColor(css) {
@@ -13360,26 +13471,27 @@ class _Canvas2D {
   }
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
-    if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
-    const idx = (y * this._w + x) * 4;
+    if (x < 0 || x >= this.#w || y < 0 || y >= this.#h) return;
+    const idx = (y * this.#w + x) * 4;
     const alpha = (a / 255) * this.globalAlpha;
     if (this.globalCompositeOperation === 'multiply') {
-      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
-      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
-      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
-      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
+      this.#buf[idx+0] = Math.round((r/255) * (this.#buf[idx+0]/255) * 255);
+      this.#buf[idx+1] = Math.round((g/255) * (this.#buf[idx+1]/255) * 255);
+      this.#buf[idx+2] = Math.round((b/255) * (this.#buf[idx+2]/255) * 255);
+      this.#buf[idx+3] = Math.min(255, this.#buf[idx+3] + Math.round(a * alpha));
     } else {
-      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+      this.#buf[idx+0] = Math.round(r * alpha + this.#buf[idx+0] * (1 - alpha));
+      this.#buf[idx+1] = Math.round(g * alpha + this.#buf[idx+1] * (1 - alpha));
+      this.#buf[idx+2] = Math.round(b * alpha + this.#buf[idx+2] * (1 - alpha));
+      this.#buf[idx+3] = Math.min(255, Math.round(a * alpha + this.#buf[idx+3] * (1 - alpha)));
     }
+    if (this.#owner?.alpha === false) this.#buf[idx+3] = 255;
   }
   fillRect(x, y, w, h) {
     const [r,g,b,a] = this._parseColor(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
+    for (let py = Math.max(0,y); py < Math.min(this.#h, y+h); py++) {
+      for (let px = Math.max(0,x); px < Math.min(this.#w, x+w); px++) {
         this._setPixel(px, py, r, g, b, a);
       }
     }
@@ -13387,10 +13499,11 @@ class _Canvas2D {
   }
   clearRect(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        const idx = (py * this._w + px) * 4;
-        this._buf[idx] = this._buf[idx+1] = this._buf[idx+2] = this._buf[idx+3] = 0;
+    for (let py = Math.max(0,y); py < Math.min(this.#h, y+h); py++) {
+      for (let px = Math.max(0,x); px < Math.min(this.#w, x+w); px++) {
+        const idx = (py * this.#w + px) * 4;
+        this.#buf[idx] = this.#buf[idx+1] = this.#buf[idx+2] = this.#buf[idx+3] = 0;
+        if (this.#owner?.alpha === false) this.#buf[idx+3] = 255;
       }
     }
     this._markPaintDamage();
@@ -13439,18 +13552,19 @@ class _Canvas2D {
     return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
+    if (!this.#originClean) throw new DOMException('The canvas is not origin-clean', 'SecurityError');
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     const data = new Uint8ClampedArray(w * h * 4);
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const srcX = x + px, srcY = y + py;
         const dstIdx = (py * w + px) * 4;
-        if (srcX >= 0 && srcX < this._w && srcY >= 0 && srcY < this._h) {
-          const srcIdx = (srcY * this._w + srcX) * 4;
-          data[dstIdx] = this._buf[srcIdx];
-          data[dstIdx+1] = this._buf[srcIdx+1];
-          data[dstIdx+2] = this._buf[srcIdx+2];
-          data[dstIdx+3] = this._buf[srcIdx+3];
+        if (srcX >= 0 && srcX < this.#w && srcY >= 0 && srcY < this.#h) {
+          const srcIdx = (srcY * this.#w + srcX) * 4;
+          data[dstIdx] = this.#buf[srcIdx];
+          data[dstIdx+1] = this.#buf[srcIdx+1];
+          data[dstIdx+2] = this.#buf[srcIdx+2];
+          data[dstIdx+3] = this.#buf[srcIdx+3];
         }
       }
     }
@@ -13463,12 +13577,15 @@ class _Canvas2D {
       for (let px = 0; px < w; px++) {
         const srcIdx = (py * w + px) * 4;
         const x = dx + px, y = dy + py;
-        if (x >= 0 && x < this._w && y >= 0 && y < this._h) {
-          const dstIdx = (y * this._w + x) * 4;
-          this._buf[dstIdx] = data[srcIdx];
-          this._buf[dstIdx+1] = data[srcIdx+1];
-          this._buf[dstIdx+2] = data[srcIdx+2];
-          this._buf[dstIdx+3] = data[srcIdx+3];
+        if (x >= 0 && x < this.#w && y >= 0 && y < this.#h) {
+          const dstIdx = (y * this.#w + x) * 4;
+          this.#buf[dstIdx] = data[srcIdx];
+          this.#buf[dstIdx+1] = data[srcIdx+1];
+          this.#buf[dstIdx+2] = data[srcIdx+2];
+          this.#buf[dstIdx+3] = data[srcIdx+3];
+          // putImageData replaces components directly; opaque storage ignores
+          // the supplied alpha instead of compositing it over black.
+          if (this.#owner?.alpha === false) this.#buf[dstIdx+3] = 255;
         }
       }
     }
@@ -13476,51 +13593,53 @@ class _Canvas2D {
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
+    if (_canvasBitmapDraw(this, img, Array.prototype.slice.call(arguments, 1))) return;
+    const src = _canvas2DPixels(_canvas2DContext(img));
+    if (src) {
+      if (!src.originClean) this.#originClean = false;
+      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src.width); dh = dh ?? (sh ?? src.height);
       for (let py = 0; py < dh; py++) {
         for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
+          const srcX = Math.floor((sx||0) + px * (sw||src.width) / dw);
+          const srcY = Math.floor((sy||0) + py * (sh||src.height) / dh);
+          if (srcX >= 0 && srcX < src.width && srcY >= 0 && srcY < src.height) {
+            const srcIdx = (srcY * src.width + srcX) * 4;
+            this._setPixel(dx+px, dy+py, src.bytes[srcIdx], src.bytes[srcIdx+1], src.bytes[srcIdx+2], src.bytes[srcIdx+3]);
           }
         }
       }
     }
     this._markPaintDamage();
   }
-  beginPath() { this._path = []; }
+  beginPath() { this.#path = []; }
   closePath() {}
-  moveTo(x, y) { if (this._path) this._path.push({t:'M',x,y}); }
-  lineTo(x, y) { if (this._path) this._path.push({t:'L',x,y}); }
+  moveTo(x, y) { if (this.#path) this.#path.push({t:'M',x,y}); }
+  lineTo(x, y) { if (this.#path) this.#path.push({t:'L',x,y}); }
   bezierCurveTo() {} quadraticCurveTo() {}
-  arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
+  arc(x, y, r, s, e) { if (this.#path) this.#path.push({t:'A',x,y,r}); }
   arcTo() {}
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
-    if (!this._path) return;
+    if (!this.#path) return;
     const [r,g,b,a] = this._parseColor(this.fillStyle);
-    for (const seg of this._path) {
+    for (const seg of this.#path) {
       if (seg.t === 'A') {
         const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
         const r2 = rad * rad;
-        for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
-          for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
+        for (let py = Math.max(0, cy - rad); py <= Math.min(this.#h - 1, cy + rad); py++) {
+          for (let px = Math.max(0, cx - rad); px <= Math.min(this.#w - 1, cx + rad); px++) {
             if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) this._setPixel(px, py, r, g, b, a);
           }
         }
       }
     }
-    this._path = [];
+    this.#path = [];
     this._markPaintDamage();
   }
   stroke() {}
   clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
-  restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
+  save() { this.#stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
+  restore() { const s = this.#stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
   createLinearGradient(x0,y0,x1,y1) { return { addColorStop(){}, _x0:x0,_y0:y0,_x1:x1,_y1:y1 }; }
@@ -13539,63 +13658,118 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
+let _webglCreate = () => null, _webglHas = () => false, _webglResize = () => {}, _webglReadback = () => null;
+let _placeholderHas = () => false, _placeholderPixels = () => null, _placeholderBlob, _transferOffscreen, _reflectCanvasDimensions;
+/* @obscura-webgl */
+
 class HTMLCanvasElement extends Element {
+  constructor(nid) {
+    super(nid);
+    _canvasDOMOwners.set(this, {node:this._nid,frame:_realmFrameId,
+      epoch:_canvasDocumentEpoch,generation:_hostState.documentGeneration});
+  }
   get width() {
+    _requireCanvasOwner(this);
     const raw = this.getAttribute('width');
     const parsed = raw === null ? 300 : Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300;
   }
-  set width(value) { this.setAttribute('width', Math.max(0, Number(value) || 0)); }
+  set width(value) { if (_placeholderHas(this)) throw new DOMException('Canvas control was transferred', 'InvalidStateError'); this.setAttribute('width', Math.max(0, Number(value) || 0)); }
   get height() {
+    _requireCanvasOwner(this);
     const raw = this.getAttribute('height');
     const parsed = raw === null ? 150 : Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 150;
   }
-  set height(value) { this.setAttribute('height', Math.max(0, Number(value) || 0)); }
+  set height(value) { if (_placeholderHas(this)) throw new DOMException('Canvas control was transferred', 'InvalidStateError'); this.setAttribute('height', Math.max(0, Number(value) || 0)); }
   setAttribute(name, value) {
+    _requireCanvasOwner(this);
     super.setAttribute(name, value);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      this._ctx._resizeFromCanvas();
+    if (normalized === 'width' || normalized === 'height') {
+      if (_canvas2DContext(this)) _canvas2DContext(this)._resizeFromCanvas();
+      _webglResize(this);
     }
   }
   removeAttribute(name) {
+    _requireCanvasOwner(this);
     super.removeAttribute(name);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      this._ctx._resizeFromCanvas();
+    if (normalized === 'width' || normalized === 'height') {
+      if (_canvas2DContext(this)) _canvas2DContext(this)._resizeFromCanvas();
+      _webglResize(this);
     }
   }
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
+const _canvasAttributeSetter = Element.prototype.setAttribute;
+_reflectCanvasDimensions = (canvas, width, height) => {
+  const owner = _requireCanvasOwner(canvas);
+  const dimension = (name, fallback) => {
+    const raw = _domParse('get_attribute', owner.node, name);
+    const parsed = raw === null ? fallback : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  // A changed displayed size replaces both attributes, including a
+  // same-valued opposite axis. Same-sized frames do not mutate attributes.
+  if (dimension('width', 300) === width && dimension('height', 150) === height) return;
+  _canvasAttributeSetter.call(canvas, 'width', width);
+  _canvasAttributeSetter.call(canvas, 'height', height);
+};
+
+HTMLCanvasElement.prototype.getContext = function getContext(type, options = undefined) {
+  if (!_canvasDOMOwner(this)) return null;
+  if (_placeholderHas(this)) throw new DOMException('Canvas control was transferred', 'InvalidStateError');
   if (type === '2d') {
-    if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
+    if (_webglHas(this)) return null;
+    if (!_canvas2DContext(this)) {
+      try { new _Canvas2D(this); }
       catch (_error) { return null; }
     }
-    return this._ctx;
+    return _canvas2DContext(this);
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+    return _webglCreate(this, type, options);
   }
   return null;
 };
+if (_transferOffscreen) {
+  Object.defineProperty(HTMLCanvasElement.prototype, 'transferControlToOffscreen', {
+    value: _transferOffscreen, writable: true, configurable: true, enumerable: true,
+  });
+  _markNative(_transferOffscreen);
+}
 HTMLCanvasElement.prototype.toDataURL = function(type) {
-  const ctx = this._ctx || this.getContext('2d');
-  if (ctx && ctx._buf) {
-    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
+  if (_placeholderHas(this)) {
+    try {
+      const pixels = _placeholderPixels(this, false);
+      return pixels.width && pixels.height ? _encodePNG(pixels.width, pixels.height, pixels.bytes) : 'data:,';
+    } catch (error) {
+      if (error.name === 'SecurityError') throw error;
+      return 'data:,';
+    }
   }
-  return 'data:,';
+  if (_webglHas(this)) {
+    const pixels = _webglReadback(this);
+    return pixels && pixels.width && pixels.height
+      ? _encodePNG(pixels.width, pixels.height, pixels.bytes) : 'data:,';
+  }
+  const surface = _canvas2DPixels(_canvas2DContext(this));
+  if (surface) {
+    if (!surface.originClean) throw new DOMException('The canvas is not origin-clean', 'SecurityError');
+    if (surface.width === 0 || surface.height === 0) return 'data:,';
+    return _encodePNG(surface.width, surface.height, surface.bytes);
+  }
+  // Serializing an unused bitmap does not select or lock a context type.
+  const width = this.width, height = this.height;
+  if (!width || !height || width > _MAX_CANVAS_DIMENSION || height > _MAX_CANVAS_DIMENSION
+      || width * height > _MAX_CANVAS_PIXELS) return 'data:,';
+  try { return _encodePNG(width, height, new Uint8Array(width * height * 4)); }
+  catch (_error) { return 'data:,'; }
 };
 HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
+  if (_placeholderHas(this)) return _placeholderBlob(this, cb, type, q);
   const url = this.toDataURL(type, q);
   const comma = url.indexOf(',');
   if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
@@ -15628,9 +15802,27 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
-globalThis.__obscura_init = function() {
+_hostState.initializeDocument = globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  const documentGeneration = _dom("document_generation");
+  // The public bootstrap hook is deleted after first use. Keep the host's
+  // initializer private so replacement documents still retire old wrappers.
+  // Repeated setup of the same document must preserve its state and entropy.
+  if (_hostState.documentGeneration === documentGeneration) return;
+  _hostState.clickTarget = null;
+  _hostState.mouseDown = null;
+  _hostState.mouseOverTarget = null;
+  _hostState.awaitRejected = false;
+  if (_hostState.documentGeneration !== documentGeneration) {
+    // Native node IDs are reused by a newly installed DOM. Its wrappers must
+    // not inherit old canvas contexts, event listeners or page-owned fields.
+    // Re-initializing the same document preserves its existing node identity.
+    _cache.clear();
+    _hostState.documentGeneration = documentGeneration;
+  }
+  const canvasEpoch = __obscuraCore.ops.op_canvas_document_epoch;
+  _canvasDocumentEpoch = typeof canvasEpoch === 'function' ? canvasEpoch(_realmFrameId) : 0;
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
@@ -15652,19 +15844,19 @@ globalThis.__obscura_init = function() {
   _reconcileWindowNamedProperties(previousWindowNames);
 
   const scr = _fp('screen');
-  const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
-    ? globalThis.__obscura_screen_w : scr[0];
-  const sh = Number.isFinite(globalThis.__obscura_screen_h) && globalThis.__obscura_screen_h > 0
-    ? globalThis.__obscura_screen_h : scr[1];
+  const sw = Number.isFinite(_hostState.screenWidth) && _hostState.screenWidth > 0
+    ? _hostState.screenWidth : scr[0];
+  const sh = Number.isFinite(_hostState.screenHeight) && _hostState.screenHeight > 0
+    ? _hostState.screenHeight : scr[1];
   // The OS screen and the page viewport are different browser concepts.
   // Keep the fingerprinted screen, but let the embedding browser provide the
   // actual CSS viewport so responsive JavaScript, layout, and screenshots all
   // observe the same dimensions.
-  const vw = Number.isFinite(globalThis.__obscura_viewport_w) && globalThis.__obscura_viewport_w > 0
-    ? globalThis.__obscura_viewport_w : sw;
-  const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
-    ? globalThis.__obscura_viewport_h : sh - 80;
-  _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
+  const vw = Number.isFinite(_hostState.viewportWidth) && _hostState.viewportWidth > 0
+    ? _hostState.viewportWidth : sw;
+  const vh = Number.isFinite(_hostState.viewportHeight) && _hostState.viewportHeight > 0
+    ? _hostState.viewportHeight : sh - 80;
+  _applyScreenSize(sw, sh, !!_hostState.screenEmulated);
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
@@ -15732,7 +15924,8 @@ globalThis.__obscura_init = function() {
 // and leave them out of the hide list (and thus visible to the reflection-API
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
-  k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+  k !== '__obscura_host_state_handoff' &&
+  (k.startsWith('_') || k.includes('obscura') || k.includes('Obscura'))
 );
 
 /* ===== WPT conformance shims: batch 2 ===== */
