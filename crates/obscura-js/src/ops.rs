@@ -188,6 +188,9 @@ pub struct ObscuraState {
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+    /// URL of the top-level document for a frame realm (`None` for the page
+    /// itself). Subresource requests carry it as their cache partition.
+    pub top_frame_url: Option<String>,
     pub pending_navigation: Option<(String, String, String)>,
     /// The tab's session history as the owning page sees it: entry URLs, the
     /// index of this document's first entry, and the current index. Empty
@@ -432,6 +435,7 @@ impl ObscuraState {
             callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
+            top_frame_url: None,
             pending_navigation: None,
             session_history: SessionHistory::default(),
             pending_history_traversal: None,
@@ -7340,6 +7344,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.top_frame = gs.top_frame_url.as_deref().and_then(|url| url::Url::parse(url).ok());
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;

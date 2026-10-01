@@ -254,6 +254,11 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// URL of the top-level document when the request comes from a nested
+    /// frame. `None` means the initiator is the top-level document. Together
+    /// with `initiator` this is the HTTP cache partition (Chrome's network
+    /// isolation key).
+    pub top_frame: Option<Url>,
 }
 
 impl ResourceRequest {
@@ -265,6 +270,7 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            top_frame: None,
         }
     }
 
@@ -301,6 +307,7 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            top_frame: None,
         }
     }
 
@@ -322,6 +329,7 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            top_frame: None,
         }
     }
 

@@ -1100,7 +1100,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            )))
+            ).with_http_cache(context.http_cache.clone())))
         } else {
             None
         };

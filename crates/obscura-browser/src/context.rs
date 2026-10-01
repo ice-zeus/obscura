@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
+use obscura_net::{CookieJar, HttpCache, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
@@ -38,6 +38,10 @@ pub struct BrowserContext {
     /// Seed pinned by the embedder, from which additional contexts derive
     /// their own reproducible seeds. `None` draws a random seed per context.
     fingerprint_seed_base: Option<u32>,
+    /// The profile's HTTP cache for the stealth transport, shared by its pages
+    /// and never by another profile (`OBSCURA_HTTP_CACHE`, see
+    /// `obscura_net::http_cache`). `None` without stealth or when disabled.
+    pub http_cache: Option<Arc<HttpCache>>,
 }
 
 impl BrowserContext {
@@ -129,6 +133,7 @@ impl BrowserContext {
         let fingerprint_seed_base = obscura_js::fingerprint::seed_from_env();
         let fingerprint_seed =
             fingerprint_seed_base.unwrap_or_else(obscura_js::fingerprint::random_seed);
+        let http_cache = if stealth { HttpCache::from_env(storage_dir.as_deref()) } else { None };
         BrowserContext {
             id,
             cookie_jar,
@@ -146,6 +151,7 @@ impl BrowserContext {
             allow_private_network,
             fingerprint_seed,
             fingerprint_seed_base,
+            http_cache,
         }
     }
 
@@ -225,6 +231,15 @@ impl BrowserContext {
             allow_private_network: self.allow_private_network,
             fingerprint_seed,
             fingerprint_seed_base: self.fingerprint_seed_base,
+            // A persistent copy is the same profile and keeps its cache; any
+            // other copy is a new profile with an empty one.
+            http_cache: if persistent {
+                self.http_cache.clone()
+            } else if self.stealth {
+                HttpCache::from_env(None)
+            } else {
+                None
+            },
         }
     }
 
@@ -337,6 +352,19 @@ mod tests {
         assert_eq!(derived, restarted.isolated_copy("context-1".to_string(), false).fingerprint_seed);
         assert_ne!(derived, 7);
         assert_ne!(derived, first.isolated_copy("context-2".to_string(), false).fingerprint_seed);
+    }
+
+    // The HTTP cache is per profile: pages and the per-connection persistent
+    // copy share it, every other context gets its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_cache_is_shared_within_a_profile_and_never_across_profiles() {
+        let template = BrowserContext::with_options("default".to_string(), None, true);
+        let cache = template.http_cache.clone().expect("stealth contexts cache by default");
+        let connection = template.isolated_copy("default".to_string(), true);
+        assert!(Arc::ptr_eq(&cache, connection.http_cache.as_ref().unwrap()));
+        let other = template.isolated_copy("context-1".to_string(), false);
+        assert!(!Arc::ptr_eq(&cache, other.http_cache.as_ref().unwrap()));
+        assert!(BrowserContext::with_options("plain".to_string(), None, false).http_cache.is_none());
     }
 
     // nextest runs every test in its own process, so the variable does not
