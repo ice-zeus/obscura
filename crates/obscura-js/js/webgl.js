@@ -137,6 +137,7 @@
       }
     }
     const reply = __obscuraCore.ops.op_webgl_call(s.frame, s.id, operation, bytes);
+    if (!reply.lost) gpuVariance(s, kind, value, bytes, reply.value);
     if (sharedDestination && !reply.lost) {
       // A failed read has no copyback, including a concurrent writer's changes.
       // Pixel packing also leaves skipped rows, padding and trailing bytes alone.
@@ -156,6 +157,22 @@
     if (!reply.lost && reply.accepted === true) retainReferences(s, kind, value);
     if (!reply.lost && reply.dirty) schedulePlaceholder(s.canvas);
     return reply.value;
+  }
+  // Per-profile readback variance (see _fpGpuVariance): RGBA8 reads of
+  // rendered pixels, applied before any copy to a shared destination.
+  function gpuVariance(s, kind, request, bytes, result) {
+    if (!_fpRenderVariance()) return;
+    if (kind === 'readPixels') {
+      if (request?.format !== 0x1908 || request?.data_type !== 0x1401) return;
+      const layout = result?.type === 'pixelRead' ? result.value : null;
+      if (!layout || !layout.rows || layout.row_bytes < 4) return;
+      _fpGpuVariance(bytes, layout.start, layout.stride, layout.row_bytes / 4, layout.rows, request.x, request.y, true);
+    } else if (kind === 'readback' || kind === 'sourceReadback' || kind === 'transferBitmap' || kind === 'transferSourceBitmap') {
+      if (result?.type !== 'boolean' || result.value !== true || !s.buffer) return;
+      const {width, height} = s.buffer;
+      if (bytes.length !== width * height * 4) return;
+      _fpGpuVariance(bytes, 0, width * 4, width, height, 0, height - 1, false);
+    }
   }
   function rememberDrawingBuffer(s, reply) {
     if(reply?.type==='drawingBuffer')s.buffer=reply.value;

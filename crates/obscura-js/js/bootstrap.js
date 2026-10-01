@@ -690,6 +690,49 @@ function _fpDocRand(salt) {
 function _fpNoise(x, y, channel) {
   return (_fpRand(x * 7919 + y * 6271 + channel * 8923) - 0.5) * 4;
 }
+// Per-profile rendering variance (stealth mode only). Real devices differ in
+// how their GPU and font stack rasterize text, curves, gradients and shaded
+// geometry, so the same drawing hashes differently per device but identically
+// on every read from one device. A profile reproduces its own variant: each
+// color channel of a rendered pixel moves by at most 1, at positions chosen by
+// the profile seed (about 1 channel in 10). Alpha, empty (transparent) pixels
+// and exact operations (solid rectangles, putImageData, clears) are untouched.
+function _fpRenderVariance() { return globalThis.__obscura_stealth === true; }
+function _fpChannelNudge(x, y, channel) {
+  const n = _fpNoise(x, y, channel);
+  return n > 1.8 ? 1 : n < -1.8 ? -1 : 0;
+}
+function _fpNudgePixel(bytes, index, x, y) {
+  for (let c = 0; c < 3; c++) {
+    const delta = _fpChannelNudge(x, y, c);
+    if (delta) {
+      const value = bytes[index + c] + delta;
+      bytes[index + c] = value < 0 ? 0 : value > 255 ? 255 : value;
+    }
+  }
+}
+// GPU readback variance. Shaded content is the opaque pixels that differ from
+// a neighbour in the read region; clears and flat fills read back exactly.
+// `x0`/`y0` are drawing-buffer coordinates (origin bottom-left) of the first
+// row in memory; `up` is true when memory rows ascend in y (readPixels) and
+// false for top-down images (toDataURL and other canvas exports).
+function _fpGpuVariance(bytes, start, stride, width, rows, x0, y0, up) {
+  if (!_fpRenderVariance() || width <= 0 || rows <= 0) return;
+  const changes = [];
+  const same = (a, b) => bytes[a] === bytes[b] && bytes[a + 1] === bytes[b + 1]
+    && bytes[a + 2] === bytes[b + 2] && bytes[a + 3] === bytes[b + 3];
+  for (let row = 0; row < rows; row++) {
+    const base = start + row * stride;
+    for (let col = 0; col < width; col++) {
+      const i = base + col * 4;
+      if (bytes[i + 3] !== 255) continue;
+      if ((col > 0 && !same(i, i - 4)) || (col + 1 < width && !same(i, i + 4))
+        || (row > 0 && !same(i, i - stride)) || (row + 1 < rows && !same(i, i + stride)))
+        changes.push(i, x0 + col, up ? y0 + row : y0 - row);
+    }
+  }
+  for (let k = 0; k < changes.length; k += 3) _fpNudgePixel(bytes, changes[k], changes[k + 1], changes[k + 2]);
+}
 
 var _fpCache = null;
 function _getFp() {
@@ -7543,75 +7586,81 @@ for (let i = 0; i < 50; i++) {
 function Navigator() {}
 _markNative(Navigator);
 
-// PluginArray must exist before navigator is built so the plugins getter can use it.
-function PluginArray(items) {
-  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
-  this.length = items.length;
+// PluginArray, Plugin, MimeType and MimeTypeArray as Chrome exposes them:
+// indexed items are enumerable own properties, named items (plugin names, MIME
+// types) are non-enumerable own properties, and every attribute (length, name,
+// type, enabledPlugin, ...) is a prototype getter over private state. Plain
+// function declarations (no globalThis assignment) so they survive the V8
+// snapshot; global constructors are needed by site bundles (issue #305).
+const _pluginStates = new WeakMap();
+function _pluginState(receiver) {
+  const state = _pluginStates.get(receiver);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
 }
-PluginArray.prototype = Object.create(Array.prototype);
-PluginArray.prototype.constructor = PluginArray;
-PluginArray.prototype.item = function(i) { return this[i] || null; };
-PluginArray.prototype.namedItem = function(name) {
-  for (var _pi = 0; _pi < this.length; _pi++) {
-    if (this[_pi].name === name) return this[_pi];
+function _pluginList(target, items, key) {
+  for (var _i = 0; _i < items.length; _i++) target[_i] = items[_i];
+  for (var _j = 0; _j < items.length; _j++) {
+    var name = key(items[_j]);
+    if (name && !Object.prototype.hasOwnProperty.call(target, name))
+      Object.defineProperty(target, name, { value: items[_j], writable: false, enumerable: false, configurable: true });
   }
-  return null;
+}
+function _pluginGetters(proto, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, {
+      get: Object.getOwnPropertyDescriptor({ get [name]() { return _pluginState(this)[name]; } }, name).get,
+      enumerable: true, configurable: true,
+    });
+  }
+}
+function PluginArray(items) {
+  _pluginStates.set(this, { length: items.length, items });
+  _pluginList(this, items, (plugin) => plugin.name);
+}
+PluginArray.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
+PluginArray.prototype.namedItem = function(name) {
+  return _pluginState(this).items.find((plugin) => plugin.name === String(name)) || null;
 };
-PluginArray.prototype.refresh = function() {};
+PluginArray.prototype.refresh = function() { _pluginState(this); };
+_pluginGetters(PluginArray.prototype, ['length']);
 PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
 _markNative(PluginArray);
-_markNative(PluginArray.prototype.item);
-_markNative(PluginArray.prototype.namedItem);
-_markNative(PluginArray.prototype.refresh);
 
-// Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
-// global constructors; their absence threw "ReferenceError: Plugin is not
-// defined" in site bundles that reference them (issue #305). Plain function
-// declarations (no globalThis assignment) so they survive the V8 snapshot, the
-// same pattern PluginArray uses.
 function Plugin(name, filename, description, mimeTypes) {
-  this.name = name;
-  this.filename = filename;
-  this.description = description;
   var mt = mimeTypes || [];
-  for (var _i = 0; _i < mt.length; _i++) this[_i] = mt[_i];
-  this.length = mt.length;
+  _pluginStates.set(this, { name, filename, description, length: mt.length, items: mt });
+  _pluginList(this, mt, (mime) => mime.type);
 }
-Plugin.prototype.item = function(i) { return this[i] || null; };
+Plugin.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
 Plugin.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
+  return _pluginState(this).items.find((mime) => mime.type === String(name)) || null;
 };
+_pluginGetters(Plugin.prototype, ['name', 'filename', 'description', 'length']);
 Plugin.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(Plugin.prototype, Symbol.toStringTag, {value: 'Plugin', configurable: true});
 _markNative(Plugin);
-_markNative(Plugin.prototype.item);
-_markNative(Plugin.prototype.namedItem);
 
 function MimeType(type, description, suffixes, plugin) {
-  this.type = type;
-  this.description = description;
-  this.suffixes = suffixes;
-  this.enabledPlugin = plugin || null;
+  _pluginStates.set(this, { type, description, suffixes, enabledPlugin: plugin || null });
 }
+_pluginGetters(MimeType.prototype, ['type', 'suffixes', 'description', 'enabledPlugin']);
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 
 function MimeTypeArray(items) {
-  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
-  this.length = items.length;
+  _pluginStates.set(this, { length: items.length, items });
+  _pluginList(this, items, (mime) => mime.type);
 }
-MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
+MimeTypeArray.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
 MimeTypeArray.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
+  return _pluginState(this).items.find((mime) => mime.type === String(name)) || null;
 };
+_pluginGetters(MimeTypeArray.prototype, ['length']);
 MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
 _markNative(MimeTypeArray);
-_markNative(MimeTypeArray.prototype.item);
-_markNative(MimeTypeArray.prototype.namedItem);
 
 globalThis.Navigator = Navigator;
 globalThis.PluginArray = PluginArray;
@@ -7816,17 +7865,22 @@ globalThis.navigator = {
   });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
+  // Chrome lists five PDF plugins that each handle both PDF MIME types; the
+  // MIME types are enabled by the first plugin.
+  var _pdfMimeStates = [];
+  var _pdfMimes = ["application/pdf", "text/pdf"].map(function(type) {
+    var mime = new MimeType(type, "Portable Document Format", "pdf", null);
+    _pdfMimeStates.push(_pluginStates.get(mime));
+    return mime;
+  });
   var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
-  var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-  ]);
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
+  ].map(function(name) {
+    return new Plugin(name, "internal-pdf-viewer", "Portable Document Format", _pdfMimes);
+  }));
+  _pdfMimeStates.forEach(function(state) { state.enabledPlugin = _plugins[0]; });
+  var _mimeTypes = new MimeTypeArray(_pdfMimes);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -7879,31 +7933,62 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
+// Screen state stays private: Chrome's screen object has no own properties and
+// every attribute is a prototype getter that rejects any other receiver.
+const _screenStates = new WeakMap();
+function _screenState(screen) {
+  const state = _screenStates.get(screen);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class ScreenOrientation {
+  get type() { return 'landscape-primary'; }
+  get angle() { return 0; }
+  get onchange() { return null; }
+  set onchange(value) {}
+  lock() { return Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError')); }
+  unlock() {}
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+Object.defineProperty(ScreenOrientation.prototype, Symbol.toStringTag, {value: 'ScreenOrientation', configurable: true});
 class Screen {
   constructor(w, h, availW, availH) {
-    this._w = w; this._h = h;
-    this._availW = availW === undefined ? w : availW;
-    this._availH = availH === undefined ? h - 40 : availH;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    _screenStates.set(this, {
+      width: w, height: h,
+      availWidth: availW === undefined ? w : availW,
+      availHeight: availH === undefined ? h - 40 : availH,
+      orientation: new ScreenOrientation(),
+    });
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._availW; }
-  get availHeight() { return this._availH; }
+  get availWidth() { return _screenState(this).availWidth; }
+  get availHeight() { return _screenState(this).availHeight; }
+  get width() { return _screenState(this).width; }
+  get height() { return _screenState(this).height; }
+  get colorDepth() { _screenState(this); return 24; }
+  get pixelDepth() { _screenState(this); return 24; }
+  get availLeft() { _screenState(this); return 0; }
+  get availTop() { _screenState(this); return 0; }
+  get orientation() { return _screenState(this).orientation; }
+  get onchange() { _screenState(this); return null; }
+  set onchange(value) { _screenState(this); }
+  get isExtended() { _screenState(this); return false; }
+  addEventListener() { _screenState(this); }
+  removeEventListener() { _screenState(this); }
+  dispatchEvent() { _screenState(this); return true; }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
-  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-  if (d && d.get) _markNative(d.get);
-});
+Object.defineProperty(Screen.prototype, Symbol.toStringTag, {value: 'Screen', configurable: true});
 globalThis.Screen = Screen;
+globalThis.ScreenOrientation = ScreenOrientation;
 globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated) {
-  if (globalThis.screen instanceof Screen) {
-    globalThis.screen._w = w;
-    globalThis.screen._h = h;
-    globalThis.screen._availW = w;
-    globalThis.screen._availH = emulated ? h : h - 40;
+  const state = _screenStates.get(globalThis.screen);
+  if (state) {
+    state.width = w;
+    state.height = h;
+    state.availWidth = w;
+    state.availHeight = emulated ? h : h - 40;
   } else {
     globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
   }
@@ -9210,6 +9295,29 @@ function _evaluateMediaFeature(raw) {
 
   const dimension = _evaluateMediaDimension(feature);
   if (dimension !== null) return dimension;
+
+  // Device metrics: the screen and the device pixel ratio, consistent with
+  // screen.width/height and window.devicePixelRatio.
+  let device = feature.match(/^(min-|max-)?device-(width|height)\s*:\s*(.+)$/);
+  if (device) {
+    const expected = _parseMediaPx(device[3]);
+    if (expected === null) return false;
+    const state = _screenStates.get(globalThis.screen);
+    const actual = state ? state[device[2]] : 0;
+    return device[1] === 'min-' ? actual >= expected : device[1] === 'max-' ? actual <= expected : actual === expected;
+  }
+  device = feature.match(/^(min-|max-)?resolution\s*:\s*([\d.]+)(dppx|x|dpi|dpcm)$/);
+  const ratio = device ? null : feature.match(/^-webkit-(min-|max-)?device-pixel-ratio\s*:\s*([\d.]+)$/);
+  if (device || ratio) {
+    let expected = Number((device || ratio)[2]);
+    if (device && device[3] === 'dpi') expected /= 96;
+    if (device && device[3] === 'dpcm') expected = expected * 2.54 / 96;
+    if (!Number.isFinite(expected)) return false;
+    const actual = Number(globalThis.devicePixelRatio) || 1;
+    const bound = (device || ratio)[1];
+    return bound === 'min-' ? actual >= expected - 1e-9 : bound === 'max-' ? actual <= expected + 1e-9
+      : Math.abs(actual - expected) < 1e-9;
+  }
 
   let match = feature.match(/^orientation\s*:\s*(portrait|landscape)$/);
   if (match) {
@@ -14446,9 +14554,68 @@ function _requireCanvasOwner(canvas) {
   if (!owner) throw new DOMException('Canvas document is unavailable', 'InvalidStateError');
   return owner;
 }
+// CSS <color> for canvas styles: hex, rgb()/rgba() in comma or space syntax
+// with numbers or percentages, hsl()/hsla(), named colors and transparent.
+// Alpha is clamped to [0, 1] as CSS requires, so `rgba(r, g, b, 255)` is opaque.
+const _cssNamedColors = (() => {
+  const table = {};
+  const packed = 'aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 azure f0ffff beige f5f5dc bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff blueviolet 8a2be2 brown a52a2a burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 chocolate d2691e coral ff7f50 cornflowerblue 6495ed cornsilk fff8dc crimson dc143c cyan 00ffff darkblue 00008b darkcyan 008b8b darkgoldenrod b8860b darkgray a9a9a9 darkgreen 006400 darkgrey a9a9a9 darkkhaki bdb76b darkmagenta 8b008b darkolivegreen 556b2f darkorange ff8c00 darkorchid 9932cc darkred 8b0000 darksalmon e9967a darkseagreen 8fbc8f darkslateblue 483d8b darkslategray 2f4f4f darkslategrey 2f4f4f darkturquoise 00ced1 darkviolet 9400d3 deeppink ff1493 deepskyblue 00bfff dimgray 696969 dimgrey 696969 dodgerblue 1e90ff firebrick b22222 floralwhite fffaf0 forestgreen 228b22 fuchsia ff00ff gainsboro dcdcdc ghostwhite f8f8ff gold ffd700 goldenrod daa520 gray 808080 green 008000 greenyellow adff2f grey 808080 honeydew f0fff0 hotpink ff69b4 indianred cd5c5c indigo 4b0082 ivory fffff0 khaki f0e68c lavender e6e6fa lavenderblush fff0f5 lawngreen 7cfc00 lemonchiffon fffacd lightblue add8e6 lightcoral f08080 lightcyan e0ffff lightgoldenrodyellow fafad2 lightgray d3d3d3 lightgreen 90ee90 lightgrey d3d3d3 lightpink ffb6c1 lightsalmon ffa07a lightseagreen 20b2aa lightskyblue 87cefa lightslategray 778899 lightslategrey 778899 lightsteelblue b0c4de lightyellow ffffe0 lime 00ff00 limegreen 32cd32 linen faf0e6 magenta ff00ff maroon 800000 mediumaquamarine 66cdaa mediumblue 0000cd mediumorchid ba55d3 mediumpurple 9370db mediumseagreen 3cb371 mediumslateblue 7b68ee mediumspringgreen 00fa9a mediumturquoise 48d1cc mediumvioletred c71585 midnightblue 191970 mintcream f5fffa mistyrose ffe4e1 moccasin ffe4b5 navajowhite ffdead navy 000080 oldlace fdf5e6 olive 808000 olivedrab 6b8e23 orange ffa500 orangered ff4500 orchid da70d6 palegoldenrod eee8aa palegreen 98fb98 paleturquoise afeeee palevioletred db7093 papayawhip ffefd5 peachpuff ffdab9 peru cd853f pink ffc0cb plum dda0dd powderblue b0e0e6 purple 800080 rebeccapurple 663399 red ff0000 rosybrown bc8f8f royalblue 4169e1 saddlebrown 8b4513 salmon fa8072 sandybrown f4a460 seagreen 2e8b57 seashell fff5ee sienna a0522d silver c0c0c0 skyblue 87ceeb slateblue 6a5acd slategray 708090 slategrey 708090 snow fffafa springgreen 00ff7f steelblue 4682b4 tan d2b48c teal 008080 thistle d8bfd8 tomato ff6347 turquoise 40e0d0 violet ee82ee wheat f5deb3 white ffffff whitesmoke f5f5f5 yellow ffff00 yellowgreen 9acd32';
+  const parts = packed.split(' ');
+  for (let i = 0; i < parts.length; i += 2) {
+    const hex = parts[i + 1];
+    table[parts[i]] = [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16), 255];
+  }
+  table.transparent = [0, 0, 0, 0];
+  return table;
+})();
+function _canvasParseColor(css) {
+  if (!css || typeof css !== 'string') return [0,0,0,0];
+  const text = css.trim().toLowerCase();
+  if (text === 'none') return [0,0,0,0];
+  if (text.startsWith('#')) {
+    const hex = text.slice(1);
+    if (/^[0-9a-f]+$/.test(hex)) {
+      if (hex.length === 3 || hex.length === 4) {
+        const v = Array.from(hex, (h) => parseInt(h + h, 16));
+        return [v[0], v[1], v[2], hex.length === 4 ? v[3] : 255];
+      }
+      if (hex.length === 6 || hex.length === 8) {
+        return [parseInt(hex.slice(0,2),16), parseInt(hex.slice(2,4),16), parseInt(hex.slice(4,6),16),
+          hex.length === 8 ? parseInt(hex.slice(6,8),16) : 255];
+      }
+    }
+    return [0,0,0,255];
+  }
+  const fn = text.match(/^(rgba?|hsla?)\(\s*([^)]*)\)$/);
+  if (fn) {
+    const args = fn[2].split(/\s*,\s*|\s*\/\s*|\s+/).filter(Boolean);
+    if (args.length < 3) return [0,0,0,255];
+    const clamp = (v, max) => Math.min(max, Math.max(0, v));
+    const alphaOf = (v) => v === undefined ? 255
+      : Math.round(clamp(v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v), 1) * 255);
+    let alpha = alphaOf(args[3]);
+    if (Number.isNaN(alpha)) alpha = 255;
+    if (fn[1].startsWith('rgb')) {
+      const channel = (v) => Math.round(clamp(v.endsWith('%') ? parseFloat(v) * 2.55 : parseFloat(v), 255)) || 0;
+      return [channel(args[0]), channel(args[1]), channel(args[2]), alpha];
+    }
+    const h = ((parseFloat(args[0]) % 360) + 360) % 360 / 360;
+    const sat = clamp(parseFloat(args[1]) / 100, 1) || 0, light = clamp(parseFloat(args[2]) / 100, 1) || 0;
+    const q = light < 0.5 ? light * (1 + sat) : light + sat - light * sat, p = 2 * light - q;
+    const hue = (t) => {
+      t = t < 0 ? t + 1 : t > 1 ? t - 1 : t;
+      return t < 1/6 ? p + (q - p) * 6 * t : t < 1/2 ? q : t < 2/3 ? p + (q - p) * (2/3 - t) * 6 : p;
+    };
+    return [Math.round(hue(h + 1/3) * 255), Math.round(hue(h) * 255), Math.round(hue(h - 1/3) * 255), alpha];
+  }
+  return _cssNamedColors[text] || [0,0,0,255];
+}
 let _canvasBitmapDraw = () => false;
 class _Canvas2D {
   #buf; #w; #h; #damageQueued; #stateStack; #path; #originClean = true; #owner; #domOwner;
+  // Set while a rasterizing operation (text, paths, gradients, scaled images)
+  // writes pixels; see _fpRenderVariance.
+  #variance = false; #rasterizing = false;
   static {
     // These accessors stay in the bootstrap closure, not on a constructor or
     // prototype reachable by page code. Private fields keep the hot pixel
@@ -14541,17 +14708,7 @@ class _Canvas2D {
     });
   }
   _parseColor(css) {
-    if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
-    if (css.startsWith('#')) {
-      const hex = css.slice(1);
-      if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
-      if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
-      if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
-    }
-    const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
-    const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
-    return named[css] || [0,0,0,255];
+    return _canvasParseColor(css);
   }
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
@@ -14570,8 +14727,16 @@ class _Canvas2D {
       this.#buf[idx+3] = Math.min(255, Math.round(a * alpha + this.#buf[idx+3] * (1 - alpha)));
     }
     if (this.#owner?.alpha === false) this.#buf[idx+3] = 255;
+    if (this.#variance && this.#buf[idx+3] !== 0) _fpNudgePixel(this.#buf, idx, x, y);
+  }
+  #rasterize(draw) {
+    this.#rasterizing = true;
+    this.#variance = _fpRenderVariance();
+    try { return draw(); } finally { this.#rasterizing = false; this.#variance = false; }
   }
   fillRect(x, y, w, h) {
+    if (!this.#rasterizing && typeof this.fillStyle === 'object' && this.fillStyle !== null)
+      return this.#rasterize(() => this.fillRect(x, y, w, h));
     const style = this._resolvePaint(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     for (let py = Math.max(0,y); py < Math.min(this.#h, y+h); py++) {
@@ -14594,6 +14759,8 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
+    if (!this.#rasterizing && typeof this.strokeStyle === 'object' && this.strokeStyle !== null)
+      return this.#rasterize(() => this.strokeRect(x, y, w, h));
     const style = this._resolvePaint(this.strokeStyle);
     const put = (px, py) => {
       const c = style.at(px, py);
@@ -14609,6 +14776,7 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   fillText(text, x, y) {
+    if (!this.#rasterizing) return this.#rasterize(() => this.fillText(text, x, y));
     const [r,g,b,a] = this._parseColor(this.fillStyle);
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
@@ -14638,7 +14806,11 @@ class _Canvas2D {
   measureText(t) {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    let width = String(t).length * 6 * scale;
+    // Advance widths depend on the device's fonts and text shaping. Scale them
+    // by a per-profile factor within 0.3% and keep Skia's 1/64 px precision.
+    if (width && _fpRenderVariance()) width = Math.round(width * (0.997 + _fpRand(7703) * 0.006) * 64) / 64;
+    return { width, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
     if (!this.#originClean) throw new DOMException('The canvas is not origin-clean', 'SecurityError');
@@ -14683,6 +14855,17 @@ class _Canvas2D {
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
     if (_canvasBitmapDraw(this, img, Array.prototype.slice.call(arguments, 1))) return;
+    // A scaled draw is resampled, which devices do differently; a 1:1 copy is exact.
+    if (!this.#rasterizing && arguments.length > 3) {
+      const src = _canvas2DPixels(_canvas2DContext(img));
+      const sourceWidth = arguments.length > 5 ? sw : (src ? src.width : 0);
+      const sourceHeight = arguments.length > 5 ? sh : (src ? src.height : 0);
+      const targetWidth = arguments.length > 5 ? dw : sw, targetHeight = arguments.length > 5 ? dh : sh;
+      if (src && (targetWidth !== sourceWidth || targetHeight !== sourceHeight)) {
+        const args = arguments;
+        return this.#rasterize(() => this.drawImage(...args));
+      }
+    }
     const src = _canvas2DPixels(_canvas2DContext(img));
     if (src) {
       if (!src.originClean) this.#originClean = false;
@@ -14710,6 +14893,7 @@ class _Canvas2D {
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
     if (!this.#path) return;
+    if (!this.#rasterizing) return this.#rasterize(() => this.fill());
     const style = this._resolvePaint(this.fillStyle);
     const put = (px, py) => {
       const c = style.at(px, py);
@@ -14760,6 +14944,7 @@ class _Canvas2D {
   // honoured; arcs are stroked as a circle outline of the same width.
   stroke() {
     if (!this.#path || this.#path.length === 0) return;
+    if (!this.#rasterizing) return this.#rasterize(() => this.stroke());
     const style = this._resolvePaint(this.strokeStyle);
     const lw = Math.max(1, Math.round(this.lineWidth || 1));
     const half = (lw - 1) / 2;
@@ -15090,12 +15275,17 @@ globalThis.AudioContext = class AudioContext {
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
-  createOscillator() { return {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}}; }
-  createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
+  createOscillator() {
+    const oscillator = {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}};
+    (this._oscillators || (this._oscillators = [])).push(oscillator);
+    return oscillator;
+  }
+  createDynamicsCompressor() { this._compressed = true; return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
   createAnalyser() {
     return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
-      getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
+      // An analyser reports silence until its context has rendered audio.
+      getByteFrequencyData(a){const live=this.context._rendered;for(let i=0;i<a.length;i++)a[i]=live?Math.floor(_fpRand(600+i)*10):0;},
+      getFloatFrequencyData(a){const live=this.context._rendered;for(let i=0;i<a.length;i++)a[i]=live?-100+_fpRand(700+i)*5:-Infinity;}
     };
   }
   createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
@@ -15128,14 +15318,22 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
     var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
     var freq = 10000, sr = 44100;
-    for (var i = 0; i < self.length; i++) {
-      var phase = ((i * freq / sr) % 1 + 1) % 1;
-      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    // A graph whose oscillators are all at 0 Hz renders silence.
+    var audible = (self._oscillators || []).some(function(o) { return Number(o.frequency.value) !== 0; });
+    if (audible) {
+      for (var i = 0; i < self.length; i++) {
+        var phase = ((i * freq / sr) % 1 + 1) % 1;
+        data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+      }
+      var s = 0;
+      for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
+      var scale = s > 0 ? target / s : 0;
+      for (var i = 0; i < self.length; i++) data[i] *= scale;
+      // A DynamicsCompressorNode delays its input by its 6 ms look-ahead, so
+      // the first 265 output frames at 44.1 kHz are silent.
+      if (self._compressed) for (var i = 0; i < Math.min(265, self.length); i++) data[i] = 0;
     }
-    var s = 0;
-    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
-    var scale = s > 0 ? target / s : 0;
-    for (var i = 0; i < self.length; i++) data[i] *= scale;
+    self._rendered = true;
     // Fire oncomplete + 'complete' listeners on next microtask so callers
     // can register handlers synchronously after startRendering().
     var p = Promise.resolve().then(function() {
@@ -15154,13 +15352,33 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
-globalThis.speechSynthesis = {
-  speaking: false, pending: false, paused: false,
-  getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
-  speak() {}, cancel() {}, pause() {}, resume() {},
-  addEventListener() {}, removeEventListener() {},
-  onvoiceschanged: null,
-};
+// speechSynthesis is a SpeechSynthesis instance with its attributes and
+// operations on the prototype, as in Chrome.
+const _speechStates = new WeakMap();
+function _speechState(receiver) {
+  const state = _speechStates.get(receiver);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class SpeechSynthesis {
+  get pending() { _speechState(this); return false; }
+  get speaking() { _speechState(this); return false; }
+  get paused() { _speechState(this); return false; }
+  get onvoiceschanged() { return _speechState(this).onvoiceschanged; }
+  set onvoiceschanged(value) { _speechState(this).onvoiceschanged = typeof value === 'function' ? value : null; }
+  getVoices() { _speechState(this); return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; }
+  speak() { _speechState(this); }
+  cancel() { _speechState(this); }
+  pause() { _speechState(this); }
+  resume() { _speechState(this); }
+  addEventListener() { _speechState(this); }
+  removeEventListener() { _speechState(this); }
+  dispatchEvent() { _speechState(this); return true; }
+}
+Object.defineProperty(SpeechSynthesis.prototype, Symbol.toStringTag, {value: 'SpeechSynthesis', configurable: true});
+globalThis.SpeechSynthesis = SpeechSynthesis;
+globalThis.speechSynthesis = new SpeechSynthesis();
+_speechStates.set(globalThis.speechSynthesis, { onvoiceschanged: null });
 globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { constructor(t){this.text=t;this.lang='en-US';this.rate=1;this.pitch=1;this.volume=1;} };
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
@@ -17845,6 +18063,176 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       } catch (e) {}
     }
   }
+})();
+
+// Chrome's navigator object has no own properties: every attribute and
+// operation lives on Navigator.prototype. Move the shim's members there (the
+// literal's data fields and the getters on its intermediate prototype), keeping
+// each value's identity, so `Object.getOwnPropertyNames(navigator)` is empty and
+// the prototype describes the interface.
+(function _hoistNavigatorMembers() {
+  const nav = globalThis.navigator;
+  if (!nav || typeof Navigator !== 'function') return;
+  const proto = Navigator.prototype;
+  const holders = [];
+  for (let p = Object.getPrototypeOf(nav); p && p !== proto && p !== Object.prototype; p = Object.getPrototypeOf(p))
+    holders.push(p);
+  const define = (key, descriptor) => {
+    if (!Object.prototype.hasOwnProperty.call(proto, key)) Object.defineProperty(proto, key, descriptor);
+  };
+  for (const key of Reflect.ownKeys(nav)) {
+    const d = Object.getOwnPropertyDescriptor(nav, key);
+    if (!d || !d.configurable) continue;
+    if ('value' in d && typeof d.value === 'function') {
+      define(key, { value: d.value, writable: true, enumerable: true, configurable: true });
+    } else if ('value' in d) {
+      const value = d.value;
+      const get = Object.getOwnPropertyDescriptor({ get [key]() { return value; } }, key).get;
+      define(key, { get, set: undefined, enumerable: true, configurable: true });
+    } else {
+      define(key, { get: d.get, set: d.set, enumerable: true, configurable: true });
+    }
+    delete nav[key];
+  }
+  for (const holder of holders)
+    for (const key of Reflect.ownKeys(holder))
+      if (key !== 'constructor') define(key, Object.getOwnPropertyDescriptor(holder, key));
+  Object.setPrototypeOf(nav, proto);
+  Object.defineProperty(proto, Symbol.toStringTag, { value: 'Navigator', configurable: true });
+})();
+
+// Browser API members are implemented natively in Chrome, so each one is a
+// non-constructible function that owns exactly `length` and `name`, and an
+// attribute getter rejects a receiver that is not an instance ("Illegal
+// invocation"), including the interface prototype object itself. Shims
+// written as `function` expressions, or as getters that simply read a field,
+// differ on each of those points, and fingerprinting scripts test them on
+// every API they read. Rewrap the members that differ; class and shorthand
+// methods already have the native shape and are left untouched.
+(function _normalizeApiSurface() {
+  const reflectApply = Reflect.apply;
+  const ownKeys = Reflect.ownKeys;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const defineProperty = Object.defineProperty;
+  const hasOwn = Object.prototype.hasOwnProperty;
+  const realSource = (fn) => { try { return reflectApply(_origToString, fn, []); } catch (e) { return ''; } };
+  const isEngineNative = (fn) => /\{\s*\[native code\]\s*\}\s*$/.test(realSource(fn)) && !_nativeFns.has(fn) && !_nativeStr.has(fn);
+  // Native shape: not a constructor (no own `prototype`) and own keys exactly
+  // `length` and `name`.
+  const nativeShaped = (fn) => {
+    if (reflectApply(hasOwn, fn, ['prototype'])) return false;
+    const keys = ownKeys(fn);
+    return keys.length === 2 && keys.includes('length') && keys.includes('name')
+      && !/^bound /.test(fn.name);
+  };
+  // A prototype object (or a non-object) is never a valid receiver.
+  const illegalReceiver = (receiver) => receiver === null
+    || (typeof receiver !== 'object' && typeof receiver !== 'function')
+    || reflectApply(hasOwn, receiver, ['constructor']);
+  const illegal = () => { throw new TypeError('Illegal invocation'); };
+  const nativeString = (fn, fallback) => _nativeStr.get(fn) || fallback;
+  function rewrapMethod(fn, key) {
+    const wrapper = { [key](...args) { return reflectApply(fn, this, args); } }[key];
+    defineProperty(wrapper, 'length', { value: fn.length, configurable: true });
+    if (_nativeStr.has(fn)) _nativeStr.set(wrapper, _nativeStr.get(fn));
+    else _markNative(wrapper);
+    return wrapper;
+  }
+  function rewrapGetter(fn, key, guard) {
+    const wrapper = getDescriptor({ get [key]() {
+      if (guard && illegalReceiver(this)) illegal();
+      return reflectApply(fn, this, []);
+    } }, key).get;
+    _markNativeAs(wrapper, nativeString(fn, 'function ' + wrapper.name + '() { [native code] }'));
+    return wrapper;
+  }
+  function rewrapSetter(fn, key) {
+    const wrapper = getDescriptor({ set [key](value) { reflectApply(fn, this, [value]); } }, key).set;
+    _markNativeAs(wrapper, nativeString(fn, 'function ' + wrapper.name + '() { [native code] }'));
+    return wrapper;
+  }
+  // Interfaces whose attribute getters fingerprinting scripts read directly
+  // from the prototype. Other interfaces keep their getters unwrapped so hot
+  // DOM paths pay nothing. `true` guards every getter.
+  const guarded = {
+    Navigator: true, Screen: true, HTMLCanvasElement: true, OffscreenCanvas: true,
+    TextMetrics: true, FontFace: true, DOMRect: true, DOMRectReadOnly: true, SVGRect: true,
+    IntersectionObserverEntry: true, AudioBuffer: true, AnalyserNode: true,
+    BiquadFilterNode: true, MediaDevices: true, Permissions: true, StorageManager: true,
+    WebGLRenderingContext: true, WebGL2RenderingContext: true, Plugin: true,
+    PluginArray: true, MimeType: true, MimeTypeArray: true, NetworkInformation: true,
+    NavigatorUAData: true, BatteryManager: true, SpeechSynthesis: true,
+    Document: ['referrer'],
+    Element: ['clientHeight', 'clientWidth', 'clientTop', 'clientLeft', 'offsetHeight',
+      'offsetWidth', 'offsetTop', 'offsetLeft', 'offsetParent', 'scrollHeight', 'scrollWidth',
+      'contentDocument', 'contentWindow'],
+  };
+  const seen = new Set();
+  // `statics`: a constructor or namespace object, whose capitalized members are
+  // nested interfaces (Intl.DateTimeFormat) and must stay constructible.
+  function normalize(holder, name, statics = false) {
+    if (!holder || (typeof holder !== 'object' && typeof holder !== 'function') || seen.has(holder)) return;
+    seen.add(holder);
+    const guard = statics ? undefined : guarded[name];
+    for (const key of ownKeys(holder)) {
+      if (key === 'constructor' || (typeof key === 'string' && key.charAt(0) === '_')) continue;
+      if (statics && (typeof key !== 'string' || /^[A-Z]/.test(key)
+        || key === 'prototype' || key === 'length' || key === 'name'
+        || key === 'caller' || key === 'arguments')) continue;
+      let d;
+      try { d = getDescriptor(holder, key); } catch (e) { continue; }
+      if (!d || !d.configurable) continue;
+      const label = typeof key === 'symbol' ? key : String(key);
+      try {
+        if (typeof d.value === 'function') {
+          const fn = d.value;
+          if (isEngineNative(fn) || nativeShaped(fn)) {
+            if (!isEngineNative(fn) && !_nativeStr.has(fn)) _markNative(fn);
+            continue;
+          }
+          d.value = rewrapMethod(fn, label);
+          defineProperty(holder, key, d);
+          continue;
+        }
+        // Static and global attributes (document, location, ...) are hot and
+        // not read from a prototype; leave their accessors alone.
+        if (statics) continue;
+        let changed = false;
+        if (typeof d.get === 'function' && !isEngineNative(d.get)) {
+          const wants = guard === true || (Array.isArray(guard) && guard.includes(key));
+          if (wants || !nativeShaped(d.get)) { d.get = rewrapGetter(d.get, label, wants); changed = true; }
+        }
+        if (typeof d.set === 'function' && !isEngineNative(d.set) && !nativeShaped(d.set)) {
+          d.set = rewrapSetter(d.set, label); changed = true;
+        }
+        if (changed) defineProperty(holder, key, d);
+      } catch (e) {}
+    }
+  }
+  // Interfaces that Obscura aliases (HTMLElement and HTMLIFrameElement share
+  // Element's prototype) are reached once, through that shared prototype.
+  const interfaces = [];
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (!/^[A-Z]/.test(name)) continue;
+    let value;
+    try { value = globalThis[name]; } catch (e) { continue; }
+    if (typeof value === 'function') {
+      if (value.prototype) normalize(value.prototype, value.name || name);
+      interfaces.push(value);
+    } else if (value && typeof value === 'object') {
+      // Namespaces (Math, JSON, Reflect, Intl, CSS) and their constructors.
+      interfaces.push(value);
+      for (const key of Object.getOwnPropertyNames(value)) {
+        let member;
+        try { member = getDescriptor(value, key).value; } catch (e) { continue; }
+        if (typeof member === 'function' && /^[A-Z]/.test(key) && member.prototype)
+          normalize(member.prototype, key);
+      }
+    }
+  }
+  for (const value of interfaces) normalize(value, '', true);
+  // Window operations are own properties of the global object.
+  normalize(globalThis, 'Window', true);
 })();
 
 (function _markBuiltinsNative() {

@@ -641,6 +641,10 @@ impl ObscuraJsRuntime {
                 op_state.put(crate::webgl_ops::DeferredCleanup::default());
             }
 
+            // V8's own frame serialization instead of deno_core's formatter,
+            // so `error.stack` reads exactly as in Chrome.
+            crate::stack_trace::install(runtime.v8_isolate());
+
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
             let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
             install_heap_limit_guard(
@@ -1000,6 +1004,7 @@ impl ObscuraJsRuntime {
         {
             frame.stealth_client = parent.stealth_client.clone();
         }
+        frame.top_frame_url = Some(parent.top_frame_url.clone().unwrap_or_else(|| parent.url.clone()));
         // A frame realm shares the page transport, so its renderer cache must
         // not open synchronous requests either. Frame geometry currently
         // resolves against the main document's renderer state, so frame-scoped
@@ -1606,6 +1611,9 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
+        // Chrome's natively implemented APIs never show up in a page's stack
+        // traces, so hide the engine's own script frames in stealth mode.
+        crate::stack_trace::set_hide_internal_frames(self.js_runtime.v8_isolate(), enabled);
         let _ = self.execute_runtime_script(
             "<set-stealth>",
             format!("globalThis.__obscura_stealth = {};", enabled),
@@ -2350,6 +2358,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "stealth")]
         let stealth_client = state.stealth_client.clone();
         let initiator = url::Url::parse(&state.url).ok();
+        let top_frame = state.top_frame_url.as_deref().and_then(|url| url::Url::parse(url).ok());
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
             // the in-flight marks so a later scan may retry.
@@ -2374,6 +2383,7 @@ impl ObscuraJsRuntime {
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
+                let top_frame = top_frame.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
                 let load = async move {
@@ -2398,6 +2408,7 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.top_frame = top_frame;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;

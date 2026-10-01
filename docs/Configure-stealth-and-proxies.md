@@ -90,6 +90,8 @@ OBSCURA_FINGERPRINT_SEED=0x5eed obscura serve --stealth   # or any profile label
 
 The default browser context (and every CDP connection to it) uses the pinned seed. A context created with `Target.createBrowserContext` derives its own reproducible seed from the pinned seed and its context id.
 
+Canvas and WebGL output is part of the profile too. In stealth mode the seed decides a small rendering variation, as real GPUs and font stacks differ: text, curves, gradients and resampled images drawn on a 2D canvas, and shaded WebGL pixels read back with `readPixels`, `toDataURL`, `toBlob` or `drawImage`, have a few color channels shifted by one level. The same drawing reads back identically every time within a profile and differently between profiles. Blank canvases, solid rectangles, `putImageData` and flat WebGL clears stay exact, and alpha is never changed. Text widths from `measureText` carry a per-profile factor within 0.3%. Without `--stealth` the output is unchanged.
+
 Timezone is driven by the process zone so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report the same region. Default is `Europe/Berlin`; set it to match the exit IP:
 
 ```bash

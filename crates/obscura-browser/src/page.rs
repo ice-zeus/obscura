@@ -100,6 +100,38 @@ fn remaining_settle_resource_warmup_ms(
         .unwrap_or(0)
 }
 
+/// Wall-clock time of each navigation phase, logged at debug level under the
+/// `obscura::navigation` target for latency analysis.
+struct NavigationPhases {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl NavigationPhases {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        NavigationPhases { started: now, last: now, phases: Vec::new() }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases.push((phase, now.duration_since(self.last).as_millis()));
+        self.last = now;
+    }
+
+    fn report(&self, url: &str, readiness: &str) {
+        tracing::debug!(
+            target: "obscura::navigation",
+            url,
+            readiness,
+            total_ms = self.started.elapsed().as_millis() as u64,
+            phases = ?self.phases,
+            "navigation phases"
+        );
+    }
+}
+
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 
@@ -1100,7 +1132,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            )))
+            ).with_http_cache(context.http_cache.clone())))
         } else {
             None
         };
@@ -2464,6 +2496,11 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        // Stealth pages fetch parser scripts through the Chrome transport like
+        // every other subresource (and its HTTP cache); the plain client would
+        // present a different TLS and header identity for script requests.
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let script_initiator = self
             .url
@@ -2473,6 +2510,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2505,9 +2544,16 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
+                    #[cfg(feature = "stealth")]
+                    let result = match stealth_client {
+                        Some(stealth_client) => {
+                            stealth_client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
+                        }
+                        None => client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await,
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let result = client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await;
+                    match result
                     {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
@@ -3444,6 +3490,7 @@ impl Page {
         referrer: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        let mut phases = NavigationPhases::start();
 
         // The previous document's background loads end with the document.
         self.retire_render_resources();
@@ -3534,6 +3581,7 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        phases.mark("document_fetch");
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
@@ -3637,6 +3685,7 @@ impl Page {
                 "delete globalThis.__obscura_registerLinkedStylesheet",
             );
         }
+        phases.mark("parse_and_stylesheets");
         self.document_timeline_origin = std::time::Instant::now();
         #[cfg(feature = "render")]
         if let Some(js) = &self.js {
@@ -3663,6 +3712,7 @@ impl Page {
                 .unwrap_or(1_000);
             let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
+        phases.mark("parser_render_resources");
 
         // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
         // not before. Skipping execute_scripts() on the DCL path meant
@@ -3671,6 +3721,7 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+        phases.mark("scripts");
 
         #[cfg(feature = "render")]
         {
@@ -3687,6 +3738,7 @@ impl Page {
             let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
 
+        phases.mark("post_script_render_resources");
         self.lifecycle = LifecycleState::DomContentLoaded;
 
         // Before any `wait_until` can return, because the frames belong to the
@@ -3695,8 +3747,10 @@ impl Page {
         // on the next line, so building frames further down left every real CDP
         // client seeing a page with no frames at all.
         self.build_document_frames().await;
+        phases.mark("frames");
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
+            phases.report(url.as_str(), "domcontentloaded");
             return Ok(());
         }
 
