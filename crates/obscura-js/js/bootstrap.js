@@ -168,21 +168,32 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+// Weak, so a retired document's functions can still be collected.
+const _nativeFns = new WeakSet();
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = new WeakMap();
 const _origToString = Function.prototype.toString;
+const _toStringApply = Reflect.apply;
+// Every realm of a page (its frames) registers here: the host links a frame
+// realm's list to the page's (`copy_identity_to_realm`), so one realm's
+// Function.prototype.toString also recognizes another realm's members, as a
+// native toString does for any native function.
+_hostState.nativeRegistries = [{ fns: _nativeFns, strs: _nativeStr }];
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
-      return `function ${this.name || ''}() { [native code] }`;
+    const registries = _hostState.nativeRegistries;
+    for (let i = 0; i < registries.length; i++) {
+      const registry = registries[i];
+      if (registry.strs.has(this)) { return registry.strs.get(this); }
+      if (registry.fns.has(this)) {
+        return `function ${this.name || ''}() { [native code] }`;
+      }
     }
-    return _origToString.call(this);
+    return _toStringApply(_origToString, this, []);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
@@ -7543,75 +7554,81 @@ for (let i = 0; i < 50; i++) {
 function Navigator() {}
 _markNative(Navigator);
 
-// PluginArray must exist before navigator is built so the plugins getter can use it.
-function PluginArray(items) {
-  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
-  this.length = items.length;
+// PluginArray, Plugin, MimeType and MimeTypeArray as Chrome exposes them:
+// indexed items are enumerable own properties, named items (plugin names, MIME
+// types) are non-enumerable own properties, and every attribute (length, name,
+// type, enabledPlugin, ...) is a prototype getter over private state. Plain
+// function declarations (no globalThis assignment) so they survive the V8
+// snapshot; global constructors are needed by site bundles (issue #305).
+const _pluginStates = new WeakMap();
+function _pluginState(receiver) {
+  const state = _pluginStates.get(receiver);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
 }
-PluginArray.prototype = Object.create(Array.prototype);
-PluginArray.prototype.constructor = PluginArray;
-PluginArray.prototype.item = function(i) { return this[i] || null; };
-PluginArray.prototype.namedItem = function(name) {
-  for (var _pi = 0; _pi < this.length; _pi++) {
-    if (this[_pi].name === name) return this[_pi];
+function _pluginList(target, items, key) {
+  for (var _i = 0; _i < items.length; _i++) target[_i] = items[_i];
+  for (var _j = 0; _j < items.length; _j++) {
+    var name = key(items[_j]);
+    if (name && !Object.prototype.hasOwnProperty.call(target, name))
+      Object.defineProperty(target, name, { value: items[_j], writable: false, enumerable: false, configurable: true });
   }
-  return null;
+}
+function _pluginGetters(proto, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, {
+      get: Object.getOwnPropertyDescriptor({ get [name]() { return _pluginState(this)[name]; } }, name).get,
+      enumerable: true, configurable: true,
+    });
+  }
+}
+function PluginArray(items) {
+  _pluginStates.set(this, { length: items.length, items });
+  _pluginList(this, items, (plugin) => plugin.name);
+}
+PluginArray.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
+PluginArray.prototype.namedItem = function(name) {
+  return _pluginState(this).items.find((plugin) => plugin.name === String(name)) || null;
 };
-PluginArray.prototype.refresh = function() {};
+PluginArray.prototype.refresh = function() { _pluginState(this); };
+_pluginGetters(PluginArray.prototype, ['length']);
 PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
 _markNative(PluginArray);
-_markNative(PluginArray.prototype.item);
-_markNative(PluginArray.prototype.namedItem);
-_markNative(PluginArray.prototype.refresh);
 
-// Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
-// global constructors; their absence threw "ReferenceError: Plugin is not
-// defined" in site bundles that reference them (issue #305). Plain function
-// declarations (no globalThis assignment) so they survive the V8 snapshot, the
-// same pattern PluginArray uses.
 function Plugin(name, filename, description, mimeTypes) {
-  this.name = name;
-  this.filename = filename;
-  this.description = description;
   var mt = mimeTypes || [];
-  for (var _i = 0; _i < mt.length; _i++) this[_i] = mt[_i];
-  this.length = mt.length;
+  _pluginStates.set(this, { name, filename, description, length: mt.length, items: mt });
+  _pluginList(this, mt, (mime) => mime.type);
 }
-Plugin.prototype.item = function(i) { return this[i] || null; };
+Plugin.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
 Plugin.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
+  return _pluginState(this).items.find((mime) => mime.type === String(name)) || null;
 };
+_pluginGetters(Plugin.prototype, ['name', 'filename', 'description', 'length']);
 Plugin.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(Plugin.prototype, Symbol.toStringTag, {value: 'Plugin', configurable: true});
 _markNative(Plugin);
-_markNative(Plugin.prototype.item);
-_markNative(Plugin.prototype.namedItem);
 
 function MimeType(type, description, suffixes, plugin) {
-  this.type = type;
-  this.description = description;
-  this.suffixes = suffixes;
-  this.enabledPlugin = plugin || null;
+  _pluginStates.set(this, { type, description, suffixes, enabledPlugin: plugin || null });
 }
+_pluginGetters(MimeType.prototype, ['type', 'suffixes', 'description', 'enabledPlugin']);
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 
 function MimeTypeArray(items) {
-  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
-  this.length = items.length;
+  _pluginStates.set(this, { length: items.length, items });
+  _pluginList(this, items, (mime) => mime.type);
 }
-MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
+MimeTypeArray.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
 MimeTypeArray.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
+  return _pluginState(this).items.find((mime) => mime.type === String(name)) || null;
 };
+_pluginGetters(MimeTypeArray.prototype, ['length']);
 MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
 _markNative(MimeTypeArray);
-_markNative(MimeTypeArray.prototype.item);
-_markNative(MimeTypeArray.prototype.namedItem);
 
 globalThis.Navigator = Navigator;
 globalThis.PluginArray = PluginArray;
@@ -7816,17 +7833,22 @@ globalThis.navigator = {
   });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
+  // Chrome lists five PDF plugins that each handle both PDF MIME types; the
+  // MIME types are enabled by the first plugin.
+  var _pdfMimeStates = [];
+  var _pdfMimes = ["application/pdf", "text/pdf"].map(function(type) {
+    var mime = new MimeType(type, "Portable Document Format", "pdf", null);
+    _pdfMimeStates.push(_pluginStates.get(mime));
+    return mime;
+  });
   var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
-  var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-  ]);
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
+  ].map(function(name) {
+    return new Plugin(name, "internal-pdf-viewer", "Portable Document Format", _pdfMimes);
+  }));
+  _pdfMimeStates.forEach(function(state) { state.enabledPlugin = _plugins[0]; });
+  var _mimeTypes = new MimeTypeArray(_pdfMimes);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -7879,31 +7901,62 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
+// Screen state stays private: Chrome's screen object has no own properties and
+// every attribute is a prototype getter that rejects any other receiver.
+const _screenStates = new WeakMap();
+function _screenState(screen) {
+  const state = _screenStates.get(screen);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class ScreenOrientation {
+  get type() { return 'landscape-primary'; }
+  get angle() { return 0; }
+  get onchange() { return null; }
+  set onchange(value) {}
+  lock() { return Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError')); }
+  unlock() {}
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+Object.defineProperty(ScreenOrientation.prototype, Symbol.toStringTag, {value: 'ScreenOrientation', configurable: true});
 class Screen {
   constructor(w, h, availW, availH) {
-    this._w = w; this._h = h;
-    this._availW = availW === undefined ? w : availW;
-    this._availH = availH === undefined ? h - 40 : availH;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    _screenStates.set(this, {
+      width: w, height: h,
+      availWidth: availW === undefined ? w : availW,
+      availHeight: availH === undefined ? h - 40 : availH,
+      orientation: new ScreenOrientation(),
+    });
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._availW; }
-  get availHeight() { return this._availH; }
+  get availWidth() { return _screenState(this).availWidth; }
+  get availHeight() { return _screenState(this).availHeight; }
+  get width() { return _screenState(this).width; }
+  get height() { return _screenState(this).height; }
+  get colorDepth() { _screenState(this); return 24; }
+  get pixelDepth() { _screenState(this); return 24; }
+  get availLeft() { _screenState(this); return 0; }
+  get availTop() { _screenState(this); return 0; }
+  get orientation() { return _screenState(this).orientation; }
+  get onchange() { _screenState(this); return null; }
+  set onchange(value) { _screenState(this); }
+  get isExtended() { _screenState(this); return false; }
+  addEventListener() { _screenState(this); }
+  removeEventListener() { _screenState(this); }
+  dispatchEvent() { _screenState(this); return true; }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
-  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-  if (d && d.get) _markNative(d.get);
-});
+Object.defineProperty(Screen.prototype, Symbol.toStringTag, {value: 'Screen', configurable: true});
 globalThis.Screen = Screen;
+globalThis.ScreenOrientation = ScreenOrientation;
 globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated) {
-  if (globalThis.screen instanceof Screen) {
-    globalThis.screen._w = w;
-    globalThis.screen._h = h;
-    globalThis.screen._availW = w;
-    globalThis.screen._availH = emulated ? h : h - 40;
+  const state = _screenStates.get(globalThis.screen);
+  if (state) {
+    state.width = w;
+    state.height = h;
+    state.availWidth = w;
+    state.availHeight = emulated ? h : h - 40;
   } else {
     globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
   }
@@ -9210,6 +9263,29 @@ function _evaluateMediaFeature(raw) {
 
   const dimension = _evaluateMediaDimension(feature);
   if (dimension !== null) return dimension;
+
+  // Device metrics: the screen and the device pixel ratio, consistent with
+  // screen.width/height and window.devicePixelRatio.
+  let device = feature.match(/^(min-|max-)?device-(width|height)\s*:\s*(.+)$/);
+  if (device) {
+    const expected = _parseMediaPx(device[3]);
+    if (expected === null) return false;
+    const state = _screenStates.get(globalThis.screen);
+    const actual = state ? state[device[2]] : 0;
+    return device[1] === 'min-' ? actual >= expected : device[1] === 'max-' ? actual <= expected : actual === expected;
+  }
+  device = feature.match(/^(min-|max-)?resolution\s*:\s*([\d.]+)(dppx|x|dpi|dpcm)$/);
+  const ratio = device ? null : feature.match(/^-webkit-(min-|max-)?device-pixel-ratio\s*:\s*([\d.]+)$/);
+  if (device || ratio) {
+    let expected = Number((device || ratio)[2]);
+    if (device && device[3] === 'dpi') expected /= 96;
+    if (device && device[3] === 'dpcm') expected = expected * 2.54 / 96;
+    if (!Number.isFinite(expected)) return false;
+    const actual = Number(globalThis.devicePixelRatio) || 1;
+    const bound = (device || ratio)[1];
+    return bound === 'min-' ? actual >= expected - 1e-9 : bound === 'max-' ? actual <= expected + 1e-9
+      : Math.abs(actual - expected) < 1e-9;
+  }
 
   let match = feature.match(/^orientation\s*:\s*(portrait|landscape)$/);
   if (match) {
@@ -15090,12 +15166,17 @@ globalThis.AudioContext = class AudioContext {
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
-  createOscillator() { return {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}}; }
-  createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
+  createOscillator() {
+    const oscillator = {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}};
+    (this._oscillators || (this._oscillators = [])).push(oscillator);
+    return oscillator;
+  }
+  createDynamicsCompressor() { this._compressed = true; return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
   createAnalyser() {
     return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
-      getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
+      // An analyser reports silence until its context has rendered audio.
+      getByteFrequencyData(a){const live=this.context._rendered;for(let i=0;i<a.length;i++)a[i]=live?Math.floor(_fpRand(600+i)*10):0;},
+      getFloatFrequencyData(a){const live=this.context._rendered;for(let i=0;i<a.length;i++)a[i]=live?-100+_fpRand(700+i)*5:-Infinity;}
     };
   }
   createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
@@ -15128,14 +15209,22 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
     var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
     var freq = 10000, sr = 44100;
-    for (var i = 0; i < self.length; i++) {
-      var phase = ((i * freq / sr) % 1 + 1) % 1;
-      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    // A graph whose oscillators are all at 0 Hz renders silence.
+    var audible = (self._oscillators || []).some(function(o) { return Number(o.frequency.value) !== 0; });
+    if (audible) {
+      for (var i = 0; i < self.length; i++) {
+        var phase = ((i * freq / sr) % 1 + 1) % 1;
+        data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+      }
+      var s = 0;
+      for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
+      var scale = s > 0 ? target / s : 0;
+      for (var i = 0; i < self.length; i++) data[i] *= scale;
+      // A DynamicsCompressorNode delays its input by its 6 ms look-ahead, so
+      // the first 265 output frames at 44.1 kHz are silent.
+      if (self._compressed) for (var i = 0; i < Math.min(265, self.length); i++) data[i] = 0;
     }
-    var s = 0;
-    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
-    var scale = s > 0 ? target / s : 0;
-    for (var i = 0; i < self.length; i++) data[i] *= scale;
+    self._rendered = true;
     // Fire oncomplete + 'complete' listeners on next microtask so callers
     // can register handlers synchronously after startRendering().
     var p = Promise.resolve().then(function() {
@@ -15154,13 +15243,33 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
-globalThis.speechSynthesis = {
-  speaking: false, pending: false, paused: false,
-  getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
-  speak() {}, cancel() {}, pause() {}, resume() {},
-  addEventListener() {}, removeEventListener() {},
-  onvoiceschanged: null,
-};
+// speechSynthesis is a SpeechSynthesis instance with its attributes and
+// operations on the prototype, as in Chrome.
+const _speechStates = new WeakMap();
+function _speechState(receiver) {
+  const state = _speechStates.get(receiver);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class SpeechSynthesis {
+  get pending() { _speechState(this); return false; }
+  get speaking() { _speechState(this); return false; }
+  get paused() { _speechState(this); return false; }
+  get onvoiceschanged() { return _speechState(this).onvoiceschanged; }
+  set onvoiceschanged(value) { _speechState(this).onvoiceschanged = typeof value === 'function' ? value : null; }
+  getVoices() { _speechState(this); return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; }
+  speak() { _speechState(this); }
+  cancel() { _speechState(this); }
+  pause() { _speechState(this); }
+  resume() { _speechState(this); }
+  addEventListener() { _speechState(this); }
+  removeEventListener() { _speechState(this); }
+  dispatchEvent() { _speechState(this); return true; }
+}
+Object.defineProperty(SpeechSynthesis.prototype, Symbol.toStringTag, {value: 'SpeechSynthesis', configurable: true});
+globalThis.SpeechSynthesis = SpeechSynthesis;
+globalThis.speechSynthesis = new SpeechSynthesis();
+_speechStates.set(globalThis.speechSynthesis, { onvoiceschanged: null });
 globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { constructor(t){this.text=t;this.lang='en-US';this.rate=1;this.pitch=1;this.volume=1;} };
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
@@ -17845,6 +17954,176 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
       } catch (e) {}
     }
   }
+})();
+
+// Chrome's navigator object has no own properties: every attribute and
+// operation lives on Navigator.prototype. Move the shim's members there (the
+// literal's data fields and the getters on its intermediate prototype), keeping
+// each value's identity, so `Object.getOwnPropertyNames(navigator)` is empty and
+// the prototype describes the interface.
+(function _hoistNavigatorMembers() {
+  const nav = globalThis.navigator;
+  if (!nav || typeof Navigator !== 'function') return;
+  const proto = Navigator.prototype;
+  const holders = [];
+  for (let p = Object.getPrototypeOf(nav); p && p !== proto && p !== Object.prototype; p = Object.getPrototypeOf(p))
+    holders.push(p);
+  const define = (key, descriptor) => {
+    if (!Object.prototype.hasOwnProperty.call(proto, key)) Object.defineProperty(proto, key, descriptor);
+  };
+  for (const key of Reflect.ownKeys(nav)) {
+    const d = Object.getOwnPropertyDescriptor(nav, key);
+    if (!d || !d.configurable) continue;
+    if ('value' in d && typeof d.value === 'function') {
+      define(key, { value: d.value, writable: true, enumerable: true, configurable: true });
+    } else if ('value' in d) {
+      const value = d.value;
+      const get = Object.getOwnPropertyDescriptor({ get [key]() { return value; } }, key).get;
+      define(key, { get, set: undefined, enumerable: true, configurable: true });
+    } else {
+      define(key, { get: d.get, set: d.set, enumerable: true, configurable: true });
+    }
+    delete nav[key];
+  }
+  for (const holder of holders)
+    for (const key of Reflect.ownKeys(holder))
+      if (key !== 'constructor') define(key, Object.getOwnPropertyDescriptor(holder, key));
+  Object.setPrototypeOf(nav, proto);
+  Object.defineProperty(proto, Symbol.toStringTag, { value: 'Navigator', configurable: true });
+})();
+
+// Browser API members are implemented natively in Chrome, so each one is a
+// non-constructible function that owns exactly `length` and `name`, and an
+// attribute getter rejects a receiver that is not an instance ("Illegal
+// invocation"), including the interface prototype object itself. Shims
+// written as `function` expressions, or as getters that simply read a field,
+// differ on each of those points, and fingerprinting scripts test them on
+// every API they read. Rewrap the members that differ; class and shorthand
+// methods already have the native shape and are left untouched.
+(function _normalizeApiSurface() {
+  const reflectApply = Reflect.apply;
+  const ownKeys = Reflect.ownKeys;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const defineProperty = Object.defineProperty;
+  const hasOwn = Object.prototype.hasOwnProperty;
+  const realSource = (fn) => { try { return reflectApply(_origToString, fn, []); } catch (e) { return ''; } };
+  const isEngineNative = (fn) => /\{\s*\[native code\]\s*\}\s*$/.test(realSource(fn)) && !_nativeFns.has(fn) && !_nativeStr.has(fn);
+  // Native shape: not a constructor (no own `prototype`) and own keys exactly
+  // `length` and `name`.
+  const nativeShaped = (fn) => {
+    if (reflectApply(hasOwn, fn, ['prototype'])) return false;
+    const keys = ownKeys(fn);
+    return keys.length === 2 && keys.includes('length') && keys.includes('name')
+      && !/^bound /.test(fn.name);
+  };
+  // A prototype object (or a non-object) is never a valid receiver.
+  const illegalReceiver = (receiver) => receiver === null
+    || (typeof receiver !== 'object' && typeof receiver !== 'function')
+    || reflectApply(hasOwn, receiver, ['constructor']);
+  const illegal = () => { throw new TypeError('Illegal invocation'); };
+  const nativeString = (fn, fallback) => _nativeStr.get(fn) || fallback;
+  function rewrapMethod(fn, key) {
+    const wrapper = { [key](...args) { return reflectApply(fn, this, args); } }[key];
+    defineProperty(wrapper, 'length', { value: fn.length, configurable: true });
+    if (_nativeStr.has(fn)) _nativeStr.set(wrapper, _nativeStr.get(fn));
+    else _markNative(wrapper);
+    return wrapper;
+  }
+  function rewrapGetter(fn, key, guard) {
+    const wrapper = getDescriptor({ get [key]() {
+      if (guard && illegalReceiver(this)) illegal();
+      return reflectApply(fn, this, []);
+    } }, key).get;
+    _markNativeAs(wrapper, nativeString(fn, 'function ' + wrapper.name + '() { [native code] }'));
+    return wrapper;
+  }
+  function rewrapSetter(fn, key) {
+    const wrapper = getDescriptor({ set [key](value) { reflectApply(fn, this, [value]); } }, key).set;
+    _markNativeAs(wrapper, nativeString(fn, 'function ' + wrapper.name + '() { [native code] }'));
+    return wrapper;
+  }
+  // Interfaces whose attribute getters fingerprinting scripts read directly
+  // from the prototype. Other interfaces keep their getters unwrapped so hot
+  // DOM paths pay nothing. `true` guards every getter.
+  const guarded = {
+    Navigator: true, Screen: true, HTMLCanvasElement: true, OffscreenCanvas: true,
+    TextMetrics: true, FontFace: true, DOMRect: true, DOMRectReadOnly: true, SVGRect: true,
+    IntersectionObserverEntry: true, AudioBuffer: true, AnalyserNode: true,
+    BiquadFilterNode: true, MediaDevices: true, Permissions: true, StorageManager: true,
+    WebGLRenderingContext: true, WebGL2RenderingContext: true, Plugin: true,
+    PluginArray: true, MimeType: true, MimeTypeArray: true, NetworkInformation: true,
+    NavigatorUAData: true, BatteryManager: true, SpeechSynthesis: true, ScreenOrientation: true,
+    Document: ['referrer'],
+    Element: ['clientHeight', 'clientWidth', 'clientTop', 'clientLeft', 'offsetHeight',
+      'offsetWidth', 'offsetTop', 'offsetLeft', 'offsetParent', 'scrollHeight', 'scrollWidth',
+      'contentDocument', 'contentWindow'],
+  };
+  const seen = new Set();
+  // `statics`: a constructor or namespace object, whose capitalized members are
+  // nested interfaces (Intl.DateTimeFormat) and must stay constructible.
+  function normalize(holder, name, statics = false) {
+    if (!holder || (typeof holder !== 'object' && typeof holder !== 'function') || seen.has(holder)) return;
+    seen.add(holder);
+    const guard = statics ? undefined : guarded[name];
+    for (const key of ownKeys(holder)) {
+      if (key === 'constructor' || (typeof key === 'string' && key.charAt(0) === '_')) continue;
+      if (statics && (typeof key !== 'string' || /^[A-Z]/.test(key)
+        || key === 'prototype' || key === 'length' || key === 'name'
+        || key === 'caller' || key === 'arguments')) continue;
+      let d;
+      try { d = getDescriptor(holder, key); } catch (e) { continue; }
+      if (!d || !d.configurable) continue;
+      const label = typeof key === 'symbol' ? key : String(key);
+      try {
+        if (typeof d.value === 'function') {
+          const fn = d.value;
+          if (isEngineNative(fn) || nativeShaped(fn)) {
+            if (!isEngineNative(fn) && !_nativeStr.has(fn)) _markNative(fn);
+            continue;
+          }
+          d.value = rewrapMethod(fn, label);
+          defineProperty(holder, key, d);
+          continue;
+        }
+        // Static and global attributes (document, location, ...) are hot and
+        // not read from a prototype; leave their accessors alone.
+        if (statics) continue;
+        let changed = false;
+        if (typeof d.get === 'function' && !isEngineNative(d.get)) {
+          const wants = guard === true || (Array.isArray(guard) && guard.includes(key));
+          if (wants || !nativeShaped(d.get)) { d.get = rewrapGetter(d.get, label, wants); changed = true; }
+        }
+        if (typeof d.set === 'function' && !isEngineNative(d.set) && !nativeShaped(d.set)) {
+          d.set = rewrapSetter(d.set, label); changed = true;
+        }
+        if (changed) defineProperty(holder, key, d);
+      } catch (e) {}
+    }
+  }
+  // Interfaces that Obscura aliases (HTMLElement and HTMLIFrameElement share
+  // Element's prototype) are reached once, through that shared prototype.
+  const interfaces = [];
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (!/^[A-Z]/.test(name)) continue;
+    let value;
+    try { value = globalThis[name]; } catch (e) { continue; }
+    if (typeof value === 'function') {
+      if (value.prototype) normalize(value.prototype, value.name || name);
+      interfaces.push(value);
+    } else if (value && typeof value === 'object') {
+      // Namespaces (Math, JSON, Reflect, Intl, CSS) and their constructors.
+      interfaces.push(value);
+      for (const key of Object.getOwnPropertyNames(value)) {
+        let member;
+        try { member = getDescriptor(value, key).value; } catch (e) { continue; }
+        if (typeof member === 'function' && /^[A-Z]/.test(key) && member.prototype)
+          normalize(member.prototype, key);
+      }
+    }
+  }
+  for (const value of interfaces) normalize(value, '', true);
+  // Window operations are own properties of the global object.
+  normalize(globalThis, 'Window', true);
 })();
 
 (function _markBuiltinsNative() {
