@@ -1032,6 +1032,7 @@ impl ObscuraJsRuntime {
         {
             frame.stealth_client = parent.stealth_client.clone();
         }
+        frame.top_frame_url = Some(parent.top_frame_url.clone().unwrap_or_else(|| parent.url.clone()));
         // A frame realm shares the page transport, so its renderer cache must
         // not open synchronous requests either. Frame geometry currently
         // resolves against the main document's renderer state, so frame-scoped
@@ -2385,6 +2386,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "stealth")]
         let stealth_client = state.stealth_client.clone();
         let initiator = url::Url::parse(&state.url).ok();
+        let top_frame = state.top_frame_url.as_deref().and_then(|url| url::Url::parse(url).ok());
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
             // the in-flight marks so a later scan may retry.
@@ -2409,6 +2411,7 @@ impl ObscuraJsRuntime {
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
+                let top_frame = top_frame.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
                 let load = async move {
@@ -2433,6 +2436,7 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.top_frame = top_frame;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;

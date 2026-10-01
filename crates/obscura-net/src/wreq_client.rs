@@ -24,6 +24,8 @@ use crate::client::{
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
+#[cfg(feature = "stealth")]
+use crate::http_cache::{CacheLookup, HttpCache};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
 /// host *string*, so on its own it lets a public name that resolves inward
@@ -220,6 +222,8 @@ pub struct StealthHttpClient {
     pub extra_headers: RwLock<HashMap<String, String>>,
     user_agent_override: RwLock<Option<String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// The browser context's HTTP cache, shared by its pages.
+    http_cache: Option<Arc<HttpCache>>,
 }
 
 #[cfg(feature = "stealth")]
@@ -297,7 +301,18 @@ impl StealthHttpClient {
             extra_headers: RwLock::new(HashMap::new()),
             user_agent_override: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            http_cache: None,
         }
+    }
+
+    /// Use the browser context's HTTP cache for subresource requests.
+    pub fn with_http_cache(mut self, cache: Option<Arc<HttpCache>>) -> Self {
+        self.http_cache = cache;
+        self
+    }
+
+    pub fn http_cache(&self) -> Option<&Arc<HttpCache>> {
+        self.http_cache.as_ref()
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -390,6 +405,72 @@ impl StealthHttpClient {
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
+        // Subresource GETs go through the context's HTTP cache. Documents,
+        // bodies and requests carrying caller cache directives or credentials
+        // headers bypass it, as do requests whose headers Chrome would not
+        // cache under (Authorization, Cache-Control, Pragma, Range).
+        let cache = self.http_cache.as_ref().filter(|_| {
+            method == wreq::Method::GET
+                && body.is_none()
+                && request.mode != RequestMode::Navigate
+                && !["authorization", "cache-control", "pragma", "range", "if-none-match", "if-modified-since"]
+                    .iter()
+                    .any(|name| request_headers.keys().any(|key| key.eq_ignore_ascii_case(name)))
+        });
+        let cache_key = cache.map(|_| crate::http_cache::cache_key(
+            request.top_frame.as_ref(),
+            request.initiator.as_ref(),
+            url,
+            request.sends_credentials_to(url),
+        ));
+        let mut conditional: Vec<(&'static str, String)> = Vec::new();
+        // Values sent for this request, recorded before any response can
+        // change the cookie jar (Vary is matched against what was sent).
+        let sent = if cache.is_some() {
+            self.cache_request_headers(&request, url, &request_headers)
+        } else {
+            HashMap::new()
+        };
+        if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
+            let lookup = cache.lookup(
+                key,
+                &|name| sent.get(name).cloned(),
+                request.max_response_bytes,
+                std::time::SystemTime::now(),
+            );
+            match lookup {
+                CacheLookup::Fresh(response) => {
+                    let request_info = RequestInfo {
+                        url: url.clone(),
+                        method: method.to_string(),
+                        headers: sent.clone(),
+                        resource_type: request.resource_type,
+                    };
+                    if let Some(callbacks) = callbacks {
+                        callbacks.fire_request(&request_info).await;
+                    }
+                    // CORS is checked against the stored response for every
+                    // use, exactly as for a network response.
+                    if cors_required(&request, url) {
+                        validate_cors_response(
+                            &request,
+                            url,
+                            &serialized_request_origin(&request, false),
+                            response.header("access-control-allow-origin"),
+                            response.header("access-control-allow-credentials"),
+                        )?;
+                    }
+                    if let Some(callbacks) = callbacks {
+                        callbacks.fire_response(&request_info, &response).await;
+                    }
+                    return Ok(response);
+                }
+                CacheLookup::Revalidate(headers) => conditional = headers,
+                CacheLookup::Miss => {}
+            }
+        }
+        let request_time = std::time::SystemTime::now();
+
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
@@ -426,6 +507,14 @@ impl StealthHttpClient {
             if !cookie_header.is_empty() {
                 req = req.header("Cookie", &cookie_header);
             }
+            // Cache validators come last, after the cookie, as in Chrome
+            // (HttpCache::Transaction adds them to the finished request).
+            let revalidating = redirects.is_empty() && !conditional.is_empty();
+            if revalidating {
+                for (name, value) in &conditional {
+                    req = req.header(*name, value);
+                }
+            }
 
             // wreq's single-header builder appends. Replace browser-derived
             // values explicitly so Accept/Cookie and caller overrides stay singular.
@@ -440,6 +529,11 @@ impl StealthHttpClient {
             observed_headers.remove("origin");
             if cors_required(&request, &current_url) {
                 observed_headers.insert("origin".into(), request_origin.clone());
+            }
+            if revalidating {
+                for (name, value) in &conditional {
+                    observed_headers.insert((*name).to_string(), value.clone());
+                }
             }
             if let Some(bytes) = &body {
                 let mut form_headers = wreq::header::HeaderMap::new();
@@ -509,6 +603,24 @@ impl StealthHttpClient {
                 last.response_headers=response_headers.clone();
             }
 
+            if revalidating && status.as_u16() == 304 {
+                drop(resp);
+                drop(in_flight);
+                let refreshed = match (cache, cache_key.as_deref()) {
+                    (Some(cache), Some(key)) => cache.refresh(key, &response_headers, request_time, std::time::SystemTime::now()),
+                    _ => None,
+                };
+                if let Some(response) = refreshed {
+                    if let Some(callbacks) = callbacks {
+                        callbacks.fire_response(&request_info, &response).await;
+                    }
+                    return Ok(response);
+                }
+                // The entry vanished (evicted) between lookup and response:
+                // fetch it again without validators.
+                return Box::pin(self.fetch_with_profile_traced(method, url, None, request, callbacks, trace)).await;
+            }
+
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location") {
                     let location_str = location.to_str().map_err(|_| {
@@ -547,6 +659,13 @@ impl StealthHttpClient {
                 body,
                 redirected_from: redirects,
             };
+            if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
+                if response.redirected_from.is_empty() {
+                    cache.store(key, &response, &|name| sent.get(name).cloned(), request_time, std::time::SystemTime::now());
+                } else {
+                    cache.remove(key);
+                }
+            }
             if let Some(callbacks) = callbacks {
                 callbacks.fire_response(&request_info, &response).await;
             }
@@ -554,6 +673,41 @@ impl StealthHttpClient {
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
+    }
+
+    /// Request header values for the HTTP cache: the headers this client sets
+    /// for `request` (Vary matching and the observed request on a cache hit).
+    /// Profile-wide emulation headers (user-agent, client hints,
+    /// accept-encoding, accept-language) are constant per client, so a stored
+    /// response that varies on them always matches its own profile.
+    fn cache_request_headers(
+        &self,
+        request: &ResourceRequest,
+        url: &Url,
+        request_headers: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut headers = request_headers.clone();
+        headers.insert("accept".into(), request.accept().to_string());
+        headers.insert("sec-fetch-site".into(), request_fetch_site(request, url).to_string());
+        headers.insert("sec-fetch-mode".into(), request.mode.header_value().to_string());
+        headers.insert("sec-fetch-dest".into(), request.destination().to_string());
+        if let Some(referer) = request_referrer(request, url) {
+            headers.insert("referer".into(), referer);
+        }
+        headers.remove("origin");
+        if cors_required(request, url) {
+            headers.insert("origin".into(), serialized_request_origin(request, false));
+        }
+        if request.sends_credentials_to(url) {
+            let cookie = self.cookie_jar.get_cookie_header_in_context(
+                url,
+                same_site_context(request, url, true),
+            );
+            if !cookie.is_empty() {
+                headers.insert("cookie".into(), cookie);
+            }
+        }
+        headers
     }
 
     /// One request with no redirect following, for scripted fetch()/XHR. The
@@ -967,6 +1121,7 @@ mod tests {
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             user_agent_override: tokio::sync::RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            http_cache: None,
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client
