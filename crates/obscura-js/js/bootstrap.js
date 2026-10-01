@@ -16875,8 +16875,121 @@ if (typeof FontFace === 'undefined') {
 }
 
 if (typeof SharedWorker === 'undefined') {
+  // A shared worker runs its script once per document for each (URL, name).
+  // Every constructor call gets a new MessageChannel: the page keeps port1 and
+  // the worker receives port2 in a 'connect' event, as in a browser. Like the
+  // Worker shim, the script runs in this realm, under a scope object that
+  // stands in for SharedWorkerGlobalScope and falls back to the realm for
+  // every other name. A port that never connected made scripts wait for a
+  // reply until their own timeout.
+  const sharedWorkers = new Map();
+  const connect = (instance, port) => {
+    setTimeout(() => {
+      const scope = instance.scope;
+      if (!scope || instance.closed) return;
+      const event = { type: 'connect', data: '', origin: '', lastEventId: '', source: port, ports: [port] };
+      try {
+        if (typeof scope.onconnect === 'function') scope.onconnect.call(scope, event);
+        for (const handler of ((scope._ev && scope._ev.connect) || []).slice()) handler.call(scope, event);
+      } catch (e) {
+        console.error('SharedWorker error:', e && e.message);
+      }
+    }, 0);
+  };
+  const fail = (instance, error) => {
+    instance.failed = true;
+    for (const owner of instance.owners) {
+      const event = { type: 'error', message: String(error && error.message || error), error };
+      try {
+        if (typeof owner.onerror === 'function') owner.onerror(event);
+        for (const handler of (owner._listeners.error || []).slice()) handler.call(owner, event);
+      } catch (_) {}
+    }
+  };
+  const start = (instance, code) => {
+    if (instance.closed) return;
+    const scope = Object.create(globalThis);
+    Object.assign(scope, {
+      onconnect: null,
+      name: instance.name,
+      document: undefined,
+      window: undefined,
+      parent: undefined,
+      top: undefined,
+      frames: undefined,
+      postMessage: undefined,
+      WorkerGlobalScope: function WorkerGlobalScope() {},
+      SharedWorkerGlobalScope: function SharedWorkerGlobalScope() {},
+      addEventListener: (type, fn) => {
+        if (typeof fn !== 'function') return;
+        if (!scope._ev) scope._ev = {};
+        (scope._ev[type] || (scope._ev[type] = [])).push(fn);
+      },
+      removeEventListener: (type, fn) => {
+        if (scope._ev && scope._ev[type]) scope._ev[type] = scope._ev[type].filter(h => h !== fn);
+      },
+      close: () => { instance.closed = true; },
+    });
+    scope.self = scope;
+    scope.globalThis = scope;
+    try {
+      const run = new Function('scope', 'source', 'with (scope) { eval(source); }');
+      run.call(scope, scope, code);
+    } catch (e) {
+      console.error('SharedWorker error:', e && e.message);
+      fail(instance, e);
+      return;
+    }
+    instance.scope = scope;
+    for (const port of instance.pending.splice(0)) connect(instance, port);
+  };
   globalThis.SharedWorker = class SharedWorker {
-    constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
+    constructor(url, options) {
+      if (arguments.length === 0) {
+        throw new TypeError("Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+      }
+      const name = typeof options === 'string' ? options
+        : options && options.name !== undefined ? String(options.name) : '';
+      let resolved = String(url);
+      if (!resolved.startsWith('blob:') && !resolved.startsWith('data:')) {
+        try { resolved = new URL(resolved, globalThis.location?.href || undefined).href; } catch (e) {}
+      }
+      const channel = new MessageChannel();
+      this.port = channel.port1;
+      this.onerror = null;
+      this._listeners = {};
+      const key = resolved + '\0' + name;
+      let instance = sharedWorkers.get(key);
+      if (!instance) {
+        instance = { name, scope: null, pending: [], owners: [], closed: false, failed: false };
+        sharedWorkers.set(key, instance);
+        const blob = globalThis.__blobStore?.[resolved];
+        if (blob !== undefined) {
+          setTimeout(() => start(instance, blob), 0);
+        } else {
+          (async () => {
+            try {
+              const response = await fetch(resolved);
+              if (!response.ok) throw new Error('Failed to load ' + resolved);
+              start(instance, await response.text());
+            } catch (e) {
+              fail(instance, e);
+            }
+          })();
+        }
+      }
+      instance.owners.push(this);
+      if (instance.failed) return;
+      if (instance.scope) connect(instance, channel.port2);
+      else instance.pending.push(channel.port2);
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners[type]) this._listeners[type] = [];
+      this._listeners[type].push(fn);
+    }
+    removeEventListener(type, fn) {
+      if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+    }
   };
 }
 if (typeof ServiceWorkerContainer === 'undefined') {
