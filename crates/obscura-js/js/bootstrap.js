@@ -15579,8 +15579,157 @@ navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not a
 
 globalThis.opener = null;
 
+// Worker scripts run in this realm inside `with (scope)`, so every name the
+// scope does not define resolves to the window global. A worker therefore saw
+// `window`, `document`, `screen`, `devicePixelRatio`, `localStorage` and the
+// DOM interfaces, which no WorkerGlobalScope has, and `'document' in self` or
+// `typeof window` exposed the shim. Shadow the window-only names on the scope
+// with configurable accessors that read as undefined, and expose the scope
+// through a proxy whose `self`/`globalThis` report them absent, as a worker
+// does. Assigning one of these names (`self.window = self`, a common worker
+// polyfill) defines it as an ordinary global again. The proxy also gives the
+// scope its worker prototype chain and toStringTag. Names that workers have
+// (navigator, location, timers, fetch, crypto, OffscreenCanvas, WebGL, ...)
+// still resolve to this realm, so the worker identity matches the page.
+const _workerGlobalScope = (() => {
+  const windowOnly = new Set([
+    'window', 'document', 'parent', 'top', 'frames', 'opener', 'frameElement', 'length', 'closed',
+    'status', 'event', 'external', 'clientInformation', 'styleMedia', 'chrome', 'history', 'navigation',
+    'screen', 'devicePixelRatio', 'innerWidth', 'innerHeight', 'outerWidth', 'outerHeight', 'screenX',
+    'screenY', 'screenLeft', 'screenTop', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset',
+    'visualViewport', 'scroll', 'scrollTo', 'scrollBy', 'moveTo', 'moveBy', 'resizeTo', 'resizeBy',
+    'localStorage', 'sessionStorage', 'alert', 'confirm', 'prompt', 'print', 'open', 'stop', 'focus',
+    'blur', 'find', 'captureEvents', 'releaseEvents', 'getComputedStyle', 'getSelection', 'matchMedia',
+    'requestIdleCallback', 'cancelIdleCallback', 'customElements', 'speechSynthesis', 'cookieStore',
+    'toolbar', 'menubar', 'locationbar', 'personalbar', 'scrollbars', 'statusbar', 'originAgentCluster',
+    'credentialless', 'launchQueue', 'documentPictureInPicture', 'sharedStorage', 'getScreenDetails',
+    'queryLocalFonts', 'showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker', 'fence',
+    'Window', 'Document', 'XMLDocument', 'DocumentFragment', 'DocumentType', 'Node', 'NodeList',
+    'NodeFilter', 'NodeIterator', 'TreeWalker', 'NamedNodeMap', 'Element', 'Attr', 'CharacterData',
+    'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'ShadowRoot', 'Range', 'StaticRange',
+    'AbstractRange', 'Selection', 'MutationObserver', 'MutationRecord', 'IntersectionObserver',
+    'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry', 'ResizeObserverSize',
+    'DOMParser', 'XMLSerializer', 'XSLTProcessor', 'XPathResult', 'XPathEvaluator', 'XPathExpression',
+    'DOMImplementation', 'DOMTokenList', 'DOMStringMap', 'DOMRectList', 'RadioNodeList',
+    'ValidityState', 'ElementInternals', 'CustomElementRegistry', 'CustomStateSet', 'StyleSheet',
+    'StyleSheetList', 'CSS', 'MediaList', 'MediaQueryList', 'MediaQueryListEvent', 'Screen',
+    'ScreenOrientation', 'VisualViewport', 'BarProp', 'External', 'History', 'Navigation', 'Storage',
+    'StorageEvent', 'Navigator', 'Location', 'Plugin', 'PluginArray', 'MimeType', 'MimeTypeArray',
+    'Image', 'Audio', 'Option', 'IdleDeadline', 'SharedWorker', 'CanvasRenderingContext2D',
+    'Geolocation', 'GeolocationPosition', 'GeolocationCoordinates', 'GeolocationPositionError',
+    'Clipboard', 'ClipboardItem', 'ClipboardEvent', 'DataTransfer', 'DataTransferItem',
+    'DataTransferItemList', 'MediaDevices', 'MediaStream', 'MediaStreamTrack', 'MediaRecorder', 'RTCPeerConnection',
+    'RTCIceCandidate', 'RTCSessionDescription', 'RTCPeerConnectionIceEvent', 'SpeechSynthesis',
+    'SpeechSynthesisUtterance', 'SpeechSynthesisEvent', 'SpeechSynthesisErrorEvent',
+    'SpeechSynthesisVoice', 'BatteryManager', 'Gamepad', 'GamepadButton', 'GamepadEvent',
+    'AudioContext', 'BaseAudioContext', 'OfflineAudioContext', 'OfflineAudioCompletionEvent',
+    'AudioBuffer', 'AudioParam', 'AudioParamMap', 'AudioListener', 'AudioProcessingEvent',
+    'AudioWorklet', 'PeriodicWave', 'TextTrack', 'TextTrackCue', 'TextTrackCueList', 'TextTrackList',
+    'VTTCue', 'TimeRanges', 'Animation', 'AnimationEffect', 'AnimationTimeline', 'KeyframeEffect',
+    'DocumentTimeline', 'PerformanceNavigation', 'PerformanceTiming', 'PerformanceNavigationTiming',
+    'PerformancePaintTiming', 'PerformanceEventTiming', 'LargestContentfulPaint', 'LayoutShift',
+    'UIEvent', 'MouseEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'PointerEvent',
+    'WheelEvent', 'CompositionEvent', 'DragEvent', 'TouchEvent', 'Touch', 'TouchList',
+    'HashChangeEvent', 'PopStateEvent', 'PageTransitionEvent', 'BeforeUnloadEvent', 'AnimationEvent',
+    'TransitionEvent', 'SubmitEvent', 'FormDataEvent', 'ToggleEvent', 'DeviceOrientationEvent',
+    'DeviceMotionEvent', 'Highlight', 'HighlightRegistry', 'CaretPosition',
+  ]);
+  // HTML*/SVG*/MathML* elements and collections, CSSOM rules and sheets,
+  // prefixed window APIs (webkitURL, webkitRTCPeerConnection, ...; workers do
+  // have the webkit file system entry points) and the audio graph nodes are
+  // window-only.
+  const windowOnlyPattern = /^(?:HTML|SVG|MathML|webkit(?!RequestFileSystem|ResolveLocalFileSystem))|^CSS\w*(?:Rule|Sheet|Declaration|List)$|Node$/;
+  // Event handler attributes a worker global scope has; every other `on*`
+  // global (onclick, onresize, onbeforeunload, ...) belongs to Window.
+  const workerHandlers = new Set(['onmessage', 'onmessageerror', 'onerror', 'onlanguagechange',
+    'onrejectionhandled', 'onunhandledrejection', 'onconnect', 'onrtctransform']);
+  // Present on DedicatedWorkerGlobalScope but not on SharedWorkerGlobalScope
+  // (Chrome has no nested workers in a shared worker).
+  const dedicatedOnly = new Set(['postMessage', 'requestAnimationFrame', 'cancelAnimationFrame', 'Worker']);
+  const isWindowOnly = (key, kind) =>
+    windowOnly.has(key) ||
+    (kind === 'shared' && dedicatedOnly.has(key)) ||
+    (key[0] !== '_' && windowOnlyPattern.test(key)) ||
+    (/^on[a-z]/.test(key) && !workerHandlers.has(key));
+  const iface = (name, parent) => {
+    const ctor = _markNative({ [name]: function () { throw new TypeError('Illegal constructor'); } }[name]);
+    Object.setPrototypeOf(ctor, parent);
+    ctor.prototype = Object.create(parent.prototype, {
+      constructor: { value: ctor, writable: true, enumerable: false, configurable: true },
+      [Symbol.toStringTag]: { value: name, writable: false, enumerable: false, configurable: true },
+    });
+    Object.defineProperty(ctor, 'prototype', { writable: false, enumerable: false, configurable: false });
+    return ctor;
+  };
+  const eventTarget = typeof globalThis.EventTarget === 'function' ? globalThis.EventTarget : Object;
+  const WorkerGlobalScope = iface('WorkerGlobalScope', eventTarget);
+  const scopes = {
+    dedicated: iface('DedicatedWorkerGlobalScope', WorkerGlobalScope),
+    shared: iface('SharedWorkerGlobalScope', WorkerGlobalScope),
+  };
+  const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+
+  // `own` holds the members the worker scope defines itself. Returns the
+  // object to run the script `with`, and the `self` that scripts observe.
+  return function make(kind, own) {
+    const ctor = scopes[kind];
+    const scope = {};
+    const hidden = new Set();
+    const consider = (key) => {
+      if (typeof key === 'string' && !hasOwn(own, key) && !hidden.has(key) && isWindowOnly(key, kind)) hidden.add(key);
+    };
+    for (const key of windowOnly) if (key in globalThis) consider(key);
+    for (const key of dedicatedOnly) if (key in globalThis) consider(key);
+    for (let o = globalThis; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      for (const key of Object.getOwnPropertyNames(o)) consider(key);
+    }
+    const expose = (key, value) => {
+      hidden.delete(key);
+      Object.defineProperty(scope, key, { value, writable: true, enumerable: true, configurable: true });
+    };
+    for (const key of hidden) {
+      Object.defineProperty(scope, key, {
+        get() { return undefined; },
+        set(value) { expose(key, value); },
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    Object.assign(scope, own, { WorkerGlobalScope, [ctor.name]: ctor });
+    const self = new Proxy(scope, {
+      get(target, key, receiver) {
+        if (hidden.has(key)) return undefined;
+        if (hasOwn(target, key)) return target[key];
+        if (key === 'constructor' || key === Symbol.toStringTag) return ctor.prototype[key];
+        if (key in Object.prototype) return Reflect.get(target, key, receiver);
+        return globalThis[key];
+      },
+      has(target, key) { return !hidden.has(key) && (key in target || key in globalThis); },
+      set(target, key, value) {
+        if (hidden.has(key)) { expose(key, value); return true; }
+        return Reflect.set(target, key, value);
+      },
+      defineProperty(target, key, descriptor) {
+        const defined = Reflect.defineProperty(target, key, descriptor);
+        if (defined) hidden.delete(key);
+        return defined;
+      },
+      deleteProperty(target, key) { return hidden.has(key) || Reflect.deleteProperty(target, key); },
+      getOwnPropertyDescriptor(target, key) {
+        return hidden.has(key) ? undefined : Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      ownKeys(target) { return Reflect.ownKeys(target).filter((key) => !hidden.has(key)); },
+      getPrototypeOf() { return ctor.prototype; },
+    });
+    scope.self = self;
+    scope.globalThis = self;
+    return { scope, self };
+  };
+})();
+
 globalThis.Worker = class Worker {
-  constructor(url) {
+  constructor(url, options) {
+    this._name = options && typeof options === 'object' && options.name !== undefined ? String(options.name) : '';
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
@@ -15613,10 +15762,12 @@ globalThis.Worker = class Worker {
   }
   _makeScope() {
     const worker = this;
-    const scope = {
+    const listeners = {};
+    const { scope, self } = _workerGlobalScope('dedicated', {
+      name: worker._name,
       onmessage: null,
-      WorkerGlobalScope: function WorkerGlobalScope() {},
-      DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
+      onmessageerror: null,
+      onerror: null,
       postMessage: (msg) => {
         if (worker._terminated) return;
         const evt = { data: msg };
@@ -15625,9 +15776,18 @@ globalThis.Worker = class Worker {
         for (const h of ls) h(evt);
       },
       addEventListener: (type, fn) => {
-        if (!scope._ev) scope._ev = {};
-        if (!scope._ev[type]) scope._ev[type] = [];
-        scope._ev[type].push(fn);
+        if (typeof fn !== 'function') return;
+        (listeners[type] || (listeners[type] = [])).push(fn);
+      },
+      removeEventListener: (type, fn) => {
+        if (listeners[type]) listeners[type] = listeners[type].filter(h => h !== fn);
+      },
+      dispatchEvent: (event) => {
+        const type = event && event.type;
+        const handler = scope['on' + type];
+        if (typeof handler === 'function') handler.call(self, event);
+        for (const h of (listeners[type] || []).slice()) h.call(self, event);
+        return true;
       },
       close: () => { worker.terminate(); },
       crypto: globalThis.crypto,
@@ -15646,8 +15806,9 @@ globalThis.Worker = class Worker {
       console: globalThis.console,
       performance: globalThis.performance,
       location: globalThis.location,
-    };
-    scope.self = scope;
+    });
+    worker._self = self;
+    worker._scopeListeners = listeners;
     return scope;
   }
   _autoRun() {
@@ -15657,7 +15818,7 @@ globalThis.Worker = class Worker {
       // Direct eval preserves script directives and resolves bare handler names
       // against the worker scope. Run once so message closures retain their state.
       const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      fn.call(this._self, scope, this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
       if (this.onerror) this.onerror(e);
@@ -15678,11 +15839,12 @@ globalThis.Worker = class Worker {
     setTimeout(() => {
       if (worker._terminated || !worker._scope) return;
       const scope = worker._scope;
+      const self = worker._self;
       try {
         const event = { data };
-        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
-        const evs = (scope._ev && scope._ev['message']) || [];
-        for (const handler of evs.slice()) handler.call(scope, event);
+        if (typeof scope.onmessage === 'function') scope.onmessage.call(self, event);
+        const evs = worker._scopeListeners['message'] || [];
+        for (const handler of evs.slice()) handler.call(self, event);
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
@@ -17108,9 +17270,9 @@ if (typeof SharedWorker === 'undefined') {
   // Every constructor call gets a new MessageChannel: the page keeps port1 and
   // the worker receives port2 in a 'connect' event, as in a browser. Like the
   // Worker shim, the script runs in this realm, under a scope object that
-  // stands in for SharedWorkerGlobalScope and falls back to the realm for
-  // every other name. A port that never connected made scripts wait for a
-  // reply until their own timeout.
+  // stands in for SharedWorkerGlobalScope (see _workerGlobalScope) and falls
+  // back to the realm for the names a worker has. A port that never connected
+  // made scripts wait for a reply until their own timeout.
   const sharedWorkers = new Map();
   const connect = (instance, port) => {
     setTimeout(() => {
@@ -17118,8 +17280,8 @@ if (typeof SharedWorker === 'undefined') {
       if (!scope || instance.closed) return;
       const event = { type: 'connect', data: '', origin: '', lastEventId: '', source: port, ports: [port] };
       try {
-        if (typeof scope.onconnect === 'function') scope.onconnect.call(scope, event);
-        for (const handler of ((scope._ev && scope._ev.connect) || []).slice()) handler.call(scope, event);
+        if (typeof scope.onconnect === 'function') scope.onconnect.call(instance.self, event);
+        for (const handler of (instance.listeners.connect || []).slice()) handler.call(instance.self, event);
       } catch (e) {
         console.error('SharedWorker error:', e && e.message);
       }
@@ -17137,33 +17299,32 @@ if (typeof SharedWorker === 'undefined') {
   };
   const start = (instance, code) => {
     if (instance.closed) return;
-    const scope = Object.create(globalThis);
-    Object.assign(scope, {
+    const listeners = {};
+    const { scope, self } = _workerGlobalScope('shared', {
       onconnect: null,
+      onerror: null,
       name: instance.name,
-      document: undefined,
-      window: undefined,
-      parent: undefined,
-      top: undefined,
-      frames: undefined,
-      postMessage: undefined,
-      WorkerGlobalScope: function WorkerGlobalScope() {},
-      SharedWorkerGlobalScope: function SharedWorkerGlobalScope() {},
       addEventListener: (type, fn) => {
         if (typeof fn !== 'function') return;
-        if (!scope._ev) scope._ev = {};
-        (scope._ev[type] || (scope._ev[type] = [])).push(fn);
+        (listeners[type] || (listeners[type] = [])).push(fn);
       },
       removeEventListener: (type, fn) => {
-        if (scope._ev && scope._ev[type]) scope._ev[type] = scope._ev[type].filter(h => h !== fn);
+        if (listeners[type]) listeners[type] = listeners[type].filter(h => h !== fn);
+      },
+      dispatchEvent: (event) => {
+        const type = event && event.type;
+        const handler = scope['on' + type];
+        if (typeof handler === 'function') handler.call(self, event);
+        for (const h of (listeners[type] || []).slice()) h.call(self, event);
+        return true;
       },
       close: () => { instance.closed = true; },
     });
-    scope.self = scope;
-    scope.globalThis = scope;
+    instance.self = self;
+    instance.listeners = listeners;
     try {
       const run = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      run.call(scope, scope, code);
+      run.call(self, scope, code);
     } catch (e) {
       console.error('SharedWorker error:', e && e.message);
       fail(instance, e);

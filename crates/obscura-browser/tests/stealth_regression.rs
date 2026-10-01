@@ -32,6 +32,10 @@
 //!   report the top document's screen, both the profile's randomized one and
 //!   a CDP device-metrics override (screen and devicePixelRatio), including
 //!   one applied or cleared live.
+//! - `worker_global_scopes_*`: dedicated, nested and shared workers have no
+//!   window-only globals (`window`, `document`, `screen`, `devicePixelRatio`,
+//!   storage, DOM interfaces) by `typeof` or `in self`, keep the globals a
+//!   worker has, and report the page's navigator identity.
 //! - `real_libraries_*` (ignored, opt-in, needs network): downloads pinned
 //!   FingerprintJS and CreepJS builds (sha256-checked, never committed) and
 //!   applies the same gates to the real libraries.
@@ -826,6 +830,113 @@ async fn frames_report_the_top_document_screen_with_and_without_device_emulation
     page.navigate(&format!("{}/page?step=restored", server.base)).await.unwrap();
     wait_for_frames(&mut page, 2).await;
     assert_eq!(assert_frames_report_top_screen(&mut page, "navigation after clearing"), native);
+}
+
+// ---------------------------------------------------------------------------
+// Worker global scopes.
+
+/// Probes the global scope of a dedicated worker, a dedicated worker nested in
+/// it and a shared worker. A WorkerGlobalScope has no `window`, `document`,
+/// `screen`, `devicePixelRatio`, storage, dialogs or DOM interfaces, so `typeof`
+/// reads 'undefined' and `name in self` is false; detectors (CreepJS's worker
+/// checks among them) compare that with the page. What a worker does have,
+/// including its navigator identity, must still match the page.
+const WORKER_SCOPE_PROBE: &str = r#"(() => {
+  const windowOnly = ['window', 'document', 'screen', 'devicePixelRatio', 'innerWidth', 'innerHeight',
+    'outerWidth', 'outerHeight', 'screenX', 'screenY', 'scrollX', 'pageYOffset', 'visualViewport',
+    'localStorage', 'sessionStorage', 'alert', 'confirm', 'prompt', 'open', 'print', 'stop', 'focus',
+    'history', 'frames', 'parent', 'top', 'opener', 'frameElement', 'length', 'customElements',
+    'getComputedStyle', 'getSelection', 'matchMedia', 'requestIdleCallback', 'speechSynthesis', 'chrome',
+    'Window', 'Document', 'Node', 'Element', 'HTMLElement', 'HTMLCanvasElement', 'HTMLDocument',
+    'CanvasRenderingContext2D', 'Screen', 'Storage', 'Navigator', 'Location', 'Image', 'Audio',
+    'MutationObserver', 'IntersectionObserver', 'ResizeObserver', 'DOMParser', 'MouseEvent',
+    'KeyboardEvent', 'AudioContext', 'OfflineAudioContext', 'webkitAudioContext', 'RTCPeerConnection',
+    'SVGElement', 'CSSStyleDeclaration', 'SharedWorker', 'MediaStreamTrack', 'onclick', 'onresize', 'onload',
+    'ononline'];
+  const sharedAlsoLacks = ['postMessage', 'requestAnimationFrame', 'cancelAnimationFrame', 'Worker'];
+  const common = ['self', 'globalThis', 'navigator', 'location', 'name', 'close', 'addEventListener',
+    'removeEventListener', 'dispatchEvent', 'setTimeout', 'setInterval', 'clearTimeout', 'fetch',
+    'crypto', 'performance', 'console', 'atob', 'TextEncoder', 'structuredClone', 'queueMicrotask',
+    'Blob', 'URL', 'Promise', 'Intl', 'WebAssembly', 'WorkerGlobalScope'];
+  const dedicatedHas = [...common, 'postMessage', 'onmessage', 'Worker', 'requestAnimationFrame',
+    'DedicatedWorkerGlobalScope'];
+  const sharedHas = [...common, 'onconnect', 'SharedWorkerGlobalScope'];
+  function probe(kind, absent, present) {
+    const leaks = [];
+    for (const n of absent) {
+      const type = eval('typeof ' + n);
+      if (type !== 'undefined' || n in self || self[n] !== undefined || Object.getOwnPropertyNames(self).includes(n)) {
+        leaks.push(n + ':' + type + ':' + (n in self));
+      }
+    }
+    const missing = present.filter((n) => eval('typeof ' + n) === 'undefined' || !(n in self));
+    const other = kind === 'shared' ? 'DedicatedWorkerGlobalScope' : 'SharedWorkerGlobalScope';
+    const result = {
+      leaks, missing,
+      otherScope: eval('typeof ' + other) + ':' + (other in self),
+      tag: Object.prototype.toString.call(self),
+      sameGlobal: globalThis === self && self.self === self && topLevelThis === self,
+      isWorkerScope: self instanceof WorkerGlobalScope,
+      identity: [navigator.userAgent, navigator.platform, navigator.hardwareConcurrency, navigator.deviceMemory,
+        navigator.languages.join(), Intl.DateTimeFormat().resolvedOptions().timeZone, typeof OffscreenCanvas],
+    };
+    // A common worker polyfill: assigning a window-only name defines it.
+    self.window = self;
+    result.polyfill = typeof window === 'object' && window === self && 'window' in self;
+    return result;
+  }
+  const blobUrl = (source) => URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+  const header = `const topLevelThis = this; const probe = ${probe}; const absent = ${JSON.stringify(windowOnly)};`
+    + ` const present = ${JSON.stringify(dedicatedHas)};`;
+  const nestedSource = header + ` onmessage = () => postMessage(probe.call(self, 'nested', absent, present));`;
+  const dedicatedSource = header + ` const nestedSource = ${JSON.stringify(nestedSource)};
+    onmessage = () => {
+      const nested = new Worker(URL.createObjectURL(new Blob([nestedSource], { type: 'text/javascript' })));
+      nested.onmessage = (event) => postMessage({ outer: probe.call(self, 'dedicated', absent, present), nested: event.data });
+      nested.postMessage(1);
+    };`;
+  const sharedSource = `const topLevelThis = this; const probe = ${probe};`
+    + ` onconnect = (event) => event.ports[0].postMessage(probe.call(self, 'shared', ${JSON.stringify([...windowOnly, ...sharedAlsoLacks])}, ${JSON.stringify(sharedHas)}));`;
+  const result = {
+    page: windowOnly.filter((n) => n in globalThis),
+    identity: [navigator.userAgent, navigator.platform, navigator.hardwareConcurrency, navigator.deviceMemory,
+      navigator.languages.join(), Intl.DateTimeFormat().resolvedOptions().timeZone, typeof OffscreenCanvas],
+  };
+  const done = () => { if (result.dedicated && result.shared) globalThis.__result = result; };
+  const worker = new Worker(blobUrl(dedicatedSource));
+  worker.onmessage = (event) => { result.dedicated = event.data.outer; result.nested = event.data.nested; done(); };
+  worker.postMessage(1);
+  const shared = new SharedWorker(blobUrl(sharedSource));
+  shared.port.onmessage = (event) => { result.shared = event.data; done(); };
+  shared.port.start();
+})()"#;
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_global_scopes_have_no_window_only_globals_and_keep_the_page_identity() {
+    let server = Server::new();
+    let mut page = open(&context(true, 0x77a1_3c05), &format!("{}/page", server.base)).await;
+    let report = evaluate_async(&mut page, WORKER_SCOPE_PROBE).await;
+    // The page itself has these, so a worker that resolves names through the
+    // page realm would leak them.
+    let page_names: Vec<&str> = report["page"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    for name in ["window", "document", "screen", "devicePixelRatio", "localStorage", "innerWidth", "alert", "Document"] {
+        assert!(page_names.contains(&name), "the page lacks {name}: {page_names:?}");
+    }
+    for (kind, tag, other) in [
+        ("dedicated", "[object DedicatedWorkerGlobalScope]", "undefined:false"),
+        ("nested", "[object DedicatedWorkerGlobalScope]", "undefined:false"),
+        ("shared", "[object SharedWorkerGlobalScope]", "undefined:false"),
+    ] {
+        let scope = &report[kind];
+        assert_eq!(scope["leaks"], json!([]), "{kind} worker exposes window-only globals: {scope}");
+        assert_eq!(scope["missing"], json!([]), "{kind} worker lacks worker globals: {scope}");
+        assert_eq!(scope["otherScope"], other, "{kind} worker exposes the other worker scope interface");
+        assert_eq!(scope["tag"], tag, "{kind} worker global toStringTag");
+        assert_eq!(scope["sameGlobal"], true, "{kind} worker: self, globalThis and top-level this differ");
+        assert_eq!(scope["isWorkerScope"], true, "{kind} worker: self is not a WorkerGlobalScope");
+        assert_eq!(scope["identity"], report["identity"], "{kind} worker identity differs from the page");
+        assert_eq!(scope["polyfill"], true, "{kind} worker: assigning self.window did not define it");
+    }
 }
 
 // ---------------------------------------------------------------------------
