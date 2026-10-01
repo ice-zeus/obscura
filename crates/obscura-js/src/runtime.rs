@@ -57,6 +57,14 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+/// The current realm's list of native-function registries (see
+/// `_hostState.nativeRegistries` in bootstrap.js).
+fn native_registries<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Array>> {
+    let state = crate::host_state::get(scope)?.to_object(scope)?;
+    let key = v8::String::new(scope, "nativeRegistries")?;
+    state.get(scope, key.into())?.try_cast::<v8::Array>().ok()
+}
+
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
 /// thread already warms up V8 once before any connection thread starts (see the
@@ -959,8 +967,10 @@ impl ObscuraJsRuntime {
 
         let main_context = v8::Local::new(scope, main);
         let mut carried = Vec::new();
+        let registries;
         {
             let scope = &mut v8::ContextScope::new(scope, main_context);
+            registries = native_registries(scope).map(|list| v8::Global::new(scope, list));
             let global = main_context.global(scope);
             for name in IDENTITY_GLOBALS {
                 let Some(key) = v8::String::new(scope, name) else {
@@ -984,6 +994,21 @@ impl ObscuraJsRuntime {
             };
             let value = v8::Local::new(scope, value);
             global.set(scope, key.into(), value);
+        }
+        // One list of native-function registries per page: the frame adds its
+        // own registry to the page's list and uses that list, so every realm's
+        // Function.prototype.toString recognizes every realm's members.
+        if let (Some(shared), Some(own)) = (registries, native_registries(scope)) {
+            let shared = v8::Local::new(scope, shared);
+            if let Some(registry) = own.get_index(scope, 0) {
+                shared.set_index(scope, shared.length(), registry);
+            }
+            if let (Some(state), Some(key)) = (
+                crate::host_state::get(scope).and_then(|value| value.to_object(scope)),
+                v8::String::new(scope, "nativeRegistries"),
+            ) {
+                state.set(scope, key.into(), shared.into());
+            }
         }
     }
 

@@ -168,21 +168,32 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+// Weak, so a retired document's functions can still be collected.
+const _nativeFns = new WeakSet();
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = new WeakMap();
 const _origToString = Function.prototype.toString;
+const _toStringApply = Reflect.apply;
+// Every realm of a page (its frames) registers here: the host links a frame
+// realm's list to the page's (`copy_identity_to_realm`), so one realm's
+// Function.prototype.toString also recognizes another realm's members, as a
+// native toString does for any native function.
+_hostState.nativeRegistries = [{ fns: _nativeFns, strs: _nativeStr }];
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
-      return `function ${this.name || ''}() { [native code] }`;
+    const registries = _hostState.nativeRegistries;
+    for (let i = 0; i < registries.length; i++) {
+      const registry = registries[i];
+      if (registry.strs.has(this)) { return registry.strs.get(this); }
+      if (registry.fns.has(this)) {
+        return `function ${this.name || ''}() { [native code] }`;
+      }
     }
-    return _origToString.call(this);
+    return _toStringApply(_origToString, this, []);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
@@ -18161,7 +18172,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     BiquadFilterNode: true, MediaDevices: true, Permissions: true, StorageManager: true,
     WebGLRenderingContext: true, WebGL2RenderingContext: true, Plugin: true,
     PluginArray: true, MimeType: true, MimeTypeArray: true, NetworkInformation: true,
-    NavigatorUAData: true, BatteryManager: true, SpeechSynthesis: true,
+    NavigatorUAData: true, BatteryManager: true, SpeechSynthesis: true, ScreenOrientation: true,
     Document: ['referrer'],
     Element: ['clientHeight', 'clientWidth', 'clientTop', 'clientLeft', 'offsetHeight',
       'offsetWidth', 'offsetTop', 'offsetLeft', 'offsetParent', 'scrollHeight', 'scrollWidth',
