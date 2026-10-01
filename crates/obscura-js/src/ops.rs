@@ -743,6 +743,11 @@ impl RealmStates {
         }
     }
 
+    /// The contexts of every live frame realm, in registration order.
+    pub(crate) fn contexts(&self) -> Vec<v8::Global<v8::Context>> {
+        self.entries.iter().map(|(context, _, _)| context.clone()).collect()
+    }
+
     pub fn register(
         &mut self,
         context: v8::Global<v8::Context>,

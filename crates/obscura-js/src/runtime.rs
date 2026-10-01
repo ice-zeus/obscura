@@ -60,6 +60,11 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+/// Host-state slots holding the page's screen metrics: the CDP screen override
+/// and the device pixel ratio. Chrome applies device metrics to the whole page,
+/// so every frame realm carries the top document's values for these.
+const PAGE_SCREEN_SLOTS: [&str; 4] = ["screenWidth", "screenHeight", "screenEmulated", "devicePixelRatio"];
+
 /// The current realm's list of native-function registries (see
 /// `_hostState.nativeRegistries` in bootstrap.js).
 fn native_registries<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Array>> {
@@ -946,8 +951,18 @@ impl ObscuraJsRuntime {
     /// fingerprints inside the frame and compares it with the top document.
     /// Copying the values the parent already has makes that true by
     /// construction, instead of relying on a caller to reapply the same
-    /// settings to both.
+    /// settings to both. The page's screen metrics are part of that identity.
     pub(crate) fn copy_identity_to_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        self.copy_identity_globals_to_realm(realm);
+        // Before the frame's init reads them, so the frame document starts on
+        // the page's screen instead of the profile's native one.
+        self.copy_page_screen_to_realm(realm);
+    }
+
+    fn copy_identity_globals_to_realm(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
@@ -1013,6 +1028,122 @@ impl ObscuraJsRuntime {
                 state.set(scope, key.into(), shared.into());
             }
         }
+    }
+
+    /// Copies the page's screen slots from the main realm's host state into
+    /// `realm`'s, removing any the page does not have.
+    fn copy_page_screen_to_realm(&mut self, realm: &deno_core::v8::Global<deno_core::v8::Context>) {
+        use deno_core::v8;
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+
+        let main_context = v8::Local::new(scope, main);
+        let mut carried = Vec::new();
+        {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let Some(state) = crate::host_state::get(scope).and_then(|value| value.to_object(scope)) else {
+                return;
+            };
+            for name in PAGE_SCREEN_SLOTS {
+                let Some(key) = v8::String::new(scope, name) else {
+                    continue;
+                };
+                let value = state.get(scope, key.into()).filter(|value| !value.is_undefined());
+                carried.push((name, value.map(|value| v8::Global::new(scope, value))));
+            }
+        }
+
+        let realm_context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, realm_context);
+        let Some(state) = crate::host_state::get(scope).and_then(|value| value.to_object(scope)) else {
+            return;
+        };
+        for (name, value) in carried {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            match value {
+                Some(value) => {
+                    let value = v8::Local::new(scope, value);
+                    state.set(scope, key.into(), value);
+                }
+                None => {
+                    state.delete(scope, key.into());
+                }
+            }
+        }
+    }
+
+    /// Applies `realm`'s screen slots to its live `screen` and
+    /// `devicePixelRatio`, exactly as the main realm applies its own.
+    fn apply_page_screen_in_realm(&mut self, realm: &deno_core::v8::Global<deno_core::v8::Context>) {
+        use deno_core::v8;
+
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(let scope, scope);
+        let Some(state) = crate::host_state::get(scope).and_then(|value| value.to_object(scope)) else {
+            return;
+        };
+        let mut slots = Vec::with_capacity(5);
+        for name in ["screenWidth", "screenHeight", "screenEmulated", "setScreenOverride", "devicePixelRatio"] {
+            slots.push(match v8::String::new(scope, name) {
+                Some(key) => state.get(scope, key.into()),
+                None => None,
+            });
+        }
+        let null: v8::Local<v8::Value> = v8::null(scope).into();
+        let width = slots[0].filter(|value| value.is_number()).unwrap_or(null);
+        let height = slots[1].filter(|value| value.is_number()).unwrap_or(null);
+        let emulated = slots[2].is_some_and(|value| value.boolean_value(scope));
+        let emulated: v8::Local<v8::Value> = v8::Boolean::new(scope, emulated).into();
+        if let Some(apply) = slots[3].and_then(|value| v8::Local::<v8::Function>::try_from(value).ok()) {
+            let receiver: v8::Local<v8::Value> = state.into();
+            if apply.call(scope, receiver, &[width, height, emulated]).is_none() {
+                tracing::debug!("frame screen override failed: {}", exception_text(scope));
+                return;
+            }
+        }
+        if let Some(ratio) = slots[4].filter(|value| value.is_number()) {
+            let global = context.global(scope);
+            if let Some(key) = v8::String::new(scope, "devicePixelRatio") {
+                global.set(scope, key.into(), ratio);
+            }
+        }
+    }
+
+    /// Makes every frame realm report the page's current screen metrics.
+    fn sync_page_screen_to_realms(&mut self) {
+        let realms = self.realm_states().borrow().contexts();
+        for realm in &realms {
+            self.copy_page_screen_to_realm(realm);
+            self.apply_page_screen_in_realm(realm);
+        }
+    }
+
+    /// Finishes a new frame realm's screen after its init, which resets
+    /// `devicePixelRatio` to the standalone default.
+    pub(crate) fn finish_realm_screen(&mut self, realm: &deno_core::v8::Global<deno_core::v8::Context>) {
+        self.apply_page_screen_in_realm(realm);
+    }
+
+    /// Sets the page's device pixel ratio in the main realm and every frame
+    /// realm. Frame realms created later copy it from the page.
+    pub fn set_device_pixel_ratio(&mut self, ratio: f64) {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return;
+        }
+        let _ = self.execute_host_expression(
+            "<device-metrics>",
+            format!("(__hostState.devicePixelRatio={ratio}, globalThis.devicePixelRatio={ratio})"),
+        );
+        self.sync_page_screen_to_realms();
     }
 
     /// Gives a frame's state the resources the page owns: cookie jar, HTTP
@@ -1700,6 +1831,9 @@ impl ObscuraJsRuntime {
             _ => format!("__hostState.setScreenOverride(null,null,{emulated});"),
         };
         let _ = self.execute_host_expression("<set-screen-size>", script);
+        // Chrome emulates device metrics for the whole page: every frame
+        // reports the same screen as the top document.
+        self.sync_page_screen_to_realms();
     }
 
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.

@@ -114,6 +114,7 @@ impl FrameRealm {
                 ),
             )
             .ok()?;
+        parent.finish_realm_screen(&realm.context);
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {

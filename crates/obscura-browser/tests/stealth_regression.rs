@@ -28,6 +28,10 @@
 //!   `__obscura` name appears on any reflection surface.
 //! - `audio_and_media_*`: silence where Chrome is silent, and media queries
 //!   consistent with screen and devicePixelRatio.
+//! - `frames_report_the_top_document_screen_*`: same- and cross-origin frames
+//!   report the top document's screen, both the profile's randomized one and
+//!   a CDP device-metrics override (screen and devicePixelRatio), including
+//!   one applied or cleared live.
 //! - `real_libraries_*` (ignored, opt-in, needs network): downloads pinned
 //!   FingerprintJS and CreepJS builds (sha256-checked, never committed) and
 //!   applies the same gates to the real libraries.
@@ -761,6 +765,67 @@ async fn audio_and_media_queries_are_consistent() {
           matchMedia(`(max-device-width: ${screen.width - 1}px)`).matches]",
     );
     assert_eq!(media, json!([true, true, false, false]));
+}
+
+// ---------------------------------------------------------------------------
+// Screen metrics under device emulation.
+
+/// Every screen surface a document can read, plus the media features derived
+/// from it.
+const SCREEN_SURFACE: &str = "[screen.width, screen.height, screen.availWidth, screen.availHeight, \
+  screen.availLeft, screen.availTop, screen.colorDepth, screen.pixelDepth, screen.orientation.type, \
+  outerWidth, outerHeight, devicePixelRatio, \
+  matchMedia(`(device-width: ${screen.width}px) and (device-height: ${screen.height}px)`).matches]";
+
+/// The top document's screen, and every frame's, which must be identical.
+fn assert_frames_report_top_screen(page: &mut Page, step: &str) -> Value {
+    let top = page.evaluate(SCREEN_SURFACE);
+    assert!(top.is_array(), "{step}: screen probe failed: {top}");
+    for index in 0..page.frame_urls().len() {
+        let frame = page.evaluate_in_frame(index, SCREEN_SURFACE).unwrap();
+        assert_eq!(frame, top, "{step}: frame {} reports a different screen than the top document", page.frame_urls()[index]);
+    }
+    top
+}
+
+/// Chrome applies Emulation.setDeviceMetricsOverride to the whole page, so
+/// every frame reports the emulated screen; without an override every frame
+/// reports the profile's randomized screen. A frame that keeps the profile
+/// screen while the top document is emulated is detectable by comparing the
+/// two.
+#[tokio::test(flavor = "current_thread")]
+async fn frames_report_the_top_document_screen_with_and_without_device_emulation() {
+    let other_origin = Server::new();
+    let server = Server::with_routes(Some(&other_origin.base), Arc::new(HashMap::new()));
+    let profile = context(true, 0x5c2e_e9f1);
+    let mut page = open(&profile, &format!("{}/page?step=native", server.base)).await;
+    wait_for_frames(&mut page, 2).await;
+    let native = assert_frames_report_top_screen(&mut page, "no override");
+    assert_ne!(native.as_array().unwrap()[..2], [json!(1280), json!(800)], "the profile screen must differ from the emulated one");
+
+    // An override applied to a loaded page reaches the frames already open.
+    page.apply_device_metrics_override(Some(1280.0), Some(800.0), Some(1.0), Some((1280.0, 800.0)), false);
+    let live = assert_frames_report_top_screen(&mut page, "override on a loaded page");
+    assert_eq!(live.as_array().unwrap()[..4], [json!(1280), json!(800), json!(1280), json!(800)]);
+    // The device scale factor belongs to the same screen.
+    page.apply_device_metrics_override(Some(1280.0), Some(800.0), Some(2.0), Some((1280.0, 800.0)), false);
+    let dense = assert_frames_report_top_screen(&mut page, "scale factor on a loaded page");
+    assert_eq!(dense.as_array().unwrap()[11], json!(2));
+
+    // Frames created while the override is active start emulated.
+    page.navigate(&format!("{}/page?step=emulated", server.base)).await.unwrap();
+    wait_for_frames(&mut page, 2).await;
+    let emulated = assert_frames_report_top_screen(&mut page, "navigation under an override");
+    assert_eq!(emulated.as_array().unwrap()[..4], [json!(1280), json!(800), json!(1280), json!(800)]);
+    assert_eq!(emulated.as_array().unwrap()[11], json!(2));
+
+    // Clearing the override restores the same profile screen everywhere.
+    page.clear_device_metrics_override();
+    let cleared = assert_frames_report_top_screen(&mut page, "override cleared");
+    assert_eq!(cleared.as_array().unwrap()[..4], native.as_array().unwrap()[..4]);
+    page.navigate(&format!("{}/page?step=restored", server.base)).await.unwrap();
+    wait_for_frames(&mut page, 2).await;
+    assert_eq!(assert_frames_report_top_screen(&mut page, "navigation after clearing"), native);
 }
 
 // ---------------------------------------------------------------------------

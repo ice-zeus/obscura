@@ -1765,10 +1765,7 @@ impl Page {
             device_scale_factor
         };
         if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<device-metrics>",
-                &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
-            );
+            js.set_device_pixel_ratio(self.device_scale_factor as f64);
         }
     }
 
@@ -1965,10 +1962,7 @@ impl Page {
         }
 
         rt.run_page_init();
-        let _ = rt.execute_script(
-            "<device-metrics>",
-            &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
-        );
+        rt.set_device_pixel_ratio(self.device_scale_factor as f64);
 
         self.js = Some(rt);
     }
