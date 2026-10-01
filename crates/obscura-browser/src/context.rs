@@ -31,6 +31,13 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+    /// Seed of the stealth fingerprint surfaces for this profile. Every page,
+    /// frame and worker of the context reports values derived from it, so
+    /// they stay stable across navigations (see `obscura_js::fingerprint`).
+    pub fingerprint_seed: u32,
+    /// Seed pinned by the embedder, from which additional contexts derive
+    /// their own reproducible seeds. `None` draws a random seed per context.
+    fingerprint_seed_base: Option<u32>,
 }
 
 impl BrowserContext {
@@ -119,6 +126,9 @@ impl BrowserContext {
             *guard = resolved_ua.clone();
         }
         let http_client = Arc::new(client);
+        let fingerprint_seed_base = obscura_js::fingerprint::seed_from_env();
+        let fingerprint_seed =
+            fingerprint_seed_base.unwrap_or_else(obscura_js::fingerprint::random_seed);
         BrowserContext {
             id,
             cookie_jar,
@@ -134,7 +144,18 @@ impl BrowserContext {
             allow_file_access: false,
             storage_dir,
             allow_private_network,
+            fingerprint_seed,
+            fingerprint_seed_base,
         }
+    }
+
+    /// Pin this profile's fingerprint seed, for embedders that keep a profile
+    /// across restarts. Contexts copied from this one with `persistent` keep
+    /// the seed; other copies derive their own seed from it.
+    pub fn with_fingerprint_seed(mut self, seed: u32) -> Self {
+        self.fingerprint_seed = seed;
+        self.fingerprint_seed_base = Some(seed);
+        self
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
@@ -159,6 +180,17 @@ impl BrowserContext {
     /// current cookies; incognito copies start empty and never write to the
     /// template's storage directory.
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
+        // A persistent copy is the same profile (the CDP server makes one per
+        // connection), so it keeps the device fingerprint. Any other copy is a
+        // new profile with its own seed.
+        let fingerprint_seed = if persistent {
+            self.fingerprint_seed
+        } else {
+            match self.fingerprint_seed_base {
+                Some(base) => obscura_js::fingerprint::derive_seed(base, &id),
+                None => obscura_js::fingerprint::random_seed(),
+            }
+        };
         let cookie_jar = Arc::new(CookieJar::new());
         if persistent {
             cookie_jar.copy_from(&self.cookie_jar);
@@ -191,6 +223,8 @@ impl BrowserContext {
             allow_file_access: self.allow_file_access,
             storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
             allow_private_network: self.allow_private_network,
+            fingerprint_seed,
+            fingerprint_seed_base: self.fingerprint_seed_base,
         }
     }
 
@@ -270,5 +304,55 @@ mod tests {
 
         assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
         assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
+    }
+    // The stealth fingerprint belongs to the profile: the CDP server's
+    // per-connection copy keeps it, every other context is a new profile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprint_seed_is_stable_per_profile_and_varies_between_profiles() {
+        let template = BrowserContext::with_options("default".to_string(), None, true);
+        let connection = template.isolated_copy("default".to_string(), true);
+        assert_eq!(connection.fingerprint_seed, template.fingerprint_seed);
+        assert_eq!(
+            connection.isolated_copy("default".to_string(), true).fingerprint_seed,
+            template.fingerprint_seed
+        );
+
+        let created: std::collections::HashSet<u32> = (1..=16)
+            .map(|i| template.isolated_copy(format!("context-{i}"), false).fingerprint_seed)
+            .collect();
+        assert!(created.len() >= 15, "new browser contexts reused seeds: {created:?}");
+        let fresh: std::collections::HashSet<u32> = (0..16)
+            .map(|_| BrowserContext::with_options("default".to_string(), None, true).fingerprint_seed)
+            .collect();
+        assert!(fresh.len() >= 15, "new profiles reused seeds: {fresh:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_fingerprint_seed_is_reproducible_across_restarts() {
+        let first = BrowserContext::with_options("default".to_string(), None, true).with_fingerprint_seed(7);
+        let restarted = BrowserContext::with_options("default".to_string(), None, true).with_fingerprint_seed(7);
+        assert_eq!(first.fingerprint_seed, 7);
+        assert_eq!(first.isolated_copy("default".to_string(), true).fingerprint_seed, 7);
+        let derived = first.isolated_copy("context-1".to_string(), false).fingerprint_seed;
+        assert_eq!(derived, restarted.isolated_copy("context-1".to_string(), false).fingerprint_seed);
+        assert_ne!(derived, 7);
+        assert_ne!(derived, first.isolated_copy("context-2".to_string(), false).fingerprint_seed);
+    }
+
+    // nextest runs every test in its own process, so the variable does not
+    // leak into other tests.
+    #[tokio::test(flavor = "current_thread")]
+    async fn embedder_pins_the_seed_through_the_environment() {
+        std::env::set_var(obscura_js::fingerprint::FINGERPRINT_SEED_ENV, "0x2a");
+        let context = BrowserContext::with_options("default".to_string(), None, true);
+        assert_eq!(context.fingerprint_seed, 42);
+        assert_eq!(context.isolated_copy("default".to_string(), true).fingerprint_seed, 42);
+        std::env::set_var(obscura_js::fingerprint::FINGERPRINT_SEED_ENV, "pulse-profile-3");
+        let labelled = BrowserContext::with_options("default".to_string(), None, true);
+        assert_eq!(
+            Some(labelled.fingerprint_seed),
+            obscura_js::fingerprint::parse_seed("pulse-profile-3")
+        );
+        std::env::remove_var(obscura_js::fingerprint::FINGERPRINT_SEED_ENV);
     }
 }

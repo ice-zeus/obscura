@@ -417,7 +417,7 @@ engine; enabling stealth does not remove screenshot, screencast, PDF, CDP, or
 MCP functionality.
 
 ### Anti-fingerprinting
-- Per-session fingerprint randomization (GPU, screen, canvas, audio, battery)
+- Per-profile fingerprint randomization (GPU, screen, canvas, audio, battery), stable across navigations, frames and workers (`OBSCURA_FINGERPRINT_SEED` pins it)
 - Realistic `navigator.userAgentData` (Chrome 145, high-entropy values)
 - `event.isTrusted = true` for dispatched events
 - Hidden internal properties (`Object.keys(window)` safe)

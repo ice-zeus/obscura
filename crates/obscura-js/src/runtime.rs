@@ -632,6 +632,11 @@ impl ObscuraJsRuntime {
                 // Empty until a frame realm exists, which is what keeps the
                 // lookup free for pages that have no frames.
                 op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+                // A runtime without a browser context is its own profile. A page
+                // replaces this with its context's seed before the first document.
+                op_state.put(crate::fingerprint::FingerprintSeed(
+                    crate::fingerprint::random_seed(),
+                ));
                 #[cfg(feature = "webgl")]
                 op_state.put(crate::webgl_ops::DeferredCleanup::default());
             }
@@ -1578,6 +1583,26 @@ impl ObscuraJsRuntime {
                 js_string_literal(ua_platform_version),
             ),
         );
+    }
+
+    /// Seed of the stealth fingerprint surfaces. The browser context owns it
+    /// so that every document, frame realm and worker of one profile reports
+    /// the same values (see `crate::fingerprint`). Takes effect from the next
+    /// document initialization.
+    pub fn set_fingerprint_seed(&mut self, seed: u32) {
+        self.js_runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::fingerprint::FingerprintSeed(seed));
+    }
+
+    pub fn fingerprint_seed(&mut self) -> u32 {
+        self.js_runtime
+            .op_state()
+            .borrow()
+            .try_borrow::<crate::fingerprint::FingerprintSeed>()
+            .map(|seed| seed.0)
+            .unwrap_or(0)
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
@@ -13438,14 +13463,10 @@ mod tests {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_viewport(300.0, 200.0);
-        // Force the fingerprint seed whose screen-pool entry is 2560x1440.
+        // Use the fingerprint seed whose screen-pool entry is 2560x1440.
         // That physical screen must not silently turn a 1x render surface into
         // a 2x devicePixelContentBoxSize surface.
-        rt.execute_script(
-            "deterministic-high-resolution-screen",
-            "Date.now = () => 0; Math.random = () => 2 / 0xFFFFFFFF;",
-        )
-        .unwrap();
+        rt.set_fingerprint_seed(2);
         rt.run_page_init();
 
         assert_eq!(

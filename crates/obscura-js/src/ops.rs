@@ -6402,6 +6402,17 @@ fn allocate_canvas_epoch(next: &std::sync::atomic::AtomicU32) -> u32 {
         |value| value.checked_add(1)).unwrap_or(0)
 }
 
+/// The stealth fingerprint seed of the browser profile that owns this runtime.
+/// Every document, frame realm and worker of the profile reads the same value
+/// (see `crate::fingerprint`).
+#[op2(fast)]
+fn op_fingerprint_seed(state: &OpState) -> u32 {
+    state
+        .try_borrow::<crate::fingerprint::FingerprintSeed>()
+        .map(|seed| seed.0)
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "render")]
 pub(crate) fn canvas_owner_matches(state: &ObscuraState, frame: u32, epoch: u32) -> bool {
     epoch != 0 && state.frame_id == frame && state.canvas_epoch == epoch
@@ -6557,6 +6568,7 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_fingerprint_seed(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.

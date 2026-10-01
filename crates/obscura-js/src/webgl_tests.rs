@@ -465,7 +465,7 @@ fn real_webgl_one_and_two_draw_shaders_and_serialize_canvas_pixels() {
         ])
     );
     // Without runtime stealth both versions report the driver identity. With
-    // it, a new document reports its seeded Windows GPU profile and Chrome
+    // it, a document reports its profile's seeded Windows GPU and Chrome
     // version strings, stable across versions, contexts and repeated reads.
     let plain = webgl_identity_rows(&mut runtime);
     let (driver_vendor, driver_renderer) = webgl_driver_identity(&runtime);

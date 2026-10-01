@@ -1845,6 +1845,7 @@ impl Page {
         rt.set_referrer(&self.referrer);
         let (session_history, session_index) = self.predicted_session_history();
         rt.set_session_history(session_history, session_index, session_index);
+        rt.set_fingerprint_seed(self.context.fingerprint_seed);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {

@@ -121,6 +121,14 @@ Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`.
 OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
 ```
 
+### `OBSCURA_FINGERPRINT_SEED`
+
+Pin the seed of the randomized fingerprint surfaces (WebGL vendor/renderer, screen, `hardwareConcurrency`, `deviceMemory`, canvas, audio, battery), so a profile reports the same fingerprint after a restart. Accepts a decimal or `0x` hexadecimal 32-bit number, or any other label, which is hashed. Without it each browser context draws a random seed once and keeps it for all of its pages, frames and workers. Additional browser contexts derive their own seed from the pinned one.
+
+```bash
+OBSCURA_FINGERPRINT_SEED=profile-17 obscura serve --stealth
+```
+
 ### `OBSCURA_PROFILE`
 
 Pin a specific browser profile from the built-in pool by index (`0`-based). Each profile keeps `navigator.platform`, `userAgentData`, the UA string, and the GPU renderer internally consistent. Without it a single stable profile is used.

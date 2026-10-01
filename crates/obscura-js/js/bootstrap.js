@@ -260,7 +260,13 @@ if (_origStackDesc && _origStackDesc.get) {
   });
 }
 
+// Fingerprint seeds. _fpSeed is the browser profile's seed: the host supplies
+// it per browser context, so a device's randomized surfaces stay the same on
+// every document, frame and worker of the profile. _fpDocSeed is redrawn for
+// each document and drives only the values a browser recomputes for every
+// navigation (navigation timing, heap and storage usage).
 let _fpSeed = 0;
+let _fpDocSeed = 0;
 // Dynamic module/in-order script queue. Module evaluation remains serialized
 // to prevent a re-entrant RefCell panic in deno_core's
 // futures_unordered_driver when SPAs insert multiple <script type=module>
@@ -671,6 +677,12 @@ async function _loadLinkedStylesheet(c) {
 
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
+  h = Math.imul(h ^ (h >>> 13), 0x45d9f3b);
+  return ((h ^ (h >>> 16)) >>> 0) / 0xFFFFFFFF;
+}
+function _fpDocRand(salt) {
+  let h = (_fpDocSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
   h = Math.imul(h ^ (h >>> 13), 0x45d9f3b);
   return ((h ^ (h >>> 16)) >>> 0) / 0xFFFFFFFF;
@@ -7760,7 +7772,7 @@ globalThis.navigator = {
     clearWatch() {},
   },
   storage: {
-    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
+    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpDocRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
   },
@@ -7832,22 +7844,22 @@ globalThis.chrome = {
   runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
-    return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
+    return { onloadT: t, startE: t - Math.floor(100 + _fpDocRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
   },
   loadTimes() {
     const t = Date.now() / 1000;
-    const request = t - 0.5 - _fpRand(611) * 0.5;
-    const startLoad = request + 0.05 + _fpRand(612) * 0.02;
-    const commit = request + 0.3 + _fpRand(613) * 0.4;
-    const finishDoc = commit + 0.1 + _fpRand(614) * 0.2;
-    const finish = finishDoc + 0.05 + _fpRand(615) * 0.1;
-    const firstPaint = commit + 0.03 + _fpRand(616) * 0.1;
+    const request = t - 0.5 - _fpDocRand(611) * 0.5;
+    const startLoad = request + 0.05 + _fpDocRand(612) * 0.02;
+    const commit = request + 0.3 + _fpDocRand(613) * 0.4;
+    const finishDoc = commit + 0.1 + _fpDocRand(614) * 0.2;
+    const finish = finishDoc + 0.05 + _fpDocRand(615) * 0.1;
+    const firstPaint = commit + 0.03 + _fpDocRand(616) * 0.1;
     const navTypes = ["BackForward","Reload","Link","Other"];
     return {
       requestTime: request, startLoadTime: startLoad * 1000, commitLoadTime: commit * 1000,
       finishDocumentLoadTime: finishDoc * 1000, finishLoadTime: finish * 1000,
       firstPaintTime: firstPaint * 1000, firstPaintAfterLoadTime: 0,
-      navigationType: navTypes[Math.floor(_fpRand(617) * 4)],
+      navigationType: navTypes[Math.floor(_fpDocRand(617) * 4)],
       wasFetchedViaSpdy: false, wasNpnNegotiated: false,
       npnNegotiatedProtocol: "http/1.1",
       wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
@@ -17048,7 +17060,11 @@ _hostState.initializeDocument = globalThis.__obscura_init = function() {
   _canvasDocumentEpoch = typeof canvasEpoch === 'function' ? canvasEpoch(_realmFrameId) : 0;
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  const profileSeed = __obscuraCore.ops.op_fingerprint_seed;
+  _fpSeed = typeof profileSeed === 'function'
+    ? profileSeed() | 0
+    : Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  _fpDocSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
@@ -17095,14 +17111,14 @@ _hostState.initializeDocument = globalThis.__obscura_init = function() {
 
   // A navigation start precedes the wall clock, so skew into the past only: an
   // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
+  const t0 = Date.now() - 1 - Math.floor(_fpDocRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
-  var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
+  var _totalHeap = 15000000 + Math.floor(_fpDocRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,
     totalJSHeapSize: _totalHeap,
-    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
+    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpDocRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
 
