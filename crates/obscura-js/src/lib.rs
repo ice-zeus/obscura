@@ -1,5 +1,6 @@
 pub mod cdp_watchdog;
 pub mod fingerprint;
+mod stack_trace;
 pub mod frame;
 mod host_state;
 #[cfg(feature = "webgl")]
