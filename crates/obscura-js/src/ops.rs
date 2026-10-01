@@ -3465,7 +3465,7 @@ async fn op_fetch_url(
     let mut effective_headers = match &http_client {
         Some(client) => client.request_headers().await,
         None => HashMap::from([("user-agent".to_string(),
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string())]),
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".to_string())]),
     };
     #[cfg(feature = "stealth")]
     if let Some(client) = &stealth {

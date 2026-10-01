@@ -1045,13 +1045,13 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
 /// the non-stealth HTTP path agrees with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
+pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
     let major: usize = ua
         .split("Chrome/")
         .nth(1)
         .and_then(|s| s.split('.').next())
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(145);
+        .unwrap_or(148);
     const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
     const GREASE_VER: [&str; 3] = ["8", "99", "24"];
     const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
@@ -1065,8 +1065,16 @@ fn chrome_client_hints(ua: &str) -> (String, String) {
         ("Chromium".to_string(), major.to_string()),
         ("Google Chrome".to_string(), major.to_string()),
     ];
-    let p = PERMS[major % 6];
-    let sec_ch_ua = p
+    // Chromium places brand i at position order[i] (ShuffleBrandList), which
+    // is not the same as reading brand order[i] into position i: the two only
+    // agree for the self-inverse orders, so a gather reports the wrong order
+    // for every major version with major % 6 of 3 or 4 (147, 148, ...).
+    let order = PERMS[major % 6];
+    let mut shuffled = [0usize; 3];
+    for (brand, &position) in order.iter().enumerate() {
+        shuffled[position] = brand;
+    }
+    let sec_ch_ua = shuffled
         .iter()
         .map(|&i| format!("\"{}\";v=\"{}\"", brands[i].0, brands[i].1))
         .collect::<Vec<_>>()
@@ -1104,7 +1112,7 @@ impl ObscuraHttpClient {
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".to_string(),
             ),
             accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: RwLock::new(HashMap::new()),
@@ -1586,7 +1594,7 @@ impl ObscuraHttpClient {
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
                 HeaderValue::from_str(&sec_ch_ua)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
+                    .unwrap_or_else(|_| HeaderValue::from_static("\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"")),
             );
             headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
             headers.insert(
@@ -1598,7 +1606,7 @@ impl ObscuraHttpClient {
                 headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
             }
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
             }));
             headers.insert(
                 reqwest::header::ACCEPT,

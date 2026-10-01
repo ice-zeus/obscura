@@ -59,12 +59,27 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
+// The wreq emulation (STEALTH_PROFILE, Platform::Windows) sends this exact UA,
+// the matching sec-ch-ua brands and sec-ch-ua-platform "Windows" on the wire,
+// over that profile's TLS and HTTP/2 settings. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
+// site cross-checks the mismatch as a bot signal. Raise the version only
+// together with the profile: Chrome148 is the newest Chrome profile the pinned
+// wreq-util provides, and claiming a newer version than the TLS and HTTP/2
+// emulation would be a worse mismatch than a slightly older browser.
+#[cfg(feature = "stealth")]
+const STEALTH_PROFILE: wreq_util::Profile = wreq_util::Profile::Chrome148;
+
+#[cfg(feature = "stealth")]
+fn stealth_emulation() -> wreq_util::Emulation {
+    wreq_util::Emulation::builder()
+        .profile(STEALTH_PROFILE)
+        .platform(wreq_util::Platform::Windows)
+        .build()
+}
+
 #[cfg(feature = "stealth")]
 pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
 #[cfg(feature = "stealth")]
@@ -218,10 +233,7 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
-        let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
-            .build();
+        let emulation_opts = stealth_emulation();
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
@@ -694,6 +706,52 @@ mod tests {
         StealthHttpClient, is_tracker_blocked, send_get_with_connection_reset_retry,
         tracker_blocking_enabled,
     };
+
+    // The wire identity comes from the wreq profile, the JavaScript identity
+    // from STEALTH_USER_AGENT plus Chromium's brand algorithm. Both must name
+    // the same browser, or a site sees two different Chrome versions.
+    #[test]
+    fn stealth_user_agent_and_client_hints_match_the_emulation_profile() {
+        use wreq::IntoEmulation;
+        let emulation = super::stealth_emulation().into_emulation();
+        let header = |name: &str| {
+            emulation.headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_string)
+        };
+        let (sec_ch_ua, sec_ch_ua_platform) = crate::client::chrome_client_hints(super::STEALTH_USER_AGENT);
+        assert_eq!(header("user-agent").as_deref(), Some(super::STEALTH_USER_AGENT));
+        assert_eq!(header("sec-ch-ua"), Some(sec_ch_ua));
+        assert_eq!(header("sec-ch-ua-platform"), Some(sec_ch_ua_platform));
+        assert_eq!(header("sec-ch-ua-mobile").as_deref(), Some("?0"));
+        assert_eq!(format!("\"{}\"", super::STEALTH_UA_PLATFORM), header("sec-ch-ua-platform").unwrap());
+    }
+
+    // The brand list Chromium sends (GREASE brand, GREASE version and order)
+    // is a function of the major version. Check the algorithm against every
+    // Chrome profile wreq-util captured since the current GREASE scheme
+    // (Chrome 105), so any version the stealth profile moves to stays exact.
+    #[test]
+    fn client_hint_brands_follow_chromium_for_every_captured_chrome_profile() {
+        use wreq::IntoEmulation;
+        use wreq_util::Profile::*;
+        for profile in [
+            Chrome105, Chrome106, Chrome107, Chrome108, Chrome109, Chrome110, Chrome114, Chrome116,
+            Chrome117, Chrome118, Chrome119, Chrome120, Chrome123, Chrome124, Chrome126, Chrome127,
+            Chrome128, Chrome129, Chrome130, Chrome131, Chrome132, Chrome133, Chrome134, Chrome135,
+            Chrome136, Chrome137, Chrome138, Chrome139, Chrome140, Chrome141, Chrome142, Chrome143,
+            Chrome144, Chrome145, Chrome146, Chrome147, Chrome148,
+        ] {
+            let emulation = wreq_util::Emulation::builder()
+                .profile(profile)
+                .platform(wreq_util::Platform::Windows)
+                .build()
+                .into_emulation();
+            let header = |name: &str| {
+                emulation.headers.get(name).and_then(|value| value.to_str().ok()).unwrap().to_string()
+            };
+            let (sec_ch_ua, _) = crate::client::chrome_client_hints(&header("user-agent"));
+            assert_eq!(sec_ch_ua, header("sec-ch-ua"), "{profile:?}");
+        }
+    }
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
