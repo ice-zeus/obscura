@@ -701,6 +701,49 @@ function _fpDocRand(salt) {
 function _fpNoise(x, y, channel) {
   return (_fpRand(x * 7919 + y * 6271 + channel * 8923) - 0.5) * 4;
 }
+// Per-profile rendering variance (stealth mode only). Real devices differ in
+// how their GPU and font stack rasterize text, curves, gradients and shaded
+// geometry, so the same drawing hashes differently per device but identically
+// on every read from one device. A profile reproduces its own variant: each
+// color channel of a rendered pixel moves by at most 1, at positions chosen by
+// the profile seed (about 1 channel in 10). Alpha, empty (transparent) pixels
+// and exact operations (solid rectangles, putImageData, clears) are untouched.
+function _fpRenderVariance() { return globalThis.__obscura_stealth === true; }
+function _fpChannelNudge(x, y, channel) {
+  const n = _fpNoise(x, y, channel);
+  return n > 1.8 ? 1 : n < -1.8 ? -1 : 0;
+}
+function _fpNudgePixel(bytes, index, x, y) {
+  for (let c = 0; c < 3; c++) {
+    const delta = _fpChannelNudge(x, y, c);
+    if (delta) {
+      const value = bytes[index + c] + delta;
+      bytes[index + c] = value < 0 ? 0 : value > 255 ? 255 : value;
+    }
+  }
+}
+// GPU readback variance. Shaded content is the opaque pixels that differ from
+// a neighbour in the read region; clears and flat fills read back exactly.
+// `x0`/`y0` are drawing-buffer coordinates (origin bottom-left) of the first
+// row in memory; `up` is true when memory rows ascend in y (readPixels) and
+// false for top-down images (toDataURL and other canvas exports).
+function _fpGpuVariance(bytes, start, stride, width, rows, x0, y0, up) {
+  if (!_fpRenderVariance() || width <= 0 || rows <= 0) return;
+  const changes = [];
+  const same = (a, b) => bytes[a] === bytes[b] && bytes[a + 1] === bytes[b + 1]
+    && bytes[a + 2] === bytes[b + 2] && bytes[a + 3] === bytes[b + 3];
+  for (let row = 0; row < rows; row++) {
+    const base = start + row * stride;
+    for (let col = 0; col < width; col++) {
+      const i = base + col * 4;
+      if (bytes[i + 3] !== 255) continue;
+      if ((col > 0 && !same(i, i - 4)) || (col + 1 < width && !same(i, i + 4))
+        || (row > 0 && !same(i, i - stride)) || (row + 1 < rows && !same(i, i + stride)))
+        changes.push(i, x0 + col, up ? y0 + row : y0 - row);
+    }
+  }
+  for (let k = 0; k < changes.length; k += 3) _fpNudgePixel(bytes, changes[k], changes[k + 1], changes[k + 2]);
+}
 
 var _fpCache = null;
 function _getFp() {
@@ -14522,9 +14565,68 @@ function _requireCanvasOwner(canvas) {
   if (!owner) throw new DOMException('Canvas document is unavailable', 'InvalidStateError');
   return owner;
 }
+// CSS <color> for canvas styles: hex, rgb()/rgba() in comma or space syntax
+// with numbers or percentages, hsl()/hsla(), named colors and transparent.
+// Alpha is clamped to [0, 1] as CSS requires, so `rgba(r, g, b, 255)` is opaque.
+const _cssNamedColors = (() => {
+  const table = {};
+  const packed = 'aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 azure f0ffff beige f5f5dc bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff blueviolet 8a2be2 brown a52a2a burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 chocolate d2691e coral ff7f50 cornflowerblue 6495ed cornsilk fff8dc crimson dc143c cyan 00ffff darkblue 00008b darkcyan 008b8b darkgoldenrod b8860b darkgray a9a9a9 darkgreen 006400 darkgrey a9a9a9 darkkhaki bdb76b darkmagenta 8b008b darkolivegreen 556b2f darkorange ff8c00 darkorchid 9932cc darkred 8b0000 darksalmon e9967a darkseagreen 8fbc8f darkslateblue 483d8b darkslategray 2f4f4f darkslategrey 2f4f4f darkturquoise 00ced1 darkviolet 9400d3 deeppink ff1493 deepskyblue 00bfff dimgray 696969 dimgrey 696969 dodgerblue 1e90ff firebrick b22222 floralwhite fffaf0 forestgreen 228b22 fuchsia ff00ff gainsboro dcdcdc ghostwhite f8f8ff gold ffd700 goldenrod daa520 gray 808080 green 008000 greenyellow adff2f grey 808080 honeydew f0fff0 hotpink ff69b4 indianred cd5c5c indigo 4b0082 ivory fffff0 khaki f0e68c lavender e6e6fa lavenderblush fff0f5 lawngreen 7cfc00 lemonchiffon fffacd lightblue add8e6 lightcoral f08080 lightcyan e0ffff lightgoldenrodyellow fafad2 lightgray d3d3d3 lightgreen 90ee90 lightgrey d3d3d3 lightpink ffb6c1 lightsalmon ffa07a lightseagreen 20b2aa lightskyblue 87cefa lightslategray 778899 lightslategrey 778899 lightsteelblue b0c4de lightyellow ffffe0 lime 00ff00 limegreen 32cd32 linen faf0e6 magenta ff00ff maroon 800000 mediumaquamarine 66cdaa mediumblue 0000cd mediumorchid ba55d3 mediumpurple 9370db mediumseagreen 3cb371 mediumslateblue 7b68ee mediumspringgreen 00fa9a mediumturquoise 48d1cc mediumvioletred c71585 midnightblue 191970 mintcream f5fffa mistyrose ffe4e1 moccasin ffe4b5 navajowhite ffdead navy 000080 oldlace fdf5e6 olive 808000 olivedrab 6b8e23 orange ffa500 orangered ff4500 orchid da70d6 palegoldenrod eee8aa palegreen 98fb98 paleturquoise afeeee palevioletred db7093 papayawhip ffefd5 peachpuff ffdab9 peru cd853f pink ffc0cb plum dda0dd powderblue b0e0e6 purple 800080 rebeccapurple 663399 red ff0000 rosybrown bc8f8f royalblue 4169e1 saddlebrown 8b4513 salmon fa8072 sandybrown f4a460 seagreen 2e8b57 seashell fff5ee sienna a0522d silver c0c0c0 skyblue 87ceeb slateblue 6a5acd slategray 708090 slategrey 708090 snow fffafa springgreen 00ff7f steelblue 4682b4 tan d2b48c teal 008080 thistle d8bfd8 tomato ff6347 turquoise 40e0d0 violet ee82ee wheat f5deb3 white ffffff whitesmoke f5f5f5 yellow ffff00 yellowgreen 9acd32';
+  const parts = packed.split(' ');
+  for (let i = 0; i < parts.length; i += 2) {
+    const hex = parts[i + 1];
+    table[parts[i]] = [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16), 255];
+  }
+  table.transparent = [0, 0, 0, 0];
+  return table;
+})();
+function _canvasParseColor(css) {
+  if (!css || typeof css !== 'string') return [0,0,0,0];
+  const text = css.trim().toLowerCase();
+  if (text === 'none') return [0,0,0,0];
+  if (text.startsWith('#')) {
+    const hex = text.slice(1);
+    if (/^[0-9a-f]+$/.test(hex)) {
+      if (hex.length === 3 || hex.length === 4) {
+        const v = Array.from(hex, (h) => parseInt(h + h, 16));
+        return [v[0], v[1], v[2], hex.length === 4 ? v[3] : 255];
+      }
+      if (hex.length === 6 || hex.length === 8) {
+        return [parseInt(hex.slice(0,2),16), parseInt(hex.slice(2,4),16), parseInt(hex.slice(4,6),16),
+          hex.length === 8 ? parseInt(hex.slice(6,8),16) : 255];
+      }
+    }
+    return [0,0,0,255];
+  }
+  const fn = text.match(/^(rgba?|hsla?)\(\s*([^)]*)\)$/);
+  if (fn) {
+    const args = fn[2].split(/\s*,\s*|\s*\/\s*|\s+/).filter(Boolean);
+    if (args.length < 3) return [0,0,0,255];
+    const clamp = (v, max) => Math.min(max, Math.max(0, v));
+    const alphaOf = (v) => v === undefined ? 255
+      : Math.round(clamp(v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v), 1) * 255);
+    let alpha = alphaOf(args[3]);
+    if (Number.isNaN(alpha)) alpha = 255;
+    if (fn[1].startsWith('rgb')) {
+      const channel = (v) => Math.round(clamp(v.endsWith('%') ? parseFloat(v) * 2.55 : parseFloat(v), 255)) || 0;
+      return [channel(args[0]), channel(args[1]), channel(args[2]), alpha];
+    }
+    const h = ((parseFloat(args[0]) % 360) + 360) % 360 / 360;
+    const sat = clamp(parseFloat(args[1]) / 100, 1) || 0, light = clamp(parseFloat(args[2]) / 100, 1) || 0;
+    const q = light < 0.5 ? light * (1 + sat) : light + sat - light * sat, p = 2 * light - q;
+    const hue = (t) => {
+      t = t < 0 ? t + 1 : t > 1 ? t - 1 : t;
+      return t < 1/6 ? p + (q - p) * 6 * t : t < 1/2 ? q : t < 2/3 ? p + (q - p) * (2/3 - t) * 6 : p;
+    };
+    return [Math.round(hue(h + 1/3) * 255), Math.round(hue(h) * 255), Math.round(hue(h - 1/3) * 255), alpha];
+  }
+  return _cssNamedColors[text] || [0,0,0,255];
+}
 let _canvasBitmapDraw = () => false;
 class _Canvas2D {
   #buf; #w; #h; #damageQueued; #stateStack; #path; #originClean = true; #owner; #domOwner;
+  // Set while a rasterizing operation (text, paths, gradients, scaled images)
+  // writes pixels; see _fpRenderVariance.
+  #variance = false; #rasterizing = false;
   static {
     // These accessors stay in the bootstrap closure, not on a constructor or
     // prototype reachable by page code. Private fields keep the hot pixel
@@ -14617,17 +14719,7 @@ class _Canvas2D {
     });
   }
   _parseColor(css) {
-    if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
-    if (css.startsWith('#')) {
-      const hex = css.slice(1);
-      if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
-      if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
-      if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
-    }
-    const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
-    const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
-    return named[css] || [0,0,0,255];
+    return _canvasParseColor(css);
   }
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
@@ -14646,8 +14738,16 @@ class _Canvas2D {
       this.#buf[idx+3] = Math.min(255, Math.round(a * alpha + this.#buf[idx+3] * (1 - alpha)));
     }
     if (this.#owner?.alpha === false) this.#buf[idx+3] = 255;
+    if (this.#variance && this.#buf[idx+3] !== 0) _fpNudgePixel(this.#buf, idx, x, y);
+  }
+  #rasterize(draw) {
+    this.#rasterizing = true;
+    this.#variance = _fpRenderVariance();
+    try { return draw(); } finally { this.#rasterizing = false; this.#variance = false; }
   }
   fillRect(x, y, w, h) {
+    if (!this.#rasterizing && typeof this.fillStyle === 'object' && this.fillStyle !== null)
+      return this.#rasterize(() => this.fillRect(x, y, w, h));
     const style = this._resolvePaint(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     for (let py = Math.max(0,y); py < Math.min(this.#h, y+h); py++) {
@@ -14670,6 +14770,8 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
+    if (!this.#rasterizing && typeof this.strokeStyle === 'object' && this.strokeStyle !== null)
+      return this.#rasterize(() => this.strokeRect(x, y, w, h));
     const style = this._resolvePaint(this.strokeStyle);
     const put = (px, py) => {
       const c = style.at(px, py);
@@ -14685,6 +14787,7 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   fillText(text, x, y) {
+    if (!this.#rasterizing) return this.#rasterize(() => this.fillText(text, x, y));
     const [r,g,b,a] = this._parseColor(this.fillStyle);
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
@@ -14714,7 +14817,11 @@ class _Canvas2D {
   measureText(t) {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    let width = String(t).length * 6 * scale;
+    // Advance widths depend on the device's fonts and text shaping. Scale them
+    // by a per-profile factor within 0.3% and keep Skia's 1/64 px precision.
+    if (width && _fpRenderVariance()) width = Math.round(width * (0.997 + _fpRand(7703) * 0.006) * 64) / 64;
+    return { width, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
     if (!this.#originClean) throw new DOMException('The canvas is not origin-clean', 'SecurityError');
@@ -14759,6 +14866,17 @@ class _Canvas2D {
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
     if (_canvasBitmapDraw(this, img, Array.prototype.slice.call(arguments, 1))) return;
+    // A scaled draw is resampled, which devices do differently; a 1:1 copy is exact.
+    if (!this.#rasterizing && arguments.length > 3) {
+      const src = _canvas2DPixels(_canvas2DContext(img));
+      const sourceWidth = arguments.length > 5 ? sw : (src ? src.width : 0);
+      const sourceHeight = arguments.length > 5 ? sh : (src ? src.height : 0);
+      const targetWidth = arguments.length > 5 ? dw : sw, targetHeight = arguments.length > 5 ? dh : sh;
+      if (src && (targetWidth !== sourceWidth || targetHeight !== sourceHeight)) {
+        const args = arguments;
+        return this.#rasterize(() => this.drawImage(...args));
+      }
+    }
     const src = _canvas2DPixels(_canvas2DContext(img));
     if (src) {
       if (!src.originClean) this.#originClean = false;
@@ -14786,6 +14904,7 @@ class _Canvas2D {
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
     if (!this.#path) return;
+    if (!this.#rasterizing) return this.#rasterize(() => this.fill());
     const style = this._resolvePaint(this.fillStyle);
     const put = (px, py) => {
       const c = style.at(px, py);
@@ -14836,6 +14955,7 @@ class _Canvas2D {
   // honoured; arcs are stroked as a circle outline of the same width.
   stroke() {
     if (!this.#path || this.#path.length === 0) return;
+    if (!this.#rasterizing) return this.#rasterize(() => this.stroke());
     const style = this._resolvePaint(this.strokeStyle);
     const lw = Math.max(1, Math.round(this.lineWidth || 1));
     const half = (lw - 1) / 2;

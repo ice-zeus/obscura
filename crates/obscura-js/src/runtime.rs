@@ -9,6 +9,9 @@ use std::task::{Context, Poll};
 #[cfg(all(test, feature = "webgl"))]
 #[path = "webgl_tests.rs"]
 mod webgl_tests;
+#[cfg(all(test, feature = "webgl"))]
+#[path = "stealth_variance_tests.rs"]
+mod stealth_variance_tests;
 
 use deno_core::{JsRuntime, RuntimeOptions, v8};
 use obscura_dom::{DomTree, NodeId};
