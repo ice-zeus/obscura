@@ -111,9 +111,11 @@ impl Server {
                 } else {
                     ("text/html", page.clone().into_bytes())
                 };
+                // Versioned modules are cacheable, like a CDN build.
+                let caching = if route.ends_with(".mjs") { "Cache-Control: public, max-age=600\r\nETag: \"m1\"\r\n" } else { "" };
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nAccess-Control-Allow-Origin: *\r\n{caching}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(&body);
@@ -699,6 +701,30 @@ async fn identity_http_headers_navigator_and_client_hints_agree_and_no_internal_
         })()"#,
     );
     assert_eq!(reflected, json!([]), "engine names visible through reflection");
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic import through the stealth transport and its cache.
+
+/// The FingerprintJS demo loads its agent with `import()` from a CDN. The
+/// module is fetched through the stealth transport (and its HTTP cache) and
+/// must keep working on a second navigation, when it comes from the cache.
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_cross_origin_module_import_works_on_repeat_visits() {
+    let mut routes = HashMap::new();
+    routes.insert("/agent.mjs".to_string(), ("text/javascript", b"export const load = async () => ({ get: async () => ({ visitorId: 'fixture' }) });".to_vec()));
+    let cdn = Server::with_routes(None, Arc::new(routes));
+    let server = Server::new();
+    let mut page = open(&context(true, 21), &format!("{}/page", server.base)).await;
+    let import = format!(
+        "(() => {{ import('{}/agent.mjs').then((m) => m.load()).then((a) => a.get()).then((r) => {{ globalThis.__result = r.visitorId; }}, (e) => {{ globalThis.__result = 'error: ' + e; }}); }})()",
+        cdn.base
+    );
+    assert_eq!(evaluate_async(&mut page, &import).await, "fixture");
+    page.navigate(&format!("{}/page?visit=2", server.base)).await.unwrap();
+    assert_eq!(evaluate_async(&mut page, &import).await, "fixture");
+    let fetched = cdn.requests.lock().unwrap().iter().filter(|(path, _)| path == "/agent.mjs").count();
+    assert_eq!(fetched, 1, "the second import is served from the profile's HTTP cache");
 }
 
 // ---------------------------------------------------------------------------

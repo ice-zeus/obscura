@@ -374,6 +374,15 @@ pub struct Page {
     callbacks: Arc<CallbackRegistry>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+    /// Deadline of the parser warmup's image loads. Scripts run without
+    /// waiting for images (as in Chrome); the window load event waits for them
+    /// until this deadline (see `wait_for_render_resources`).
+    #[cfg(feature = "render")]
+    navigation_image_deadline: Option<tokio::time::Instant>,
+    /// Loads the last navigation left running (images past its font
+    /// warmups). A capture waits for these, and only these.
+    #[cfg(feature = "render")]
+    navigation_loads_in_flight: Vec<(String, Option<obscura_js::ImageRequestProfile>, bool)>,
 }
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
@@ -1186,6 +1195,10 @@ impl Page {
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
+            #[cfg(feature = "render")]
+            navigation_image_deadline: None,
+            #[cfg(feature = "render")]
+            navigation_loads_in_flight: Vec::new(),
         }
     }
 
@@ -3069,7 +3082,14 @@ impl Page {
                     "script deadline reached with load-delaying dynamic scripts still pending"
                 );
             }
-
+        }
+        // Images delay the window load event, within the parser warmup's
+        // budget (loads past it continue in the background).
+        #[cfg(feature = "render")]
+        if let Some(deadline) = self.navigation_image_deadline.take() {
+            let _ = self.wait_for_render_resources(deadline, false).await;
+        }
+        if let Some(js) = &mut self.js {
             // readyState becomes complete before the load event. A script
             // inserted by an onload handler is therefore post-load work and
             // remains pending until an explicit caller settle/wait.
@@ -3704,13 +3724,24 @@ impl Page {
         // V8, making framework startup take many seconds. This is deliberately
         // bounded: navigation should not wait indefinitely for decorative
         // resources.
+        //
+        // Web fonts are awaited here, because text metrics are what layout
+        // reads depend on. Images keep loading while scripts run, as in Chrome;
+        // the window load event waits for them with the same budget, and
+        // captures wait for whatever is still loading.
         #[cfg(feature = "render")]
         {
             let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_WARMUP_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1_000);
-            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+            self.navigation_image_deadline = None;
+            if warmup_ms != 0 && self.js.is_some() {
+                self.spawn_pending_render_resources();
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(warmup_ms);
+                let _ = self.wait_for_render_resources(deadline, !Self::warmup_waits_for_images()).await;
+                self.navigation_image_deadline = Some(deadline);
+            }
         }
         phases.mark("parser_render_resources");
 
@@ -3735,7 +3766,11 @@ impl Page {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1_000);
-            let _ = self.prepare_screenshot_resources(warmup_ms).await;
+            if warmup_ms != 0 && self.js.is_some() {
+                self.spawn_pending_render_resources();
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(warmup_ms);
+                let _ = self.wait_for_render_resources(deadline, !Self::warmup_waits_for_images()).await;
+            }
         }
 
         phases.mark("post_script_render_resources");
@@ -3748,6 +3783,11 @@ impl Page {
         // client seeing a page with no frames at all.
         self.build_document_frames().await;
         phases.mark("frames");
+        #[cfg(feature = "render")]
+        {
+            self.navigation_loads_in_flight =
+                self.js.as_ref().map(|js| js.render_resources_in_flight()).unwrap_or_default();
+        }
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             phases.report(url.as_str(), "domcontentloaded");
@@ -4132,15 +4172,56 @@ impl Page {
     /// by a later drain; they are neither cancelled nor negative-cached.
     #[cfg(feature = "render")]
     pub async fn prepare_screenshot_resources(&mut self, max_ms: u64) -> usize {
-        let started = std::time::Instant::now();
         if max_ms == 0 || self.js.is_none() {
             return 0;
         }
-        let mut loaded = 0;
         self.spawn_pending_render_resources();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
+        self.wait_for_render_resources(deadline, false).await
+    }
+
+    /// Wait up to `max_ms` for the loads the last navigation left running,
+    /// without starting any (and without waiting for loads started later).
+    /// Returns the number of loads applied.
+    #[cfg(feature = "render")]
+    pub async fn wait_for_in_flight_render_resources(&mut self, max_ms: u64) -> usize {
+        let loads = std::mem::take(&mut self.navigation_loads_in_flight);
+        let still_running = |page: &Self| page.js.as_ref().is_some_and(|js| js.any_render_resource_in_flight(&loads));
+        if max_ms == 0 || !still_running(self) {
+            return 0;
+        }
+        let Some(notify) = self.js.as_ref().map(|js| js.render_resource_notify()) else {
+            return 0;
+        };
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
+        let mut loaded = 0;
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            loaded += self.drain_render_resource_results();
+            if !still_running(self) || tokio::time::timeout_at(deadline, notified).await.is_err() {
+                loaded += self.drain_render_resource_results();
+                break;
+            }
+        }
+        loaded
+    }
+
+    /// Wait until the page-transport loads finish (only web fonts when
+    /// `fonts_only`) or `deadline` passes, applying results as they arrive.
+    /// Loads still running at the deadline continue in the background.
+    #[cfg(feature = "render")]
+    async fn wait_for_render_resources(&mut self, deadline: tokio::time::Instant, fonts_only: bool) -> usize {
+        let started = std::time::Instant::now();
+        let mut loaded = 0;
         let Some(notify) = self.js.as_ref().map(|js| js.render_resource_notify()) else {
             return loaded;
+        };
+        let pending = |page: &Self| {
+            page.js.as_ref().is_some_and(|js| {
+                if fonts_only { js.has_pending_render_font_resources() } else { js.has_pending_render_resources() }
+            })
         };
         loop {
             // Register the waiter first, then apply what already arrived,
@@ -4151,7 +4232,7 @@ impl Page {
             tokio::pin!(notified);
             notified.as_mut().enable();
             loaded += self.drain_render_resource_results();
-            if !self.has_pending_render_resources() {
+            if !pending(self) {
                 break;
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -4161,10 +4242,20 @@ impl Page {
         }
         tracing::debug!(
             loaded,
+            fonts_only,
             elapsed_ms = started.elapsed().as_millis(),
             "prepared screenshot resources through page transport"
         );
         loaded
+    }
+
+    /// Whether navigation warmups also wait for images before scripts run and
+    /// before navigation returns (`OBSCURA_RENDER_RESOURCE_WARMUP_IMAGES=1`, the
+    /// behaviour before images moved to the load event and to capture time).
+    #[cfg(feature = "render")]
+    fn warmup_waits_for_images() -> bool {
+        std::env::var("OBSCURA_RENDER_RESOURCE_WARMUP_IMAGES")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
     }
 
     /// Rasterize the current DOM to PNG bytes at `viewport` (CSS pixels), when

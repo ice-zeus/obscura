@@ -554,14 +554,22 @@ fn encode_long_full_page_png(
 pub(crate) async fn prepare_capture_resources_if_requested(
     page: &mut obscura_browser::Page,
 ) {
-    let Some(deadline_ms) = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+    match std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value != 0)
-    else {
-        return;
-    };
-    let _ = page.prepare_screenshot_resources(deadline_ms).await;
+    {
+        Some(0) => {}
+        Some(deadline_ms) => {
+            let _ = page.prepare_screenshot_resources(deadline_ms).await;
+        }
+        // Captures never start loads of their own. Navigation keeps images
+        // loading in the background after its font warmup, so a capture waits
+        // (up to 1 s, the budget the navigation warmups used to spend) for the
+        // loads already in flight, and returns at once when there are none.
+        None => {
+            let _ = page.wait_for_in_flight_render_resources(1_000).await;
+        }
+    }
 }
 
 #[cfg(feature = "render")]
