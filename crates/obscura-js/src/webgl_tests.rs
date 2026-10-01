@@ -1540,7 +1540,7 @@ fn real_webgl_stealth_readback_variance_is_profile_stable_and_consistent() {
       const c=document.createElement('canvas');c.width=64;c.height=32;
       const gl=c.getContext('webgl',{preserveDrawingBuffer:true,antialias:false});if(!gl)throw Error('WebGL unavailable');
       gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);
-      const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-0.9,-0.7,0.8,-0.7,0,0.5]),gl.STATIC_DRAW);
+      const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-0.9,-0.7,0.8,-0.7,0,0.5]),gl.STATIC_DRAW);
       const p=gl.createProgram();
       const vs=gl.createShader(gl.VERTEX_SHADER);gl.shaderSource(vs,'attribute vec2 a;varying vec2 v;void main(){v=a+1.0;gl_Position=vec4(a,0,1);}');gl.compileShader(vs);gl.attachShader(p,vs);
       const fs=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(fs,'precision mediump float;varying vec2 v;void main(){gl_FragColor=vec4(v*0.5,0.5,1);}');gl.compileShader(fs);gl.attachShader(p,fs);
