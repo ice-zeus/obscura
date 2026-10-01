@@ -2198,6 +2198,38 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Post-connection steps run per inserted node, in tree order, after the whole
+// insertion. While a script among them runs, an iframe later in tree order
+// has not run its steps yet, so it has no content window.
+let _postConnection = null;
+function _runPostConnectionSteps(nodes) {
+  const outer = _postConnection;
+  const state = { roots: nodes, index: 0, cursor: null };
+  _postConnection = state;
+  try {
+    for (let i = 0; i < nodes.length; i++) {
+      state.index = i;
+      state.cursor = null;
+      const n = nodes[i];
+      __prepareInsertedSubtree(n);
+      if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+    }
+  } finally {
+    _postConnection = outer;
+  }
+}
+function _iframeConnectionPending(iframe) {
+  const state = _postConnection;
+  if (!state) return false;
+  for (let j = state.index; j < state.roots.length; j++) {
+    const root = state.roots[j];
+    if (root !== iframe && _dom("is_inclusive_ancestor", root._nid, iframe._nid) !== "true") continue;
+    if (j > state.index) return true;
+    return !!state.cursor && _rngOrder(state.cursor, iframe) < 0;
+  }
+  return false;
+}
+
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
@@ -2217,7 +2249,10 @@ function __prepareInsertedSubtree(root) {
       seen.add(script._nid);
     }
   }
-  for (const script of scripts) __prepareInsertedScript(script);
+  for (const script of scripts) {
+    if (_postConnection) _postConnection.cursor = script;
+    __prepareInsertedScript(script);
+  }
 }
 
 function _seedDetachedTreeState(node) {
@@ -2288,6 +2323,7 @@ function _childNodeOfType(parent, type) {
 
 function _isDomNode(value) {
   return value instanceof Node
+    || (typeof globalThis.Attr === "function" && value instanceof globalThis.Attr)
     || (value !== null && typeof value === "object"
       && (typeof value._nid === "number" || value._documentShim === true));
 }
@@ -2300,15 +2336,26 @@ function _requireNodeArgument(value, method, position, iface = "Node") {
   }
 }
 
-// Exceptions come from the relevant global of the node the method was called
-// on, so a node of an iframe document throws that frame's DOMException.
-function _mutationError(method, message, name, context) {
-  let Ctor = DOMException;
-  if (context && _foreignDocumentCount) {
-    const doc = context.nodeType === 9 ? context : _nodeDocumentOf(context);
-    const view = doc && doc !== globalThis.document ? doc.defaultView : null;
-    if (view && view !== globalThis && typeof view.DOMException === "function") Ctor = view.DOMException;
+// Objects a node's methods create come from that node's relevant global. An
+// iframe document's nodes live in this realm, so their exceptions and node
+// lists take the frame window's constructors explicitly.
+function _frameViewOf(context) {
+  if (!context || !_foreignDocumentCount) return null;
+  const doc = context.nodeType === 9 ? context : _nodeDocumentOf(context);
+  const view = doc && doc !== globalThis.document ? doc.defaultView : null;
+  return view && view !== globalThis ? view : null;
+}
+function _relevantNodeList(context, list) {
+  const view = _frameViewOf(context);
+  const FrameNodeList = view && view.NodeList;
+  if (typeof FrameNodeList === "function" && FrameNodeList.prototype !== NodeList.prototype) {
+    Object.setPrototypeOf(list, FrameNodeList.prototype);
   }
+  return list;
+}
+function _mutationError(method, message, name, context) {
+  const view = _frameViewOf(context);
+  const Ctor = view && typeof view.DOMException === "function" ? view.DOMException : DOMException;
   return new Ctor(`Failed to execute '${method}' on 'Node': ${message}`, name);
 }
 
@@ -2440,10 +2487,7 @@ function _preInsertConverted(parent, args, context, reference, method) {
         : null;
       for (const n of nodes) _insertOneNode(parent, n, child, method, true);
       if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
-      for (const n of nodes) {
-        __prepareInsertedSubtree(n);
-        if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
-      }
+      _runPostConnectionSteps(nodes);
       return;
     }
   }
@@ -2566,10 +2610,7 @@ function _insertNode(parent, node, child, suppress, method) {
     : null;
   for (const n of nodes) _insertOneNode(parent, n, child, method, !isFragment);
   if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
-  for (const n of nodes) {
-    __prepareInsertedSubtree(n);
-    if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
-  }
+  _runPostConnectionSteps(nodes);
   return nodes;
 }
 
@@ -4151,11 +4192,16 @@ class Element extends Node {
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
-    return _nodeList(ids.map(_wrapEl).filter(Boolean));
+    return _relevantNodeList(this, _nodeList(ids.map(_wrapEl).filter(Boolean)));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
+    if (arguments.length === 0) {
+      const view = _frameViewOf(this);
+      throw new ((view && view.TypeError) || TypeError)(
+        "Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
+    }
     // :popover-open is a JS-observable popover state, not understood by the
     // native selector engine. Handle it here (and strip it from compound
     // selectors so the rest can still be matched natively).
@@ -4946,6 +4992,7 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    if (_postConnection && _iframeConnectionPending(this)) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4967,6 +5014,7 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_postConnection && _iframeConnectionPending(this)) return null;
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -6213,7 +6261,11 @@ class Document extends Node {
     }
     return new Cls('');
   }
-  createRange() { return new Range(); }
+  createRange() {
+    const range = new Range();
+    if (this !== globalThis.document) { range._sc = this; range._ec = this; }
+    return range;
+  }
   addEventListener(type, fn, opts) {
     _eventTargetAdd(this, type, fn, opts);
   }
@@ -6622,7 +6674,7 @@ class DocumentFragment extends Node {
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
-    return _nodeList(ids.map(_wrapEl).filter(Boolean));
+    return _relevantNodeList(this, _nodeList(ids.map(_wrapEl).filter(Boolean)));
   }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -8587,6 +8639,18 @@ if (!Element.prototype.after) {
 // These are the same implementations as Element.prototype — frameworks
 // (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
 if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
+// The legacy alias Chromium still ships.
+if (!Element.prototype.webkitMatchesSelector) {
+  Element.prototype.webkitMatchesSelector = function webkitMatchesSelector(selectors) {
+    if (arguments.length === 0) {
+      const view = _frameViewOf(this);
+      throw new ((view && view.TypeError) || TypeError)(
+        "Failed to execute 'webkitMatchesSelector' on 'Element': 1 argument required, but only 0 present.");
+    }
+    return this.matches(selectors);
+  };
+  _markNative(Element.prototype.webkitMatchesSelector);
+}
 for (const name of ["before", "after", "replaceWith", "remove"]) {
   if (!Object.prototype.hasOwnProperty.call(DocumentType.prototype, name)) {
     DocumentType.prototype[name] = Element.prototype[name];
