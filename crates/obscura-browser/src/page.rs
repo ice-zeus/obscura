@@ -2464,6 +2464,11 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        // Stealth pages fetch parser scripts through the Chrome transport like
+        // every other subresource (and its HTTP cache); the plain client would
+        // present a different TLS and header identity for script requests.
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let script_initiator = self
             .url
@@ -2473,6 +2478,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2505,9 +2512,16 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
+                    #[cfg(feature = "stealth")]
+                    let result = match stealth_client {
+                        Some(stealth_client) => {
+                            stealth_client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await
+                        }
+                        None => client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await,
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let result = client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)).await;
+                    match result
                     {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
