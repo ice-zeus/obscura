@@ -7320,6 +7320,50 @@ mod tests {
     }
 
     #[test]
+    fn new_dom_interfaces_have_browser_shapes() {
+        let mut rt = setup_runtime("<html><head><style id='s'>@media all { p { color: red } }</style></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r##"(() => {
+                    const caught = (fn) => { try { fn(); return "none"; } catch (e) { return e.message; } };
+                    const observer = new MutationObserver(() => {});
+                    const div = document.createElement("div");
+                    observer.observe(div, { childList: true });
+                    div.appendChild(document.createElement("i"));
+                    const record = observer.takeRecords()[0];
+                    const media = document.getElementById("s").sheet.cssRules[0];
+                    return [
+                        Object.prototype.toString.call(record),
+                        Object.prototype.toString.call(media),
+                        caught(() => new MutationRecord()),
+                        caught(() => new IntersectionObserverEntry({})),
+                        [MutationRecord.length, IntersectionObserverEntry.length, CSSConditionRule.length, CSSMediaRule.length],
+                        ["MutationRecord", "IntersectionObserverEntry", "CSSMediaRule", "XMLDocument"]
+                            .map(name => Object.getOwnPropertyDescriptor(globalThis, name).enumerable),
+                        Object.getOwnPropertyNames(CSSConditionRule.prototype).sort(),
+                        media.cssText,
+                        Document.prototype.importNode.length
+                    ];
+                })()"##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object MutationRecord]",
+                "[object CSSMediaRule]",
+                "Failed to construct 'MutationRecord': Illegal constructor",
+                "Failed to construct 'IntersectionObserverEntry': Illegal constructor",
+                [0, 0, 0, 0],
+                [false, false, false, false],
+                ["conditionText", "constructor"],
+                "@media all {\n  p { color: red; }\n}",
+                1
+            ])
+        );
+    }
+
+    #[test]
     fn computed_style_is_empty_outside_a_document() {
         let mut rt = setup_runtime("<html><body><div id='c' style='color: red'></div></body></html>");
         let result = rt

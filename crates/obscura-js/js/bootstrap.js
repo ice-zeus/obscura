@@ -76,6 +76,7 @@ const __obscuraCore = globalThis.Deno.core;
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
     'MutationRecord', 'CSSConditionRule', 'CSSMediaRule', 'CSSSupportsRule',
+    'IntersectionObserverEntry', 'XMLDocument',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -9372,6 +9373,9 @@ globalThis.getSelection = _markNative(function getSelection() {
   return _selectionFor(globalThis.document);
 });
 
+// Rules whose text is derived from their state serialize through this
+// symbol-keyed method, so cssText stays a single CSSRule.prototype accessor.
+const _cssRuleSerializer = Symbol("cssText");
 class CSSRule {
   static STYLE_RULE = 1;
   static CHARSET_RULE = 2;
@@ -9392,7 +9396,7 @@ class CSSRule {
     this._parentRule = null;
   }
   get type() { return this._type; }
-  get cssText() { return this._cssText; }
+  get cssText() { return this[_cssRuleSerializer] ? this[_cssRuleSerializer]() : this._cssText; }
   set cssText(_value) {}
   get parentStyleSheet() { return this._parentStyleSheet || this._parentRule?.parentStyleSheet || null; }
   get parentRule() { return this._parentRule; }
@@ -9557,7 +9561,7 @@ class CSSGroupingRule extends CSSRule {
     if (!child) throw new DOMException("The rule could not be parsed", "SyntaxError");
     child._parentRule = this;
     this._rules.splice(idx, 0, child);
-    this._nestedRulesChanged();
+    _groupingRuleChanged(this);
     return idx;
   }
   deleteRule(index) {
@@ -9565,34 +9569,33 @@ class CSSGroupingRule extends CSSRule {
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
     const [removed] = this._rules.splice(idx, 1);
     if (removed) removed._parentRule = null;
-    this._nestedRulesChanged();
+    _groupingRuleChanged(this);
   }
-  // A nested rule changes its top-level rule's text: replace that one rule in
-  // the sheet, the same incremental path as CSSStyleSheet.insertRule.
-  _nestedRulesChanged() {
-    let top = this;
-    while (top._parentRule) top = top._parentRule;
-    const sheet = top.parentStyleSheet;
-    if (!sheet) return;
-    const index = sheet._rules.indexOf(top);
-    if (index < 0) sheet._ruleChanged();
-    else sheet._ruleChanged({ index, deleteCount: 1, rules: [top.cssText] });
-  }
+}
+// A nested rule changes its top-level rule's text: replace that one rule in
+// the sheet, the same incremental path as CSSStyleSheet.insertRule.
+function _groupingRuleChanged(rule) {
+  let top = rule;
+  while (top._parentRule) top = top._parentRule;
+  const sheet = top.parentStyleSheet;
+  if (!sheet) return;
+  const index = sheet._rules.indexOf(top);
+  if (index < 0) sheet._ruleChanged();
+  else sheet._ruleChanged({ index, deleteCount: 1, rules: [top.cssText] });
 }
 
 // @media and @supports expose their nested rules; other at-rules stay opaque.
 class CSSConditionRule extends CSSGroupingRule {
-  constructor(prelude, type) {
-    super("", type);
-    this._conditionText = prelude;
+  constructor() {
+    super("", arguments[1]);
+    this._conditionText = arguments[0];
   }
   get conditionText() { return this._conditionText; }
-  get cssText() {
+  [_cssRuleSerializer]() {
     const keyword = this._type === CSSRule.MEDIA_RULE ? "@media" : "@supports";
     const body = this._rules.map(rule => "\n  " + rule.cssText).join("");
     return `${keyword} ${this._conditionText} {${body}\n}`;
   }
-  set cssText(_value) {}
 }
 class CSSMediaRule extends CSSConditionRule {
   get media() {
@@ -9607,6 +9610,9 @@ class CSSMediaRule extends CSSConditionRule {
   }
 }
 class CSSSupportsRule extends CSSConditionRule {}
+for (const RuleClass of [CSSRule, CSSStyleRule, CSSGroupingRule, CSSConditionRule, CSSMediaRule, CSSSupportsRule]) {
+  Object.defineProperty(RuleClass.prototype, Symbol.toStringTag, { value: RuleClass.name, configurable: true });
+}
 
 function _cssConditionRuleFromText(text) {
   const match = /^@(media|supports)\b/i.exec(text);
@@ -10079,7 +10085,9 @@ function _recordNode(value) {
 globalThis.MutationRecord = class MutationRecord {
   #d;
   constructor() {
-    if (arguments[0] !== _mutationRecordToken) throw new TypeError("Illegal constructor");
+    if (arguments[0] !== _mutationRecordToken) {
+      throw new TypeError("Failed to construct 'MutationRecord': Illegal constructor");
+    }
     this.#d = arguments[1];
   }
   get type() { return this.#d.type; }
@@ -10100,6 +10108,7 @@ globalThis.MutationRecord = class MutationRecord {
   get attributeNamespace() { return this.#d.attributeNamespace ?? null; }
   get oldValue() { return this.#d.oldValue; }
 };
+Object.defineProperty(MutationRecord.prototype, Symbol.toStringTag, { value: "MutationRecord", configurable: true });
 function _makeMutationRecord(type, target, init, includeOldValue) {
   return new MutationRecord(_mutationRecordToken, {
     type,
@@ -10635,13 +10644,14 @@ function _ioElementPaddingBox(element, style, measurements) {
   return _ioRect(rect.left + borderLeft, rect.top + borderTop, width, height);
 }
 // Entry fields are prototype getters over internal state, as in browsers.
+const _ioEntryToken = Symbol("IntersectionObserverEntry");
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
   #d;
-  constructor(init) {
-    if (init === undefined) {
-      throw new TypeError("Failed to construct 'IntersectionObserverEntry': 1 argument required, but only 0 present.");
+  constructor() {
+    if (arguments[0] !== _ioEntryToken) {
+      throw new TypeError("Failed to construct 'IntersectionObserverEntry': Illegal constructor");
     }
-    this.#d = init;
+    this.#d = arguments[1];
   }
   get time() { return this.#d.time; }
   get rootBounds() { return this.#d.rootBounds ?? null; }
@@ -10652,6 +10662,7 @@ globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
   get intersectionRatio() { return this.#d.intersectionRatio; }
   get target() { return this.#d.target; }
 };
+Object.defineProperty(IntersectionObserverEntry.prototype, Symbol.toStringTag, { value: "IntersectionObserverEntry", configurable: true });
 globalThis.IntersectionObserver = class IntersectionObserver {
   constructor(callback, options) {
     if (typeof callback !== "function") {
@@ -10765,7 +10776,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     // As in Chromium, an entry below the first threshold is reported as not
     // intersecting even when the boxes overlap.
     const isIntersecting = edgesTouch && this._thresholdIndex(intersectionRatio) > 0;
-    return new IntersectionObserverEntry({
+    return new IntersectionObserverEntry(_ioEntryToken, {
       target,
       isIntersecting,
       intersectionRatio,
@@ -16656,7 +16667,8 @@ if (typeof URLPattern === 'undefined') {
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
-  Document.prototype.importNode = function(node, deep) {
+  Document.prototype.importNode = function(node) {
+    const deep = arguments[1];
     _requireNodeArgument(node, "importNode", 1, "Document");
     if (node.nodeType === 9 || node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
