@@ -2155,14 +2155,11 @@ impl PreparedRender {
     }
 
     /// Whether newly available bytes for one selected image can change box
-    /// geometry. A replaced image whose two used axes are authored lengths
-    /// does not consult its natural dimensions; resource completion only
-    /// changes the pixels painted inside the existing content box.
-    ///
-    /// Keep flex/grid items on the conservative path. Their intrinsic
-    /// contribution participates in sizing algorithms even when the item has
-    /// preferred dimensions, and browsers likewise propagate image-size
-    /// invalidation through those formatting contexts.
+    /// geometry. A replaced image whose two used axes are definite does not
+    /// consult its natural dimensions; resource completion only changes the
+    /// pixels painted inside the existing content box. See
+    /// `image_intrinsics_affect_geometry` for when an axis is definite and
+    /// which flex items qualify; grid items stay on the conservative path.
     pub fn image_resource_needs_geometry(
         &self,
         tree: &DomTree,
@@ -2186,6 +2183,22 @@ impl PreparedRender {
         false
     }
 
+    /// Whether an image's natural dimensions can change any box geometry.
+    ///
+    /// They cannot when both used axes are definite and the formatting context
+    /// never consults the image's content-based sizes:
+    ///
+    /// - Each axis is an authored length, or a percentage of a parent axis
+    ///   that is itself an authored length. The parent's size must not depend
+    ///   on its content either: it is no flex/grid item, or it clips overflow
+    ///   (its automatic minimum size is then zero), or it never shrinks.
+    ///   Table boxes size cells from content and stay conservative.
+    /// - Min/max limits are lengths or `auto`, so clamping is content-free.
+    /// - A flex item's automatic minimum size is the only content-based input
+    ///   left once its basis and cross size are definite, and it only applies
+    ///   while the line shrinks. Qualify items that never shrink
+    ///   (`flex-shrink: 0`) or that are the container's only in-flow child
+    ///   and fit its content box. Grid track sizing stays conservative.
     fn image_intrinsics_affect_geometry(&self, tree: &DomTree, id: obscura_dom::tree::NodeId) -> bool {
         if !tree.get_node(id).is_some_and(|node| {
             node.as_element()
@@ -2202,45 +2215,173 @@ impl PreparedRender {
         if style.content_image.is_some() {
             return true;
         }
-        let fixed_box = matches!(style.width, crate::Dimension::Px(_))
-            && matches!(style.height, crate::Dimension::Px(_))
-            && matches!(
-                style.min_width,
-                crate::Dimension::Auto | crate::Dimension::Px(_)
-            )
-            && matches!(
-                style.min_height,
-                crate::Dimension::Auto | crate::Dimension::Px(_)
-            )
-            && matches!(
-                style.max_width,
-                crate::Dimension::Auto | crate::Dimension::Px(_)
-            )
-            && matches!(
-                style.max_height,
-                crate::Dimension::Auto | crate::Dimension::Px(_)
-            )
-            && !style.width_fit_content
-            && style.size_expressions.iter().all(Option::is_none);
-        if !fixed_box {
+        let definite = |d: crate::Dimension| matches!(d, crate::Dimension::Px(_) | crate::Dimension::Percent(_));
+        let limit = |d: crate::Dimension| matches!(d, crate::Dimension::Auto | crate::Dimension::Px(_));
+        if !definite(style.width)
+            || !definite(style.height)
+            || ![style.min_width, style.min_height, style.max_width, style.max_height]
+                .into_iter()
+                .all(limit)
+            || style.width_fit_content
+            || style.size_expressions.iter().any(Option::is_some)
+        {
             return true;
         }
 
         let mut parent = crate::dom::rendered_parent(tree, id);
-        while let Some(parent_id) = parent {
-            let Some(parent_style) = self.layout.styles.get(&parent_id) else {
-                parent = crate::dom::rendered_parent(tree, parent_id);
-                continue;
-            };
-            if parent_style.display_contents {
-                parent = crate::dom::rendered_parent(tree, parent_id);
-                continue;
+        let formatting_parent = loop {
+            let Some(parent_id) = parent else { break None };
+            match self.layout.styles.get(&parent_id) {
+                Some(parent_style) if !parent_style.display_contents => break Some((parent_id, parent_style)),
+                _ => parent = crate::dom::rendered_parent(tree, parent_id),
             }
-            return parent_style.display == crate::Display::Grid
-                || (parent_style.display == crate::Display::Flex
-                    && !parent_style.internal_flex_container);
+        };
+        let percent = matches!(style.width, crate::Dimension::Percent(_))
+            || matches!(style.height, crate::Dimension::Percent(_));
+        let Some((parent_id, parent_style)) = formatting_parent else {
+            return percent;
+        };
+        if percent && !self.percentage_basis_is_fixed(tree, id, style, parent_id, parent_style) {
+            return true;
         }
-        false
+        match parent_style.display {
+            crate::Display::Grid => true,
+            crate::Display::Flex if !parent_style.internal_flex_container => {
+                parent_style.webkit_box_display.is_some()
+                    || !self.flex_item_size_is_fixed(tree, id, style, parent_id, parent_style)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether every percentage axis of `id` resolves against a parent axis
+    /// whose used size cannot depend on the parent's content.
+    fn percentage_basis_is_fixed(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        style: &crate::LayoutStyle,
+        parent_id: obscura_dom::tree::NodeId,
+        parent: &crate::LayoutStyle,
+    ) -> bool {
+        // Out-of-flow boxes resolve against a positioned ancestor instead.
+        if style.position_fixed || style.position == Some(taffy::Position::Absolute) {
+            return false;
+        }
+        // The rendered parent is the containing block only when it is a
+        // block or (non-legacy) flex container that is not part of a table.
+        let container = match parent.display {
+            crate::Display::Block => !parent.is_table_box,
+            crate::Display::Flex => !parent.internal_flex_container && parent.webkit_box_display.is_none(),
+            _ => false,
+        };
+        if !container || parent.is_table_cell_box || parent.column_count.is_some() {
+            return false;
+        }
+        let length = |d: crate::Dimension| matches!(d, crate::Dimension::Px(_));
+        let limit = |d: crate::Dimension| matches!(d, crate::Dimension::Auto | crate::Dimension::Px(_));
+        let axis_fixed = |own: crate::Dimension, size: crate::Dimension, min: crate::Dimension, max: crate::Dimension| {
+            !matches!(own, crate::Dimension::Percent(_)) || (length(size) && limit(min) && limit(max))
+        };
+        if !axis_fixed(style.width, parent.width, parent.min_width, parent.max_width)
+            || !axis_fixed(style.height, parent.height, parent.min_height, parent.max_height)
+            || parent.width_fit_content
+            || parent.size_expressions.iter().any(Option::is_some)
+        {
+            return false;
+        }
+        // Authored lengths fix the parent's size unless its own formatting
+        // context can resize it from content: a flex item may stop shrinking
+        // at its content-based minimum, and grid tracks size from content.
+        let mut grandparent = crate::dom::rendered_parent(tree, parent_id);
+        while let Some(ancestor) = grandparent {
+            match self.layout.styles.get(&ancestor) {
+                Some(ancestor_style) if !ancestor_style.display_contents => {
+                    let sized_by_content = ancestor_style.display == crate::Display::Grid
+                        || (ancestor_style.display == crate::Display::Flex
+                            && !ancestor_style.internal_flex_container
+                            && parent.flex_shrink != Some(0.0));
+                    return !sized_by_content || parent.overflow_hidden || parent.overflow_scroll_container;
+                }
+                _ => grandparent = crate::dom::rendered_parent(tree, ancestor),
+            }
+        }
+        true
+    }
+
+    /// Whether a flex item with two definite axes keeps its preferred size
+    /// for every natural size: it never shrinks, or it is the container's only
+    /// in-flow child and its margin box fits the container's content box, so
+    /// the line has no negative free space to distribute.
+    fn flex_item_size_is_fixed(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        style: &crate::LayoutStyle,
+        parent_id: obscura_dom::tree::NodeId,
+        parent: &crate::LayoutStyle,
+    ) -> bool {
+        if !matches!(style.flex_basis, crate::Dimension::Auto | crate::Dimension::Px(_)) {
+            return false;
+        }
+        if style.flex_shrink == Some(0.0) {
+            return true;
+        }
+        if crate::dom::rendered_parent(tree, id) != Some(parent_id)
+            || style.margin_expressions.iter().any(Option::is_some)
+            || !matches!(style.box_sizing, crate::BoxSizing::ContentBox | crate::BoxSizing::BorderBox)
+        {
+            return false;
+        }
+        let only_child = crate::dom::rendered_children(tree, parent_id).into_iter().all(|child| {
+            if child == id {
+                return true;
+            }
+            if let Some(text) = tree.get_node(child).and_then(|node| node.text_content_of_text_node().map(str::to_owned)) {
+                return text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}'));
+            }
+            match self.layout.styles.get(&child) {
+                Some(child_style) => {
+                    child_style.display == crate::Display::None
+                        || child_style.position_fixed
+                        || child_style.position == Some(taffy::Position::Absolute)
+                }
+                // Comments and other nodes without a box.
+                None => tree.get_node(child).is_some_and(|node| node.as_element().is_none()),
+            }
+        });
+        if !only_child {
+            return false;
+        }
+        let Some(parent_rect) = self.layout.rects.get(&parent_id) else {
+            return false;
+        };
+        let content_width = parent_rect.width
+            - parent.padding.left - parent.padding.right - parent.border.left - parent.border.right;
+        let content_height = parent_rect.height
+            - parent.padding.top - parent.padding.bottom - parent.border.top - parent.border.bottom;
+        let outer = |size: crate::Dimension, basis: f32, edges: f32, margins: f32| {
+            let size = match size {
+                crate::Dimension::Px(value) => value,
+                crate::Dimension::Percent(fraction) => fraction * basis,
+                _ => return f32::INFINITY,
+            };
+            let border_box = if style.box_sizing == crate::BoxSizing::BorderBox { size.max(edges) } else { size + edges };
+            border_box + margins
+        };
+        let width = outer(
+            style.width,
+            content_width,
+            style.padding.left + style.padding.right + style.border.left + style.border.right,
+            style.margin.left + style.margin.right,
+        );
+        let height = outer(
+            style.height,
+            content_height,
+            style.padding.top + style.padding.bottom + style.border.top + style.border.bottom,
+            style.margin.top + style.margin.bottom,
+        );
+        width <= content_width + 0.01 && height <= content_height + 0.01
     }
 }
 
@@ -13102,6 +13243,107 @@ mod tests {
                 let pixels = paint_prepared(&tree, &mut retained, &mut resources, (0.0, 0.0)).unwrap();
                 let expected = paint_prepared(&tree, &mut oracle, &mut oracle_resources, (0.0, 0.0)).unwrap();
                 assert_eq!(pixels.data(), expected.data(), "{name} {display}");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_image_source_changes_skip_layout_only_for_definite_boxes() {
+        let make_resources = || {
+            let mut resources = RenderResourceCache::with_loader(|_url: &str| {
+                panic!("all image resources must be seeded")
+            });
+            for (url, width, height, color) in [
+                ("https://assets.test/a.svg", 1, 1, "red"),
+                ("https://assets.test/b.svg", 40, 30, "lime"),
+                ("https://assets.test/wide.svg", 400, 10, "blue"),
+                ("https://assets.test/tall.svg", 10, 400, "green"),
+            ] {
+                resources.seed_image(url.into(), ImageRequestProfile::NoCorsInclude, format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="100%" height="100%" fill="{color}"/></svg>"#,
+                ).into_bytes());
+            }
+            resources
+        };
+        // (case, style, body, natural size may change geometry)
+        for (case, css, body, affects) in [
+            // Result thumbnails: percentage boxes inside fixed clipping boxes.
+            ("percent in fixed clipped block", "main{width:68px;height:68px;overflow:hidden}img{display:block;width:100%;height:100%;object-fit:cover}",
+                "<main><img id=image></main>", false),
+            ("percent in fixed clipped flex", "main{display:flex;width:16px;height:16px;overflow:hidden}img{width:100%;height:100%}",
+                "<main> <img id=image> </main>", false),
+            ("percent in fixed block", "main{width:50px;height:40px}img{display:block;width:100%;height:50%}",
+                "<main><img id=image><aside></aside></main>", false),
+            ("clipped flex item parent", "nav{display:flex;width:90px}main{width:68px;height:68px;overflow:hidden}img{display:block;width:100%;height:100%}",
+                "<nav><main><img id=image></main><aside></aside></nav>", false),
+            ("unshrinkable parent", "nav{display:flex;width:40px}main{width:68px;height:68px;flex-shrink:0}img{display:block;width:100%;height:100%}",
+                "<nav><main><img id=image></main><aside></aside></nav>", false),
+            // Favicons: fixed flex items that never shrink.
+            ("unshrinkable fixed flex item", "main{display:flex;width:30px}img{width:18px;height:18px;flex-shrink:0}",
+                "<main><img id=image><aside></aside><aside></aside></main>", false),
+            ("fitting only flex child", "main{display:flex;width:30px;height:30px;padding:2px}img{width:20px;height:10px;margin:1px}",
+                "<main><!-- c --><img id=image></main>", false),
+            ("fixed in inline parent", "img{width:20px;height:10px}", "<main><span><img id=image></span></main>", false),
+            // Natural sizes still matter.
+            ("shrinking flex line", "main{display:flex;width:30px}img{width:20px;height:10px}",
+                "<main><img id=image><aside style='width:60px'></aside></main>", true),
+            ("overflowing only flex child", "main{display:flex;width:16px;height:16px;overflow:hidden}img{width:100%;height:100%;margin:2px}",
+                "<main><img id=image></main>", true),
+            ("percent of auto height", "main{width:50px}img{display:block;width:100%;height:100%}",
+                "<main><img id=image></main>", true),
+            ("auto axis", "main{width:50px;height:50px}img{display:block;width:auto;height:20px}",
+                "<main><img id=image></main>", true),
+            ("percent limit", "main{width:50px;height:50px}img{display:block;width:20px;height:20px;max-width:50%}",
+                "<main><img id=image></main>", true),
+            ("grid item", "main{display:grid;width:50px}img{width:20px;height:10px}",
+                "<main><img id=image></main>", true),
+            ("absolute percent", "main{position:relative;width:50px;height:50px}img{position:absolute;width:100%;height:100%}",
+                "<main><img id=image></main>", true),
+            ("table cell parent", "main{display:table-cell;width:50px;height:50px}img{display:block;width:100%;height:100%}",
+                "<main><img id=image></main>", true),
+            ("legacy box", "main{display:-webkit-box;width:50px}img{width:20px;height:10px}",
+                "<main><img id=image></main>", true),
+            ("content-sized flex item parent", "nav{display:flex;width:40px}main{width:68px;height:68px}img{display:block;width:100%;height:100%}",
+                "<nav><main><img id=image></main><aside></aside></nav>", true),
+            ("content-sized grid item parent", "nav{display:grid;width:90px}main{width:68px;height:68px}img{display:block;width:100%;height:100%}",
+                "<nav><main><img id=image></main></nav>", true),
+        ] {
+            for next in ["https://assets.test/b.svg", "https://assets.test/wide.svg", "https://assets.test/tall.svg"] {
+                let case = format!("{case} -> {next}");
+                let tree = parse_html(&format!(
+                    r#"<html><head><style>
+                        html,body{{margin:0}}aside{{width:20px;height:9px;background:black}}{css}
+                    </style></head><body>{body}<div style="height:12px;background:yellow"></div></body></html>"#,
+                ));
+                let image = tree.get_element_by_id("image").unwrap();
+                tree.with_node_mut(image, |node| node.set_attribute("src", "https://assets.test/a.svg".into()));
+                let viewport = (120.0, 100.0);
+                let mut resources = make_resources();
+                let mut cache = crate::css::StylesheetCache::default();
+                let previous = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+                    &tree, viewport, None, &mut resources, &[], &mut cache,
+                ).unwrap();
+                assert_eq!(previous.image_intrinsics_affect_geometry(&tree, image), affects, "{case}");
+                tree.with_node_mut(image, |node| node.set_attribute("src", next.into()));
+                let mut retained = prepare_dom_with_retained_attribute_styles(
+                    &tree, viewport, None, &mut resources, &[], &mut cache, previous,
+                    &[crate::dom::AttributeStyleMutation {
+                        node: image, name: "src".into(),
+                        old_value: Some("https://assets.test/a.svg".into()),
+                        new_value: Some(next.into()),
+                    }],
+                ).unwrap();
+                let mut oracle_resources = make_resources();
+                let mut oracle = prepare_dom(&tree, viewport, None, &mut oracle_resources).unwrap();
+                assert_eq!(retained.selected_images, oracle.selected_images, "{case}");
+                assert_eq!(retained.layout.rects, oracle.layout.rects, "{case}");
+                assert_eq!(retained.content_size, oracle.content_size, "{case}");
+                for (node, style) in &oracle.layout.styles {
+                    assert_eq!(format!("{:?}", retained.layout.styles[node]), format!("{style:?}"), "{case} {node:?}");
+                }
+                let pixels = paint_prepared(&tree, &mut retained, &mut resources, (0.0, 0.0)).unwrap();
+                let expected = paint_prepared(&tree, &mut oracle, &mut oracle_resources, (0.0, 0.0)).unwrap();
+                assert_eq!(pixels.data(), expected.data(), "{case}");
             }
         }
     }
