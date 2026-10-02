@@ -16,14 +16,17 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
+    chrome_sends_origin, chrome_wire_headers, combine_fetch_site, ProfileHeaders, WireRequest,
     cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
-    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    validate_url, CallbackRegistry, InFlightGuard, NavigationExchange, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
+#[cfg(feature = "stealth")]
+use crate::http_cache::{CacheLookup, HttpCache};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
 /// host *string*, so on its own it lets a public name that resolves inward
@@ -59,12 +62,100 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
+// The wreq emulation (STEALTH_PROFILE, Platform::Windows) sends this exact UA,
+// the matching sec-ch-ua brands and sec-ch-ua-platform "Windows" on the wire,
+// over that profile's TLS and HTTP/2 settings. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
+// site cross-checks the mismatch as a bot signal. Raise the version only
+// together with the profile: Chrome148 is the newest Chrome profile the pinned
+// wreq-util provides, and claiming a newer version than the TLS and HTTP/2
+// emulation would be a worse mismatch than a slightly older browser.
+#[cfg(feature = "stealth")]
+const STEALTH_PROFILE: wreq_util::Profile = wreq_util::Profile::Chrome148;
+
+#[cfg(feature = "stealth")]
+fn stealth_emulation() -> wreq_util::Emulation {
+    wreq_util::Emulation::builder()
+        .profile(STEALTH_PROFILE)
+        .platform(wreq_util::Platform::Windows)
+        .build()
+}
+
+/// The identity headers of the emulation profile. Requests are sent with the
+/// client's default headers disabled and the complete Chrome header list
+/// built per request, so a request type never inherits the navigation
+/// defaults (Sec-Fetch-Dest: document, Sec-Fetch-Mode: navigate, the HTML
+/// Accept) the profile installs as client defaults.
+#[cfg(feature = "stealth")]
+fn stealth_profile_headers() -> ProfileHeaders {
+    use wreq::IntoEmulation;
+    let emulation = stealth_emulation().into_emulation();
+    let header = |name: &str, fallback: &str| {
+        emulation
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let (sec_ch_ua, sec_ch_ua_platform) = crate::client::chrome_client_hints(STEALTH_USER_AGENT);
+    ProfileHeaders {
+        user_agent: header("user-agent", STEALTH_USER_AGENT),
+        sec_ch_ua: header("sec-ch-ua", &sec_ch_ua),
+        sec_ch_ua_mobile: header("sec-ch-ua-mobile", "?0"),
+        sec_ch_ua_platform: header("sec-ch-ua-platform", &sec_ch_ua_platform),
+        accept_encoding: header("accept-encoding", "gzip, deflate, br, zstd"),
+        accept_language: header("accept-language", "en-US,en;q=0.9"),
+    }
+}
+
+/// A request carrying exactly `headers`, in that order and HTTP/1.1 casing.
+#[cfg(feature = "stealth")]
+fn chrome_request_builder(
+    client: &wreq::Client,
+    method: wreq::Method,
+    url: &Url,
+    headers: &[(String, String)],
+    has_body: bool,
+) -> Result<wreq::RequestBuilder, ObscuraNetError> {
+    let mut map = wreq::header::HeaderMap::with_capacity(headers.len() + 2);
+    let mut order = wreq::header::OrigHeaderMap::with_capacity(headers.len() + 3);
+    order.insert("Host");
+    if url.scheme() == "http" {
+        // Chrome's HTTP/1.1 requests keep the connection alive explicitly.
+        order.insert("Connection");
+        map.insert(wreq::header::CONNECTION, wreq::header::HeaderValue::from_static("keep-alive"));
+    }
+    if has_body {
+        order.insert("Content-Length");
+    }
+    for (name, value) in headers {
+        let header_name = wreq::header::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+            .map_err(|_| ObscuraNetError::Network("Invalid HTTP header name".into()))?;
+        let header_value = wreq::header::HeaderValue::from_str(value)
+            .map_err(|_| ObscuraNetError::Network("Invalid HTTP header value".into()))?;
+        map.append(header_name, header_value);
+        order.insert(name.clone());
+    }
+    Ok(client
+        .request(method, url.as_str())
+        .default_headers(false)
+        .headers(map)
+        .orig_headers(order))
+}
+
+#[cfg(feature = "stealth")]
+fn sorted_extra(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut extra: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    extra.sort();
+    extra
+}
+
 #[cfg(feature = "stealth")]
 pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
 #[cfg(feature = "stealth")]
@@ -184,13 +275,31 @@ async fn send_get_with_connection_reset_retry(
 }
 
 #[cfg(feature = "stealth")]
+fn explicit_header_map(headers: &HashMap<String, String>) -> Result<wreq::header::HeaderMap, ObscuraNetError> {
+    let mut map = wreq::header::HeaderMap::new();
+    for (name, value) in headers {
+        let name = wreq::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| ObscuraNetError::Network("Invalid explicit HTTP header name".into()))?;
+        let value = wreq::header::HeaderValue::from_str(value)
+            .map_err(|_| ObscuraNetError::Network("Invalid explicit HTTP header value".into()))?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
+    user_agent_override: RwLock<Option<String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// The browser context's HTTP cache, shared by its pages.
+    http_cache: Option<Arc<HttpCache>>,
+    profile: ProfileHeaders,
+    proxy_url: Option<String>,
 }
 
 /// Scripted fetch exposes these headers before consuming the bounded body.
@@ -212,10 +321,7 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
-        let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
-            .build();
+        let emulation_opts = stealth_emulation();
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
@@ -277,8 +383,39 @@ impl StealthHttpClient {
             ),
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
+            user_agent_override: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            http_cache: None,
+            profile: stealth_profile_headers(),
+            proxy_url: proxy_url.map(str::to_string),
         }
+    }
+
+    /// A client with its own connection pool and the same identity, cookie
+    /// jar, HTTP cache and overrides. A synchronous load (importScripts) runs
+    /// on a helper thread while the page thread waits; a connection pooled by
+    /// the page's runtime cannot make progress then, so it needs its own.
+    pub async fn detached(&self) -> Self {
+        let mut client = Self::with_proxy(
+            self.cookie_jar.clone(),
+            self.proxy_url.as_deref(),
+            self.allow_private_network,
+        )
+        .with_http_cache(self.http_cache.clone());
+        client.block_trackers = self.block_trackers;
+        *client.extra_headers.get_mut() = self.extra_headers.read().await.clone();
+        *client.user_agent_override.get_mut() = self.user_agent_override.read().await.clone();
+        client
+    }
+
+    /// Use the browser context's HTTP cache for subresource requests.
+    pub fn with_http_cache(mut self, cache: Option<Arc<HttpCache>>) -> Self {
+        self.http_cache = cache;
+        self
+    }
+
+    pub fn http_cache(&self) -> Option<&Arc<HttpCache>> {
+        self.http_cache.as_ref()
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -290,7 +427,7 @@ impl StealthHttpClient {
         url: &Url,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, ResourceRequest::navigation(), callbacks)
+        self.fetch_with_profile(wreq::Method::GET, url, None, ResourceRequest::navigation(), callbacks)
             .await
     }
 
@@ -300,14 +437,62 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, request, callbacks).await
+        self.fetch_with_profile(wreq::Method::GET, url, None, request, callbacks).await
+    }
+
+    pub async fn post_form_with_callbacks(
+        &self,
+        url: &Url,
+        body: &str,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(wreq::Method::POST, url, Some(body.as_bytes().to_vec()), ResourceRequest::navigation(), callbacks).await
     }
 
     async fn fetch_with_profile(
         &self,
+        initial_method: wreq::Method,
         url: &Url,
+        initial_body: Option<Vec<u8>>,
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile_traced(initial_method,url,initial_body,request,callbacks,None).await
+    }
+
+    /// Navigation-only transport observations, separate from logical callbacks.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_with_trace(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        self.fetch_navigation_from(url, form, callbacks, None, false).await
+    }
+
+    /// A navigation the document started (link, form, location): Chrome
+    /// derives Sec-Fetch-Site, Referer and a POST's Origin from that document.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_from(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>, initiator: Option<&Url>, reload: bool)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        let mut trace=Vec::new();
+        let method=if form.is_some() {wreq::Method::POST} else {wreq::Method::GET};
+        let mut request = ResourceRequest::navigation();
+        request.initiator = initiator.cloned();
+        request.referrer = initiator.cloned();
+        request.reload = reload;
+        let result=self.fetch_with_profile_traced(method,url,form.map(|body|body.as_bytes().to_vec()),request,callbacks,Some(&mut trace)).await;
+        if result.is_err() {
+            if let Some(last)=trace.last_mut() { last.failed=true; }
+        }
+        (result,trace)
+    }
+
+    async fn fetch_with_profile_traced(
+        &self,
+        initial_method: wreq::Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+        mut trace: Option<&mut Vec<NavigationExchange>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -316,6 +501,9 @@ impl StealthHttpClient {
         }
 
         let mut current_url = url.clone();
+        let mut method = initial_method;
+        let mut body = initial_body;
+        let mut request_headers = self.request_headers().await;
 
         if is_tracker_blocked(&current_url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", current_url);
@@ -332,26 +520,83 @@ impl StealthHttpClient {
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
+        // Subresource GETs go through the context's HTTP cache. Documents,
+        // bodies and requests carrying caller cache directives or credentials
+        // headers bypass it, as do requests whose headers Chrome would not
+        // cache under (Authorization, Cache-Control, Pragma, Range).
+        let cache = self.http_cache.as_ref().filter(|_| {
+            method == wreq::Method::GET
+                && body.is_none()
+                && request.mode != RequestMode::Navigate
+                && !["authorization", "cache-control", "pragma", "range", "if-none-match", "if-modified-since"]
+                    .iter()
+                    .any(|name| request_headers.keys().any(|key| key.eq_ignore_ascii_case(name)))
+        });
+        let cache_key = cache.map(|_| crate::http_cache::cache_key(
+            request.top_frame.as_ref(),
+            request.initiator.as_ref(),
+            url,
+            request.sends_credentials_to(url),
+        ));
+        let mut conditional: Vec<(&'static str, String)> = Vec::new();
+        // Values sent for this request, recorded before any response can
+        // change the cookie jar (Vary is matched against what was sent).
+        let sent = if cache.is_some() {
+            self.cache_request_headers(&request, url, &request_headers)
+        } else {
+            HashMap::new()
+        };
+        if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
+            let lookup = cache.lookup(
+                key,
+                &|name| sent.get(name).cloned(),
+                request.max_response_bytes,
+                std::time::SystemTime::now(),
+            );
+            match lookup {
+                CacheLookup::Fresh(response) => {
+                    let request_info = RequestInfo {
+                        url: url.clone(),
+                        method: method.to_string(),
+                        headers: sent.clone(),
+                        resource_type: request.resource_type,
+                    };
+                    if let Some(callbacks) = callbacks {
+                        callbacks.fire_request(&request_info).await;
+                    }
+                    // CORS is checked against the stored response for every
+                    // use, exactly as for a network response.
+                    if cors_required(&request, url) {
+                        validate_cors_response(
+                            &request,
+                            url,
+                            &serialized_request_origin(&request, false),
+                            response.header("access-control-allow-origin"),
+                            response.header("access-control-allow-credentials"),
+                        )?;
+                    }
+                    if let Some(callbacks) = callbacks {
+                        callbacks.fire_response(&request_info, &response).await;
+                    }
+                    return Ok(response);
+                }
+                CacheLookup::Revalidate(headers) => conditional = headers,
+                CacheLookup::Miss => {}
+            }
+        }
+        let request_time = std::time::SystemTime::now();
+
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
+        let mut chain_site: &'static str = "none";
         for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
-            let mut req = self.client.get(current_url.as_str());
-
-            req = req
-                .header("accept", request.accept())
-                .header("sec-fetch-site", request_fetch_site(&request, &current_url))
-                .header("sec-fetch-mode", request.mode.header_value())
-                .header("sec-fetch-dest", request.destination());
-            if request.mode == RequestMode::Navigate {
-                req = req
-                    .header("upgrade-insecure-requests", "1")
-                    .header("sec-fetch-user", "?1");
-            }
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                req = req.header("referer", referer);
-            }
+            let hop_site = request_fetch_site(&request, &current_url);
+            chain_site = if redirects.is_empty() { hop_site } else { combine_fetch_site(chain_site, hop_site) };
+            let referer = request_referrer(&request, &current_url);
             let request_origin = serialized_request_origin(&request, redirect_tainted);
+            let sends_origin = chrome_sends_origin(&request, method.as_str(), &current_url)
+                && (request.initiator.is_some() || request.mode != RequestMode::Navigate);
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
                 self.cookie_jar.get_cookie_header_in_context(
@@ -359,30 +604,56 @@ impl StealthHttpClient {
                     same_site_context(
                         &request,
                         &current_url,
-                        request.mode == crate::RequestMode::Navigate,
+                        method == wreq::Method::GET || method == wreq::Method::HEAD,
                     ),
                 )
             } else {
                 String::new()
             };
-            if !cookie_header.is_empty() {
-                req = req.header("Cookie", &cookie_header);
-            }
+            // Cache validators come last, after the cookie, as in Chrome
+            // (HttpCache::Transaction adds them to the finished request).
+            let revalidating = redirects.is_empty() && !conditional.is_empty();
+            let mut extra = sorted_extra(&request_headers);
+            extra.retain(|(name, _)| name != "origin");
+            let redirected_navigation = request.mode == RequestMode::Navigate
+                && redirects.last().is_some_and(|previous: &Url| previous.origin() != current_url.origin());
+            let wire = chrome_wire_headers(
+                &WireRequest {
+                    method: method.as_str(),
+                    url: &current_url,
+                    request: &request,
+                    site: chain_site,
+                    origin: sends_origin.then_some(request_origin.as_str()),
+                    referer: referer.as_deref(),
+                    cookie: Some(cookie_header.as_str()),
+                    content_type: body.as_ref().map(|_| "application/x-www-form-urlencoded"),
+                    extra: &extra,
+                    redirected_navigation,
+                    preflight: None,
+                    conditional: if revalidating { &conditional } else { &[] },
+                },
+                &self.profile,
+            );
+            let mut req = chrome_request_builder(&self.client, method.clone(), &current_url, &wire, body.is_some())?;
 
-            for (k, v) in self.extra_headers.read().await.iter() {
-                if k.eq_ignore_ascii_case("origin") {
-                    continue;
+            let mut observed_headers = request_headers.clone();
+            observed_headers.remove("origin");
+            if sends_origin {
+                observed_headers.insert("origin".into(), request_origin.clone());
+            }
+            if revalidating {
+                for (name, value) in &conditional {
+                    observed_headers.insert((*name).to_string(), value.clone());
                 }
-                req = req.header(k.as_str(), v.as_str());
             }
-            if cors_required(&request, &current_url) {
-                req = req.header("origin", &request_origin);
+            if let Some(bytes) = &body {
+                req = req.body(bytes.clone());
+                observed_headers.insert("content-type".into(), "application/x-www-form-urlencoded".into());
             }
-
             let request_info = RequestInfo {
                 url: current_url.clone(),
-                method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                method: method.to_string(),
+                headers: observed_headers,
                 resource_type: request.resource_type,
             };
             if !request_callback_fired {
@@ -392,10 +663,17 @@ impl StealthHttpClient {
                 request_callback_fired = true;
             }
 
+            let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            if let Some(trace)=trace.as_mut() {
+                trace.push(NavigationExchange::started(&request_info,body.as_deref(),timestamp));
+            }
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = send_get_with_connection_reset_retry(req, &current_url)
-                .await
-                .map_err(|e| {
+            let result = if method == wreq::Method::GET && body.is_none() {
+                send_get_with_connection_reset_retry(req, &current_url).await
+            } else {
+                req.send().await
+            };
+            let resp = result.map_err(|e| {
                     ObscuraNetError::Network(format!(
                         "{}: {} (source: {:?})",
                         current_url,
@@ -429,6 +707,29 @@ impl StealthHttpClient {
                 );
             }
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) {
+                last.status=Some(status.as_u16());
+                last.response_headers=response_headers.clone();
+            }
+
+            if revalidating && status.as_u16() == 304 {
+                drop(resp);
+                drop(in_flight);
+                let refreshed = match (cache, cache_key.as_deref()) {
+                    (Some(cache), Some(key)) => cache.refresh(key, &response_headers, request_time, std::time::SystemTime::now()),
+                    _ => None,
+                };
+                if let Some(response) = refreshed {
+                    if let Some(callbacks) = callbacks {
+                        callbacks.fire_response(&request_info, &response).await;
+                    }
+                    return Ok(response);
+                }
+                // The entry vanished (evicted) between lookup and response:
+                // fetch it again without validators.
+                return Box::pin(self.fetch_with_profile_traced(method, url, None, request, callbacks, trace)).await;
+            }
+
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location") {
                     let location_str = location.to_str().map_err(|_| {
@@ -441,8 +742,16 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    let discard_body = matches!(status.as_u16(), 301 | 302 | 303);
+                    crate::client::strip_navigation_redirect_headers(
+                        &mut request_headers, &current_url, &next_url, discard_body,
+                    );
                     redirects.push(current_url.clone());
                     current_url = next_url;
+                    if discard_body {
+                        method = wreq::Method::GET;
+                        body = None;
+                    }
                     continue;
                 }
             }
@@ -451,6 +760,7 @@ impl StealthHttpClient {
                 .await?;
             drop(in_flight);
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) { last.response_body_size=Some(body.len()); }
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
@@ -458,6 +768,13 @@ impl StealthHttpClient {
                 body,
                 redirected_from: redirects,
             };
+            if let (Some(cache), Some(key)) = (cache, cache_key.as_deref()) {
+                if response.redirected_from.is_empty() {
+                    cache.store(key, &response, &|name| sent.get(name).cloned(), request_time, std::time::SystemTime::now());
+                } else {
+                    cache.remove(key);
+                }
+            }
             if let Some(callbacks) = callbacks {
                 callbacks.fire_response(&request_info, &response).await;
             }
@@ -465,6 +782,41 @@ impl StealthHttpClient {
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
+    }
+
+    /// Request header values for the HTTP cache: the headers this client sets
+    /// for `request` (Vary matching and the observed request on a cache hit).
+    /// Profile-wide emulation headers (user-agent, client hints,
+    /// accept-encoding, accept-language) are constant per client, so a stored
+    /// response that varies on them always matches its own profile.
+    fn cache_request_headers(
+        &self,
+        request: &ResourceRequest,
+        url: &Url,
+        request_headers: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut headers = request_headers.clone();
+        headers.insert("accept".into(), request.accept().to_string());
+        headers.insert("sec-fetch-site".into(), request_fetch_site(request, url).to_string());
+        headers.insert("sec-fetch-mode".into(), request.mode.header_value().to_string());
+        headers.insert("sec-fetch-dest".into(), request.destination().to_string());
+        if let Some(referer) = request_referrer(request, url) {
+            headers.insert("referer".into(), referer);
+        }
+        headers.remove("origin");
+        if cors_required(request, url) {
+            headers.insert("origin".into(), serialized_request_origin(request, false));
+        }
+        if request.sends_credentials_to(url) {
+            let cookie = self.cookie_jar.get_cookie_header_in_context(
+                url,
+                same_site_context(request, url, true),
+            );
+            if !cookie.is_empty() {
+                headers.insert("cookie".into(), cookie);
+            }
+        }
+        headers
     }
 
     /// One request with no redirect following, for scripted fetch()/XHR. The
@@ -501,7 +853,22 @@ impl StealthHttpClient {
         cookie_context: Option<SameSiteContext>,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
-        let response = self.send_single_headers_with_context(
+        let mut merged = self.request_headers().await;
+        crate::client::merge_request_headers(&mut merged, headers);
+        self.send_single_with_resolved_headers(method, url, &merged, body, cookie_context, store_cookies).await
+    }
+
+    /// Internal workspace entry point for an already resolved redirect snapshot.
+    pub async fn send_single_with_resolved_headers(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+    ) -> Result<Response, ObscuraNetError> {
+        let response = self.send_single_headers_with_resolved_headers(
             method, url, headers, body, cookie_context, store_cookies, 64 * 1024 * 1024,
         ).await?;
         Ok(Response {
@@ -511,7 +878,26 @@ impl StealthHttpClient {
     }
 
     /// Preserve request policy and cookie handling while deferring body reads.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_single_headers_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
+        let mut merged = self.request_headers().await;
+        crate::client::merge_request_headers(&mut merged, headers);
+        self.send_single_headers_with_resolved_headers(
+            method, url, &merged, body, cookie_context, store_cookies, max_body_bytes,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_single_headers_with_resolved_headers(
         &self,
         method: &str,
         url: &Url,
@@ -541,12 +927,7 @@ impl StealthHttpClient {
                 req = req.header("cookie", &cookie_header);
             }
         }
-        for (k, v) in self.extra_headers.read().await.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        for (k, v) in headers.iter() {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        req = req.headers(explicit_header_map(headers)?);
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
@@ -580,6 +961,148 @@ impl StealthHttpClient {
         })
     }
 
+    /// One scripted request hop (fetch(), XHR, sendBeacon, CORS preflight,
+    /// worker loads) with Chrome's complete header set for `request`: Fetch
+    /// metadata, Accept, Referer, Origin, Priority and header order, instead
+    /// of the profile's navigation defaults. `extra` holds the page script and
+    /// CDP headers; `site` is the Sec-Fetch-Site combined across redirects.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_browser_hop(
+        &self,
+        method: &str,
+        url: &Url,
+        request: &ResourceRequest,
+        site: &'static str,
+        origin: Option<&str>,
+        extra: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        preflight: Option<(&str, Option<&str>)>,
+    ) -> Result<Response, ObscuraNetError> {
+        let response = self.send_browser_hop_headers(
+            method, url, request, site, origin, extra, body, cookie_context, store_cookies, preflight,
+        ).await?;
+        Ok(Response {
+            url: url.clone(),
+            status: response.status,
+            headers: response.headers,
+            body: response.body.await?,
+            redirected_from: Vec::new(),
+        })
+    }
+
+    /// `send_browser_hop` that resolves once the response headers arrive.
+    /// The body (bounded by `request.max_response_bytes`) is read on demand,
+    /// so scripted fetch can expose the Response before the body completes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_browser_hop_headers(
+        &self,
+        method: &str,
+        url: &Url,
+        request: &ResourceRequest,
+        site: &'static str,
+        origin: Option<&str>,
+        extra: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        preflight: Option<(&str, Option<&str>)>,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
+        if is_tracker_blocked(url, self.block_trackers) {
+            tracing::debug!("Blocked tracker: {}", url);
+            return Ok(StealthResponseHeaders {
+                status: 0,
+                headers: HashMap::new(),
+                body: Box::pin(async { Ok(Vec::new()) }),
+            });
+        }
+        let req_method = method
+            .parse::<wreq::Method>()
+            .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
+        let cookie = match cookie_context {
+            Some(context) if preflight.is_none() => self.cookie_jar.get_cookie_header_in_context(url, context),
+            _ => String::new(),
+        };
+        let mut merged = self.request_headers().await;
+        crate::client::merge_request_headers(&mut merged, extra);
+        let mut extra = sorted_extra(&merged);
+        extra.retain(|(name, _)| name != "origin");
+        if preflight.is_some() {
+            extra.retain(|(name, _)| matches!(name.as_str(), "user-agent" | "accept-language"));
+        }
+        let referer = request_referrer(request, url);
+        let wire = chrome_wire_headers(
+            &WireRequest {
+                method,
+                url,
+                request,
+                site,
+                origin,
+                referer: referer.as_deref(),
+                cookie: Some(cookie.as_str()),
+                content_type: None,
+                extra: &extra,
+                redirected_navigation: false,
+                preflight,
+                conditional: &[],
+            },
+            &self.profile,
+        );
+        let mut req = chrome_request_builder(&self.client, req_method, url, &wire, !body.is_empty())?;
+        if !body.is_empty() {
+            req = req.body(body.to_vec());
+        }
+        let in_flight = InFlightGuard::new(&self.in_flight);
+        let resp = req.send().await.map_err(|e| {
+            ObscuraNetError::Network(format!("{}: {}", url, e))
+        })?;
+        let status = resp.status();
+        if store_cookies && preflight.is_none() {
+            for val in resp.headers().get_all("set-cookie") {
+                if let Ok(s) = val.to_str() {
+                    self.cookie_jar.set_cookie(s, url);
+                }
+            }
+        }
+        let mut response_headers: HashMap<String, String> = HashMap::new();
+        for (k, v) in resp.headers().iter() {
+            crate::client::merge_response_header(
+                &mut response_headers,
+                k.as_str().to_lowercase(),
+                v.to_str().unwrap_or("").to_string(),
+            );
+        }
+        let body_url = url.clone();
+        let max_body_bytes = request.max_response_bytes;
+        Ok(StealthResponseHeaders {
+            status: status.as_u16(),
+            headers: response_headers,
+            body: Box::pin(async move {
+                let _in_flight = in_flight;
+                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
+            }),
+        })
+    }
+
+    /// None preserves the selected emulation profile's existing User-Agent.
+    pub async fn set_user_agent_override(&self, user_agent: &str) {
+        *self.user_agent_override.write().await = if user_agent.is_empty() {
+            None
+        } else {
+            Some(user_agent.to_string())
+        };
+    }
+
+    pub async fn request_headers(&self) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        if let Some(user_agent) = self.user_agent_override.read().await.as_ref() {
+            headers.insert("user-agent".to_string(), user_agent.clone());
+        }
+        crate::client::merge_request_headers(&mut headers, &*self.extra_headers.read().await);
+        headers
+    }
+
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
     }
@@ -606,6 +1129,52 @@ mod tests {
         StealthHttpClient, is_tracker_blocked, send_get_with_connection_reset_retry,
         tracker_blocking_enabled,
     };
+
+    // The wire identity comes from the wreq profile, the JavaScript identity
+    // from STEALTH_USER_AGENT plus Chromium's brand algorithm. Both must name
+    // the same browser, or a site sees two different Chrome versions.
+    #[test]
+    fn stealth_user_agent_and_client_hints_match_the_emulation_profile() {
+        use wreq::IntoEmulation;
+        let emulation = super::stealth_emulation().into_emulation();
+        let header = |name: &str| {
+            emulation.headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_string)
+        };
+        let (sec_ch_ua, sec_ch_ua_platform) = crate::client::chrome_client_hints(super::STEALTH_USER_AGENT);
+        assert_eq!(header("user-agent").as_deref(), Some(super::STEALTH_USER_AGENT));
+        assert_eq!(header("sec-ch-ua"), Some(sec_ch_ua));
+        assert_eq!(header("sec-ch-ua-platform"), Some(sec_ch_ua_platform));
+        assert_eq!(header("sec-ch-ua-mobile").as_deref(), Some("?0"));
+        assert_eq!(format!("\"{}\"", super::STEALTH_UA_PLATFORM), header("sec-ch-ua-platform").unwrap());
+    }
+
+    // The brand list Chromium sends (GREASE brand, GREASE version and order)
+    // is a function of the major version. Check the algorithm against every
+    // Chrome profile wreq-util captured since the current GREASE scheme
+    // (Chrome 105), so any version the stealth profile moves to stays exact.
+    #[test]
+    fn client_hint_brands_follow_chromium_for_every_captured_chrome_profile() {
+        use wreq::IntoEmulation;
+        use wreq_util::Profile::*;
+        for profile in [
+            Chrome105, Chrome106, Chrome107, Chrome108, Chrome109, Chrome110, Chrome114, Chrome116,
+            Chrome117, Chrome118, Chrome119, Chrome120, Chrome123, Chrome124, Chrome126, Chrome127,
+            Chrome128, Chrome129, Chrome130, Chrome131, Chrome132, Chrome133, Chrome134, Chrome135,
+            Chrome136, Chrome137, Chrome138, Chrome139, Chrome140, Chrome141, Chrome142, Chrome143,
+            Chrome144, Chrome145, Chrome146, Chrome147, Chrome148,
+        ] {
+            let emulation = wreq_util::Emulation::builder()
+                .profile(profile)
+                .platform(wreq_util::Platform::Windows)
+                .build()
+                .into_emulation();
+            let header = |name: &str| {
+                emulation.headers.get(name).and_then(|value| value.to_str().ok()).unwrap().to_string()
+            };
+            let (sec_ch_ua, _) = crate::client::chrome_client_hints(&header("user-agent"));
+            assert_eq!(sec_ch_ua, header("sec-ch-ua"), "{profile:?}");
+        }
+    }
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
     use wreq::dns::{Name, Resolve};
@@ -819,7 +1388,11 @@ mod tests {
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            user_agent_override: tokio::sync::RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            http_cache: None,
+            profile: super::stealth_profile_headers(),
+            proxy_url: None,
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

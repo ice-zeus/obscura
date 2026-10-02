@@ -1,6 +1,7 @@
 pub mod client;
 pub mod cookies;
 pub mod encoding;
+pub mod http_cache;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
@@ -19,6 +20,7 @@ pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,
 };
+pub use http_cache::{cache_key, CacheLimits, CacheLookup, HttpCache};
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
@@ -26,3 +28,8 @@ pub use wreq_client::{
     StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
 };
+
+#[cfg(test)]
+mod http_identity_tests;
+#[cfg(all(test, feature = "stealth"))]
+mod http_cache_wire_tests;

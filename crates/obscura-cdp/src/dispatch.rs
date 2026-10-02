@@ -86,6 +86,11 @@ pub struct CdpContext {
     pub runtime_enabled_sessions: HashSet<String>,
     /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
     pub(crate) lifecycle_enabled_sessions: HashSet<String>,
+    pub(crate) network_enabled_sessions: HashSet<String>,
+    // Original pause recipients, scoped by actual page and request identity.
+    // Full capacity drops new completion telemetry, never inventing a request
+    // that Playwright would wait to match with a nonexistent Fetch pause.
+    pub(crate) intercepted_network_requests: HashMap<(String, String), String>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -191,6 +196,8 @@ impl CdpContext {
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
+            network_enabled_sessions: HashSet::new(),
+            intercepted_network_requests: HashMap::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -331,6 +338,7 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.clear_intercepted_network_requests(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -349,6 +357,7 @@ impl CdpContext {
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
+            self.network_enabled_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -495,6 +504,43 @@ impl CdpContext {
             self.valid_context_ids.remove(&id);
             self.execution_contexts.remove(&id)
         }).collect()
+    }
+
+    pub(crate) fn note_intercepted_network_request(&mut self, page: &str, request: &str, owner: &str) {
+        const MAX_INTERCEPTED_NETWORK_REQUESTS: usize = 4096;
+        let key = (page.to_string(), request.to_string());
+        if self.intercepted_network_requests.len() < MAX_INTERCEPTED_NETWORK_REQUESTS
+            || self.intercepted_network_requests.contains_key(&key)
+        {
+            self.intercepted_network_requests.insert(key, owner.to_string());
+        }
+    }
+
+    pub(crate) fn take_intercepted_network_requests(&mut self, page: &str) -> Vec<(String, String)> {
+        let keys: Vec<_> = self.intercepted_network_requests.keys()
+            .filter(|(owner, _)| owner == page).cloned().collect();
+        keys.into_iter().filter_map(|key| self.intercepted_network_requests.remove(&key)
+            .map(|owner| (key.1, owner))).collect()
+    }
+
+    pub(crate) fn restore_intercepted_network_requests(&mut self, page: &str, previous: Vec<(String, String)>) {
+        for (request, owner) in previous {
+            if !self.intercepted_network_requests.contains_key(&(page.to_string(), request.clone())) {
+                self.note_intercepted_network_request(page, &request, &owner);
+            }
+        }
+    }
+
+    pub(crate) fn clear_intercepted_network_requests(&mut self, page: &str) {
+        self.intercepted_network_requests.retain(|(owner, _), _| owner != page);
+    }
+
+    pub(crate) fn network_sessions_for_page(&self, page_id: &str) -> Vec<String> {
+        let mut sessions = self.network_enabled_sessions.iter()
+            .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
+            .cloned().collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
     }
 
     pub(crate) fn runtime_sessions_for_page(&self, page_id: &str) -> Vec<String> {

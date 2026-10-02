@@ -7,6 +7,12 @@
 // browser APIs below close over this reference.
 const __obscuraCore = globalThis.Deno.core;
 
+// Shared only with the embedding runtime. The host takes this handoff before
+// page code runs and stores it under a V8 private key; no reflection filtering
+// or reserved page-property names are needed for these values.
+const _hostState = Object.create(null);
+globalThis.__obscura_host_state_handoff = _hostState;
+
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
 // declarations or property assignments below: once a property is defined
@@ -22,11 +28,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
-    // Created by later evaluation, input and emulation paths. Register them
-    // before the snapshot hide list is captured, just like the other internals.
-    '__obscura_await_rejected', '__obscura_click_target',
-    '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
-    '__obscura_viewport_w', '__obscura_viewport_h',
+    // Evaluation, input and emulation state lives in _hostState, never on the
+    // global, so a page's own property with one of those names stays visible.
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
@@ -39,6 +42,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
+    '_fetchMeta', '_obscuraFetch',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -72,7 +76,7 @@ const __obscuraCore = globalThis.Deno.core;
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
-    'HTMLAudioElement', 'WebGL2RenderingContext',
+    'HTMLAudioElement', 'HTMLScriptElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
     'MutationRecord', 'CSSConditionRule', 'CSSMediaRule', 'CSSSupportsRule',
@@ -169,21 +173,32 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+// Weak, so a retired document's functions can still be collected.
+const _nativeFns = new WeakSet();
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = new WeakMap();
 const _origToString = Function.prototype.toString;
+const _toStringApply = Reflect.apply;
+// Every realm of a page (its frames) registers here: the host links a frame
+// realm's list to the page's (`copy_identity_to_realm`), so one realm's
+// Function.prototype.toString also recognizes another realm's members, as a
+// native toString does for any native function.
+_hostState.nativeRegistries = [{ fns: _nativeFns, strs: _nativeStr }];
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
-      return `function ${this.name || ''}() { [native code] }`;
+    const registries = _hostState.nativeRegistries;
+    for (let i = 0; i < registries.length; i++) {
+      const registry = registries[i];
+      if (registry.strs.has(this)) { return registry.strs.get(this); }
+      if (registry.fns.has(this)) {
+        return `function ${this.name || ''}() { [native code] }`;
+      }
     }
-    return _origToString.call(this);
+    return _toStringApply(_origToString, this, []);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
@@ -261,7 +276,13 @@ if (_origStackDesc && _origStackDesc.get) {
   });
 }
 
+// Fingerprint seeds. _fpSeed is the browser profile's seed: the host supplies
+// it per browser context, so a device's randomized surfaces stay the same on
+// every document, frame and worker of the profile. _fpDocSeed is redrawn for
+// each document and drives only the values a browser recomputes for every
+// navigation (navigation timing, heap and storage usage).
 let _fpSeed = 0;
+let _fpDocSeed = 0;
 // Dynamic module/in-order script queue. Module evaluation remains serialized
 // to prevent a re-entrant RefCell panic in deno_core's
 // futures_unordered_driver when SPAs insert multiple <script type=module>
@@ -359,7 +380,8 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", true
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin",
+      _fetchMeta('script', '', _domParse("document_url"), false, true)
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -589,13 +611,14 @@ function _cssImportApplies(media) {
   return true;
 }
 
-async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
+async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set(), referrer = null) {
   if (depth > 4 || seen.has(url)) {
     return { css: "", responseUrl: url, originClean: true };
   }
   seen.add(url);
   const raw = await __obscuraCore.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", true
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin",
+    _fetchMeta('style', 'u=0', referrer || _domParse("document_url"), false, true)
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -618,7 +641,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
     }
   );
   const imported = await Promise.all(imports.map(importUrl =>
-    _fetchLinkedCss(importUrl, pageOrigin, depth + 1, new Set(seen))
+    _fetchLinkedCss(importUrl, pageOrigin, depth + 1, new Set(seen), url)
   ));
   const responseUrl = parsed.url || url;
   const parts = imported.map(result => result.css).filter(Boolean);
@@ -676,8 +699,57 @@ function _fpRand(salt) {
   h = Math.imul(h ^ (h >>> 13), 0x45d9f3b);
   return ((h ^ (h >>> 16)) >>> 0) / 0xFFFFFFFF;
 }
+function _fpDocRand(salt) {
+  let h = (_fpDocSeed ^ (salt || 0)) | 0;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
+  h = Math.imul(h ^ (h >>> 13), 0x45d9f3b);
+  return ((h ^ (h >>> 16)) >>> 0) / 0xFFFFFFFF;
+}
 function _fpNoise(x, y, channel) {
   return (_fpRand(x * 7919 + y * 6271 + channel * 8923) - 0.5) * 4;
+}
+// Per-profile rendering variance (stealth mode only). Real devices differ in
+// how their GPU and font stack rasterize text, curves, gradients and shaded
+// geometry, so the same drawing hashes differently per device but identically
+// on every read from one device. A profile reproduces its own variant: each
+// color channel of a rendered pixel moves by at most 1, at positions chosen by
+// the profile seed (about 1 channel in 10). Alpha, empty (transparent) pixels
+// and exact operations (solid rectangles, putImageData, clears) are untouched.
+function _fpRenderVariance() { return globalThis.__obscura_stealth === true; }
+function _fpChannelNudge(x, y, channel) {
+  const n = _fpNoise(x, y, channel);
+  return n > 1.8 ? 1 : n < -1.8 ? -1 : 0;
+}
+function _fpNudgePixel(bytes, index, x, y) {
+  for (let c = 0; c < 3; c++) {
+    const delta = _fpChannelNudge(x, y, c);
+    if (delta) {
+      const value = bytes[index + c] + delta;
+      bytes[index + c] = value < 0 ? 0 : value > 255 ? 255 : value;
+    }
+  }
+}
+// GPU readback variance. Shaded content is the opaque pixels that differ from
+// a neighbour in the read region; clears and flat fills read back exactly.
+// `x0`/`y0` are drawing-buffer coordinates (origin bottom-left) of the first
+// row in memory; `up` is true when memory rows ascend in y (readPixels) and
+// false for top-down images (toDataURL and other canvas exports).
+function _fpGpuVariance(bytes, start, stride, width, rows, x0, y0, up) {
+  if (!_fpRenderVariance() || width <= 0 || rows <= 0) return;
+  const changes = [];
+  const same = (a, b) => bytes[a] === bytes[b] && bytes[a + 1] === bytes[b + 1]
+    && bytes[a + 2] === bytes[b + 2] && bytes[a + 3] === bytes[b + 3];
+  for (let row = 0; row < rows; row++) {
+    const base = start + row * stride;
+    for (let col = 0; col < width; col++) {
+      const i = base + col * 4;
+      if (bytes[i + 3] !== 255) continue;
+      if ((col > 0 && !same(i, i - 4)) || (col + 1 < width && !same(i, i + 4))
+        || (row > 0 && !same(i, i - stride)) || (row + 1 < rows && !same(i, i + stride)))
+        changes.push(i, x0 + col, up ? y0 + row : y0 - row);
+    }
+  }
+  for (let k = 0; k < changes.length; k += 3) _fpNudgePixel(bytes, changes[k], changes[k + 1], changes[k + 2]);
 }
 
 var _fpCache = null;
@@ -1094,9 +1166,11 @@ let _rafFrameScheduled = false;
 let _rafRunningFrame = false;
 let _renderOpportunityScheduled = false;
 let _renderOpportunityRunning = false;
+let _canvasPresentationPending = false;
+let _runCanvasPresentation = () => { _canvasPresentationPending = false; };
 
 function _renderOpportunityHasWork() {
-  return _rafFrameScheduled || _resizeRenderCheckpointPending
+  return _canvasPresentationPending || _rafFrameScheduled || _resizeRenderCheckpointPending
     || _intersectionRenderCheckpointPending;
 }
 
@@ -1121,6 +1195,9 @@ function _runRenderingOpportunity() {
   _renderOpportunityScheduled = false;
   _renderOpportunityRunning = true;
   try {
+    // Offscreen snapshots publish before the document's frame callbacks, so
+    // dimensions, observer records and pixels share one rendering boundary.
+    if (_canvasPresentationPending) _runCanvasPresentation();
     if (_rafFrameScheduled) _runAnimationFrameBatch();
     if (_resizeRenderCheckpointPending) _runResizeRenderCheckpoint();
     if (_intersectionRenderCheckpointPending) _runIntersectionRenderCheckpoint();
@@ -2095,6 +2172,10 @@ function __prepareInsertedScript(script) {
   if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
     return;
   }
+  // HTML's preparation algorithm marks the element started before this
+  // check. Moving it, or removing nomodule afterwards, must not run it again.
+  // The attribute only suppresses classic scripts; modules still execute.
+  if (!isModule && script.hasAttribute('nomodule')) return;
   const src = script.getAttribute('src');
   const code = src ? "" : script.textContent;
   if (!src && !code) return;
@@ -4436,7 +4517,7 @@ class Element extends Node {
       previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
     }
     globalThis.__obscura_focused = this;
-    globalThis.__obscura_click_target = this;
+    _hostState.clickTarget = this;
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
   }
@@ -4950,7 +5031,7 @@ class Element extends Node {
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', true
+      'no-cors', 'include', _fetchMeta('iframe', 'u=0, i', _domParse('document_url'), false, true)
     ).then(raw => {
       if (el._iframeLoadingUrl !== fullUrl) return;
       const response = JSON.parse(raw);
@@ -4962,10 +5043,12 @@ class Element extends Node {
         // own and runs the scripts that came with it (issue #600). The shim
         // document below stays: it is what the parent reads through
         // contentDocument.
-        const box = el.getBoundingClientRect();
+        // The frame's viewport is the iframe's content box, not its border
+        // box: Chrome reports a default 300x150 frame (304x154 with its
+        // inset border) as innerWidth 300, innerHeight 150.
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+          loadedUrl, html, Math.round(el.clientWidth) || 300, Math.round(el.clientHeight) || 150);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
@@ -5031,7 +5114,7 @@ class Element extends Node {
       if (this.parentNode === null) return null;
       this.contentDocument;
     }
-    return this._iframeWin;
+    return _windowViewFor(this._iframeWin);
   }
   get action() {
     // A missing action falls back to the document URL, a present one resolves against the base.
@@ -5174,11 +5257,13 @@ class Element extends Node {
         const opt = f.querySelector('option[selected]') || f.querySelector('option');
         val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
       } else if (tag === 'textarea') {
-        val = f.value || f.textContent || '';
+        val = f.value; // An explicitly cleared textarea must stay empty.
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
+      // HTML form entry names and string values normalize line breaks before
+      // the shared application/x-www-form-urlencoded serializer runs.
+      const enc = (s) => _formEncode(String(s).replace(/\r\n|\r|\n/g, '\r\n'));
       pairs.push(enc(name) + '=' + enc(val));
     }
 
@@ -5539,7 +5624,7 @@ class Element extends Node {
     }
   }
   getBoundingClientRect() {
-    globalThis.__obscura_click_target = this;
+    _hostState.clickTarget = this;
     // Real layout when the render feature is compiled in: ask the Rust layout
     // cache for this element's border box. The op is absent in the default
     // build, so probe with typeof and fall through to the synthetic rect below.
@@ -5636,7 +5721,7 @@ class Element extends Node {
     this._scrollIntoView(alignment, alignment, true);
   }
   _scrollIntoView(block, inline, onlyIfNeeded, behavior) {
-    globalThis.__obscura_click_target = this;
+    _hostState.clickTarget = this;
     const align = (mode, start, end, size, viewportSize, current) => {
       if (onlyIfNeeded && start >= 0 && end <= viewportSize) return current;
       if (mode === "start") return current + start;
@@ -7371,6 +7456,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
+    if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
@@ -7582,75 +7668,81 @@ for (let i = 0; i < 50; i++) {
 function Navigator() {}
 _markNative(Navigator);
 
-// PluginArray must exist before navigator is built so the plugins getter can use it.
-function PluginArray(items) {
-  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
-  this.length = items.length;
+// PluginArray, Plugin, MimeType and MimeTypeArray as Chrome exposes them:
+// indexed items are enumerable own properties, named items (plugin names, MIME
+// types) are non-enumerable own properties, and every attribute (length, name,
+// type, enabledPlugin, ...) is a prototype getter over private state. Plain
+// function declarations (no globalThis assignment) so they survive the V8
+// snapshot; global constructors are needed by site bundles (issue #305).
+const _pluginStates = new WeakMap();
+function _pluginState(receiver) {
+  const state = _pluginStates.get(receiver);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
 }
-PluginArray.prototype = Object.create(Array.prototype);
-PluginArray.prototype.constructor = PluginArray;
-PluginArray.prototype.item = function(i) { return this[i] || null; };
-PluginArray.prototype.namedItem = function(name) {
-  for (var _pi = 0; _pi < this.length; _pi++) {
-    if (this[_pi].name === name) return this[_pi];
+function _pluginList(target, items, key) {
+  for (var _i = 0; _i < items.length; _i++) target[_i] = items[_i];
+  for (var _j = 0; _j < items.length; _j++) {
+    var name = key(items[_j]);
+    if (name && !Object.prototype.hasOwnProperty.call(target, name))
+      Object.defineProperty(target, name, { value: items[_j], writable: false, enumerable: false, configurable: true });
   }
-  return null;
+}
+function _pluginGetters(proto, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, {
+      get: Object.getOwnPropertyDescriptor({ get [name]() { return _pluginState(this)[name]; } }, name).get,
+      enumerable: true, configurable: true,
+    });
+  }
+}
+function PluginArray(items) {
+  _pluginStates.set(this, { length: items.length, items });
+  _pluginList(this, items, (plugin) => plugin.name);
+}
+PluginArray.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
+PluginArray.prototype.namedItem = function(name) {
+  return _pluginState(this).items.find((plugin) => plugin.name === String(name)) || null;
 };
-PluginArray.prototype.refresh = function() {};
+PluginArray.prototype.refresh = function() { _pluginState(this); };
+_pluginGetters(PluginArray.prototype, ['length']);
 PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
 _markNative(PluginArray);
-_markNative(PluginArray.prototype.item);
-_markNative(PluginArray.prototype.namedItem);
-_markNative(PluginArray.prototype.refresh);
 
-// Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
-// global constructors; their absence threw "ReferenceError: Plugin is not
-// defined" in site bundles that reference them (issue #305). Plain function
-// declarations (no globalThis assignment) so they survive the V8 snapshot, the
-// same pattern PluginArray uses.
 function Plugin(name, filename, description, mimeTypes) {
-  this.name = name;
-  this.filename = filename;
-  this.description = description;
   var mt = mimeTypes || [];
-  for (var _i = 0; _i < mt.length; _i++) this[_i] = mt[_i];
-  this.length = mt.length;
+  _pluginStates.set(this, { name, filename, description, length: mt.length, items: mt });
+  _pluginList(this, mt, (mime) => mime.type);
 }
-Plugin.prototype.item = function(i) { return this[i] || null; };
+Plugin.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
 Plugin.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
+  return _pluginState(this).items.find((mime) => mime.type === String(name)) || null;
 };
+_pluginGetters(Plugin.prototype, ['name', 'filename', 'description', 'length']);
 Plugin.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(Plugin.prototype, Symbol.toStringTag, {value: 'Plugin', configurable: true});
 _markNative(Plugin);
-_markNative(Plugin.prototype.item);
-_markNative(Plugin.prototype.namedItem);
 
 function MimeType(type, description, suffixes, plugin) {
-  this.type = type;
-  this.description = description;
-  this.suffixes = suffixes;
-  this.enabledPlugin = plugin || null;
+  _pluginStates.set(this, { type, description, suffixes, enabledPlugin: plugin || null });
 }
+_pluginGetters(MimeType.prototype, ['type', 'suffixes', 'description', 'enabledPlugin']);
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 
 function MimeTypeArray(items) {
-  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
-  this.length = items.length;
+  _pluginStates.set(this, { length: items.length, items });
+  _pluginList(this, items, (mime) => mime.type);
 }
-MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
+MimeTypeArray.prototype.item = function(i) { return _pluginState(this).items[i >>> 0] || null; };
 MimeTypeArray.prototype.namedItem = function(name) {
-  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
-  return null;
+  return _pluginState(this).items.find((mime) => mime.type === String(name)) || null;
 };
+_pluginGetters(MimeTypeArray.prototype, ['length']);
 MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
 Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
 _markNative(MimeTypeArray);
-_markNative(MimeTypeArray.prototype.item);
-_markNative(MimeTypeArray.prototype.namedItem);
 
 globalThis.Navigator = Navigator;
 globalThis.PluginArray = PluginArray;
@@ -7697,7 +7789,7 @@ globalThis.ContentIndex = class ContentIndex {};
 
 function _chromeMajor() {
   var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
-  return m ? (m[1] | 0) : 145;
+  return m ? (m[1] | 0) : 148;
 }
 // Chromium derives the sec-ch-ua GREASE brand, version, and brand order
 // deterministically from the Chrome major version
@@ -7718,8 +7810,11 @@ function _uaBrands() {
     {brand: 'Chromium', version: String(seed)},
     {brand: 'Google Chrome', version: String(seed)},
   ];
-  var p = _BRAND_PERMS[seed % 6];
-  return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
+  // Chromium places brand i at position order[i] (ShuffleBrandList).
+  var order = _BRAND_PERMS[seed % 6];
+  var shuffled = new Array(3);
+  for (var i = 0; i < 3; i++) shuffled[order[i]] = ordered[i];
+  return shuffled;
 }
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
@@ -7777,7 +7872,28 @@ globalThis.navigator = {
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
-  sendBeacon() { return true; },
+  sendBeacon(url, data) {
+    if (arguments.length === 0) {
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': 1 argument required, but only 0 present.");
+    }
+    let target;
+    try { target = new URL(String(url), _domParse("document_url") || undefined); } catch (e) {
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': The URL argument is ill-formed or unsupported.");
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': Beacons are only supported over HTTP(S).");
+    }
+    // A beacon is a keepalive POST: no-CORS for a CORS-safelisted body type,
+    // CORS otherwise, always with credentials (Beacon section 3.2).
+    const headers = {};
+    const bytes = _serializeBody(data === undefined ? null : data, headers, true);
+    if (bytes.byteLength > 65536) return false;
+    const type = String(Object.entries(headers).find(([k]) => k.toLowerCase() === 'content-type')?.[1] || '').split(';')[0].trim().toLowerCase();
+    const safelisted = type === '' || type === 'text/plain' || type === 'application/x-www-form-urlencoded' || type === 'multipart/form-data';
+    _obscuraFetch(target.href, { method: 'POST', body: bytes, headers, mode: safelisted ? 'no-cors' : 'cors',
+      credentials: 'include', keepalive: true }, { dest: 'empty', priority: 'u=4, i' }).catch(() => {});
+    return true;
+  },
   javaEnabled() { return false; },
   geolocation: {
     getCurrentPosition(success, error) {
@@ -7811,7 +7927,7 @@ globalThis.navigator = {
     clearWatch() {},
   },
   storage: {
-    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
+    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpDocRand(640) * 100000000) }); },
     persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
   },
@@ -7834,35 +7950,40 @@ globalThis.navigator = {
   defGetter('userAgent', function() {
     return globalThis.__obscura_ua ||
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+      "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
   });
   defGetter('appVersion', function() {
     return (globalThis.__obscura_ua ||
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36").replace('Mozilla/', '');
+      "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36").replace('Mozilla/', '');
   });
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('language', function() { return _hostState.language || "en-US"; });
   defGetter('languages', function() {
-    const language = globalThis.__obscura_language || "en-US";
+    const language = _hostState.language || "en-US";
     const base = language.split('-')[0];
     return base !== language ? [language, base] : [language];
   });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
+  // Chrome lists five PDF plugins that each handle both PDF MIME types; the
+  // MIME types are enabled by the first plugin.
+  var _pdfMimeStates = [];
+  var _pdfMimes = ["application/pdf", "text/pdf"].map(function(type) {
+    var mime = new MimeType(type, "Portable Document Format", "pdf", null);
+    _pdfMimeStates.push(_pluginStates.get(mime));
+    return mime;
+  });
   var _plugins = new PluginArray([
-    new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
-    new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
-  ]);
-  var _mimeTypes = new MimeTypeArray([
-    new MimeType("application/pdf", "Portable Document Format", "pdf", null),
-    new MimeType("text/pdf", "Portable Document Format", "pdf", null),
-  ]);
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF",
+  ].map(function(name) {
+    return new Plugin(name, "internal-pdf-viewer", "Portable Document Format", _pdfMimes);
+  }));
+  _pdfMimeStates.forEach(function(state) { state.enabledPlugin = _plugins[0]; });
+  var _mimeTypes = new MimeTypeArray(_pdfMimes);
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
@@ -7883,22 +8004,22 @@ globalThis.chrome = {
   runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
-    return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
+    return { onloadT: t, startE: t - Math.floor(100 + _fpDocRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
   },
   loadTimes() {
     const t = Date.now() / 1000;
-    const request = t - 0.5 - _fpRand(611) * 0.5;
-    const startLoad = request + 0.05 + _fpRand(612) * 0.02;
-    const commit = request + 0.3 + _fpRand(613) * 0.4;
-    const finishDoc = commit + 0.1 + _fpRand(614) * 0.2;
-    const finish = finishDoc + 0.05 + _fpRand(615) * 0.1;
-    const firstPaint = commit + 0.03 + _fpRand(616) * 0.1;
+    const request = t - 0.5 - _fpDocRand(611) * 0.5;
+    const startLoad = request + 0.05 + _fpDocRand(612) * 0.02;
+    const commit = request + 0.3 + _fpDocRand(613) * 0.4;
+    const finishDoc = commit + 0.1 + _fpDocRand(614) * 0.2;
+    const finish = finishDoc + 0.05 + _fpDocRand(615) * 0.1;
+    const firstPaint = commit + 0.03 + _fpDocRand(616) * 0.1;
     const navTypes = ["BackForward","Reload","Link","Other"];
     return {
       requestTime: request, startLoadTime: startLoad * 1000, commitLoadTime: commit * 1000,
       finishDocumentLoadTime: finishDoc * 1000, finishLoadTime: finish * 1000,
       firstPaintTime: firstPaint * 1000, firstPaintAfterLoadTime: 0,
-      navigationType: navTypes[Math.floor(_fpRand(617) * 4)],
+      navigationType: navTypes[Math.floor(_fpDocRand(617) * 4)],
       wasFetchedViaSpdy: false, wasNpnNegotiated: false,
       npnNegotiatedProtocol: "http/1.1",
       wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
@@ -7915,49 +8036,106 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
+// Screen state stays private: Chrome's screen object has no own properties and
+// every attribute is a prototype getter that rejects any other receiver.
+const _screenStates = new WeakMap();
+function _screenState(screen) {
+  const state = _screenStates.get(screen);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class ScreenOrientation {
+  get type() { return 'landscape-primary'; }
+  get angle() { return 0; }
+  get onchange() { return null; }
+  set onchange(value) {}
+  lock() { return Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError')); }
+  unlock() {}
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+Object.defineProperty(ScreenOrientation.prototype, Symbol.toStringTag, {value: 'ScreenOrientation', configurable: true});
 class Screen {
   constructor(w, h, availW, availH) {
-    this._w = w; this._h = h;
-    this._availW = availW === undefined ? w : availW;
-    this._availH = availH === undefined ? h - 40 : availH;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    _screenStates.set(this, {
+      width: w, height: h,
+      availWidth: availW === undefined ? w : availW,
+      availHeight: availH === undefined ? h - 40 : availH,
+      orientation: new ScreenOrientation(),
+    });
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._availW; }
-  get availHeight() { return this._availH; }
+  get availWidth() { return _screenState(this).availWidth; }
+  get availHeight() { return _screenState(this).availHeight; }
+  get width() { return _screenState(this).width; }
+  get height() { return _screenState(this).height; }
+  get colorDepth() { _screenState(this); return 24; }
+  get pixelDepth() { _screenState(this); return 24; }
+  get availLeft() { _screenState(this); return 0; }
+  get availTop() { _screenState(this); return 0; }
+  get orientation() { return _screenState(this).orientation; }
+  get onchange() { _screenState(this); return null; }
+  set onchange(value) { _screenState(this); }
+  get isExtended() { _screenState(this); return false; }
+  addEventListener() { _screenState(this); }
+  removeEventListener() { _screenState(this); }
+  dispatchEvent() { _screenState(this); return true; }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
-  var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-  if (d && d.get) _markNative(d.get);
-});
+Object.defineProperty(Screen.prototype, Symbol.toStringTag, {value: 'Screen', configurable: true});
 globalThis.Screen = Screen;
+globalThis.ScreenOrientation = ScreenOrientation;
 globalThis.screen = new Screen(1920, 1080);
 function _applyScreenSize(w, h, emulated) {
-  if (globalThis.screen instanceof Screen) {
-    globalThis.screen._w = w;
-    globalThis.screen._h = h;
-    globalThis.screen._availW = w;
-    globalThis.screen._availH = emulated ? h : h - 40;
+  const state = _screenStates.get(globalThis.screen);
+  if (state) {
+    state.width = w;
+    state.height = h;
+    state.availWidth = w;
+    state.availHeight = emulated ? h : h - 40;
   } else {
     globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
   }
 }
-globalThis.__obscura_set_screen_override = function(w, h, emulated) {
-  globalThis.__obscura_screen_emulated = !!emulated;
+_hostState.setScreenOverride = function(w, h, emulated) {
+  _hostState.screenEmulated = !!emulated;
   if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
-    globalThis.__obscura_screen_w = w;
-    globalThis.__obscura_screen_h = h;
+    _hostState.screenWidth = w;
+    _hostState.screenHeight = h;
     _applyScreenSize(w, h, !!emulated);
     return;
   }
-  // Keep the snapshot's writable, hidden slots when clearing an override.
-  // Deleting them makes page initialization recreate read-only properties.
-  globalThis.__obscura_screen_w = undefined;
-  globalThis.__obscura_screen_h = undefined;
+  delete _hostState.screenWidth;
+  delete _hostState.screenHeight;
   const fallback = _fp('screen');
   _applyScreenSize(fallback[0], fallback[1], !!emulated);
+};
+// outerWidth/outerHeight are the browser window's size. Chrome keeps it under
+// desktop device emulation (Emulation.setDeviceMetricsOverride with
+// mobile:false), and under mobile emulation reports the emulated view size.
+// The host passes that size as the window override; without one the window
+// is the profile's own, derived from its native screen, never from an
+// emulated screen.
+function _applyOuterSize() {
+  const w = _hostState.windowWidth;
+  const h = _hostState.windowHeight;
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    globalThis.outerWidth = w;
+    globalThis.outerHeight = h;
+    return;
+  }
+  const native = _fp('screen');
+  globalThis.outerWidth = native[0];
+  globalThis.outerHeight = native[1] - 40;
+}
+_hostState.setWindowOverride = function(w, h) {
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    _hostState.windowWidth = w;
+    _hostState.windowHeight = h;
+  } else {
+    delete _hostState.windowWidth;
+    delete _hostState.windowHeight;
+  }
+  _applyOuterSize();
 };
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
@@ -8103,10 +8281,25 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
     return new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
   }
+  if (synthesizeContentType && typeof initBody === 'string'
+      && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    headers['Content-Type'] = 'text/plain;charset=UTF-8';
+  }
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
-globalThis.fetch = async (input, init = {}) => {
+// Request metadata for op_fetch_url: the Fetch destination, Chrome's
+// Priority value ('' omits the header), the referrer URL and whether the
+// request comes from a worker global scope.
+function _fetchMeta(dest, priority, referrer, worker = false, internal = false) {
+  return JSON.stringify({ dest, priority, referrer: referrer || '', worker: !!worker, internal: !!internal });
+}
+
+globalThis.fetch = async (input, init = {}) => _obscuraFetch(input, init, null);
+
+// ctx: null for the window's fetch(); { worker, referrer } for a worker's
+// fetch(); { dest, priority, internal } for browser-owned loads (worker scripts).
+async function _obscuraFetch(input, init, ctx) {
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -8140,7 +8333,9 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, false);
+  const meta = _fetchMeta(ctx && ctx.dest || 'empty', ctx && ctx.priority !== undefined ? ctx.priority : 'u=1, i',
+    ctx && ctx.referrer || _domParse("document_url"), ctx && ctx.worker, ctx && ctx.internal);
+  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, meta);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -8178,7 +8373,7 @@ globalThis.fetch = async (input, init = {}) => {
     });
   }
   return response;
-};
+}
 
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
@@ -9275,6 +9470,29 @@ function _evaluateMediaFeature(raw) {
 
   const dimension = _evaluateMediaDimension(feature);
   if (dimension !== null) return dimension;
+
+  // Device metrics: the screen and the device pixel ratio, consistent with
+  // screen.width/height and window.devicePixelRatio.
+  let device = feature.match(/^(min-|max-)?device-(width|height)\s*:\s*(.+)$/);
+  if (device) {
+    const expected = _parseMediaPx(device[3]);
+    if (expected === null) return false;
+    const state = _screenStates.get(globalThis.screen);
+    const actual = state ? state[device[2]] : 0;
+    return device[1] === 'min-' ? actual >= expected : device[1] === 'max-' ? actual <= expected : actual === expected;
+  }
+  device = feature.match(/^(min-|max-)?resolution\s*:\s*([\d.]+)(dppx|x|dpi|dpcm)$/);
+  const ratio = device ? null : feature.match(/^-webkit-(min-|max-)?device-pixel-ratio\s*:\s*([\d.]+)$/);
+  if (device || ratio) {
+    let expected = Number((device || ratio)[2]);
+    if (device && device[3] === 'dpi') expected /= 96;
+    if (device && device[3] === 'dpcm') expected = expected * 2.54 / 96;
+    if (!Number.isFinite(expected)) return false;
+    const actual = Number(globalThis.devicePixelRatio) || 1;
+    const bound = (device || ratio)[1];
+    return bound === 'min-' ? actual >= expected - 1e-9 : bound === 'max-' ? actual <= expected + 1e-9
+      : Math.abs(actual - expected) < 1e-9;
+  }
 
   let match = feature.match(/^orientation\s*:\s*(portrait|landscape)$/);
   if (match) {
@@ -11296,14 +11514,15 @@ globalThis.PopStateEvent = class extends Event {
   }
 };
 globalThis.HashChangeEvent = class extends Event {};
-globalThis.MessageEvent = class extends Event {
+globalThis.MessageEvent = class MessageEvent extends Event {
   constructor(t,o={}) {
     super(t,o);
     this.data = Object.prototype.hasOwnProperty.call(o, "data") ? o.data : null;
     this.origin = o.origin == null ? "" : String(o.origin);
     this.lastEventId = o.lastEventId == null ? "" : String(o.lastEventId);
     this.source = o.source == null ? null : o.source;
-    this.ports = Array.isArray(o.ports) ? o.ports.slice() : [];
+    // `ports` is a FrozenArray in Chrome.
+    this.ports = Object.freeze(Array.isArray(o.ports) ? o.ports.slice() : []);
   }
 };
 globalThis.ProgressEvent = class ProgressEvent extends Event {
@@ -12453,8 +12672,24 @@ globalThis.atob = globalThis.atob || ((s) => {
   globalThis.navigation = nav;
 })();
 
-globalThis.screenX = 0; globalThis.screenY = 0;
-globalThis.screenLeft = 0; globalThis.screenTop = 0;
+// The window position. The profile window is maximized on its screen
+// (outerWidth x outerHeight is the work area, the taskbar at the bottom), and
+// Chrome on Windows reports a maximized window at the work-area origin, 0/0:
+// RenderWidgetHostViewAura::GetBoundsInRootWindow removes the invisible resize
+// frame Windows places a maximized window -8/-8 outside the screen with
+// (Firefox reports that -8/-8). Under mobile emulation Chrome reports 0/0 too.
+// Any other origin would put part of the maximized window off screen.
+// Chrome defines them as [Replaceable] accessors on the window: a getter, and
+// a setter that replaces the accessor with a plain value.
+for (const name of ['screenX', 'screenY', 'screenLeft', 'screenTop']) {
+  const get = Object.getOwnPropertyDescriptor({ get [name]() { return 0; } }, name).get;
+  const set = Object.getOwnPropertyDescriptor({ set [name](value) {
+    Object.defineProperty(globalThis, name, { value, writable: true, enumerable: true, configurable: true });
+  } }, name).set;
+  _markNativeAs(get, 'function get ' + name + '() { [native code] }');
+  _markNativeAs(set, 'function set ' + name + '() { [native code] }');
+  Object.defineProperty(globalThis, name, { get, set, enumerable: true, configurable: true });
+}
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 
@@ -13080,7 +13315,18 @@ globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
+globalThis.HTMLScriptElement = class HTMLScriptElement extends Element {
+  get noModule() {
+    if (!(this instanceof HTMLScriptElement)) throw new TypeError('Illegal invocation');
+    return this.hasAttribute('nomodule');
+  }
+  set noModule(value) {
+    if (!(this instanceof HTMLScriptElement)) throw new TypeError('Illegal invocation');
+    if (value) this.setAttribute('nomodule', '');
+    else this.removeAttribute('nomodule');
+  }
+};
+Object.defineProperty(globalThis.HTMLScriptElement.prototype, 'noModule', { enumerable: true });
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = class HTMLMetaElement extends Element {
@@ -14187,26 +14433,157 @@ function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
   return receiverOrigin === expected;
 }
 
-function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+// Window.postMessage's two overloads, resolved the way Chrome's bindings do:
+// postMessage(message, targetOrigin, transfer) and postMessage(message,
+// options). With one argument, or an undefined/null/object second argument,
+// the options dictionary applies and its targetOrigin defaults to '/', so an
+// unspecified target never reaches a cross-origin window. Returns '*', '/' or
+// the serialized origin of a URL target; a target that is not a URL throws the
+// SyntaxError Chrome throws, before anything is cloned or sent.
+function _postMessageTargetOrigin(args) {
+  if (args.length === 0) {
+    throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
+  }
+  const second = args[1];
+  let targetOrigin;
+  if (args.length < 3 && (second === undefined || second === null
+      || typeof second === 'object' || typeof second === 'function')) {
+    const option = second == null ? undefined : second.targetOrigin;
+    targetOrigin = option === undefined ? '/' : String(option);
+  } else {
+    targetOrigin = String(second);
+  }
+  if (targetOrigin === '*' || targetOrigin === '/') return targetOrigin;
+  let origin = null;
+  try { origin = new URL(targetOrigin).origin; } catch (_) {}
+  if (origin === null) {
+    throw new DOMException(`Failed to execute 'postMessage' on 'Window': Invalid target origin '${targetOrigin}' in a call to 'postMessage'.`, 'SyntaxError');
+  }
+  return origin;
+}
+
+const _base64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const _base64Codes = (() => {
+  const codes = new Uint8Array(128);
+  for (let i = 0; i < _base64Alphabet.length; i++) codes[_base64Alphabet.charCodeAt(i)] = i;
+  return codes;
+})();
+// Private codecs for the message envelope. The page's own btoa/atob are
+// writable globals and must not be able to break or observe the transport.
+function _messageBytesToBase64(bytes) {
+  const parts = [];
+  let chunk = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    chunk += _base64Alphabet[a >> 2] + _base64Alphabet[((a & 3) << 4) | (b >> 4)]
+      + (i + 1 < bytes.length ? _base64Alphabet[((b & 15) << 2) | (c >> 6)] : '=')
+      + (i + 2 < bytes.length ? _base64Alphabet[c & 63] : '=');
+    if (chunk.length >= 8192) { parts.push(chunk); chunk = ''; }
+  }
+  parts.push(chunk);
+  return parts.join('');
+}
+function _messageBase64ToBytes(text) {
+  let length = (text.length / 4) * 3;
+  if (text.endsWith('==')) length -= 2; else if (text.endsWith('=')) length -= 1;
+  const bytes = new Uint8Array(length);
+  for (let i = 0, j = 0; i < text.length; i += 4) {
+    const n = (_base64Codes[text.charCodeAt(i)] << 18) | (_base64Codes[text.charCodeAt(i + 1)] << 12)
+      | (_base64Codes[text.charCodeAt(i + 2)] << 6) | _base64Codes[text.charCodeAt(i + 3)];
+    if (j < length) bytes[j++] = n >> 16;
+    if (j < length) bytes[j++] = (n >> 8) & 255;
+    if (j < length) bytes[j++] = n & 255;
+  }
+  return bytes;
+}
+
+// Platform objects a browser refuses to clone. V8's serializer would otherwise
+// copy this engine's script-implemented nodes, windows and events as plain
+// objects, walking the whole document behind them.
+function _assertMessageCloneable(value, seen) {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return;
+  seen.add(value);
+  let name = null;
+  try {
+    if (value instanceof EventTarget || value instanceof Event
+        || value === globalThis || (typeof _IframeWindow === 'function' && value instanceof _IframeWindow)
+        || (typeof _RemoteWindow === 'function' && value instanceof _RemoteWindow)) {
+      name = (value.constructor && value.constructor.name) || 'Object';
+    }
+  } catch (_) {}
+  if (name !== null) {
+    throw new DOMException(`Failed to execute 'postMessage' on 'Window': ${name} object could not be cloned.`, 'DataCloneError');
+  }
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+  if (value instanceof Map) {
+    for (const [k, v] of value) { _assertMessageCloneable(k, seen); _assertMessageCloneable(v, seen); }
+    return;
+  }
+  if (value instanceof Set) {
+    for (const v of value) _assertMessageCloneable(v, seen);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    let child;
+    try { child = value[key]; } catch (_) { continue; }
+    _assertMessageCloneable(child, seen);
+  }
+}
+
+function _throwMessageCloneError(message) {
+  throw new DOMException(`Failed to execute 'postMessage' on 'Window': ${message}`, 'DataCloneError');
+}
+
+// The structured clone of a postMessage payload, as text the host can carry
+// between realms. JSON-exact primitives travel as {"v": value}; everything else
+// is V8's own structured serialization ({"sc": base64}), so Date, Map, Set,
+// RegExp, BigInt, typed arrays, undefined, NaN, -0, sparse arrays and cycles
+// arrive intact, and a function or symbol throws DataCloneError at the call.
+// The receiving realm deserializes into its own objects (_readRealmMessage).
+function _serializeRealmMessage(data) {
+  if (data === null || typeof data === 'string' || typeof data === 'boolean'
+      || (typeof data === 'number' && Number.isFinite(data) && !Object.is(data, -0))) {
+    return JSON.stringify({ v: data });
+  }
+  const ops = __obscuraCore.ops;
+  if (typeof ops.op_serialize === 'function') {
+    _assertMessageCloneable(data, new Set());
+    const bytes = ops.op_serialize(data, undefined, undefined, false, _throwMessageCloneError);
+    return '{"sc":"' + _messageBytesToBase64(bytes) + '"}';
+  }
   let json;
-  // Structured clone cannot cross realms here. JSON carries what postMessage is
-  // actually used for; anything else throws the same DataCloneError a browser
-  // throws for an unclonable value, rather than arriving silently as null.
   try {
     json = JSON.stringify({ v: data === undefined ? null : data });
   } catch (_) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
-  if (json === undefined) json = '{"v":null}';
-  // An unspecified targetOrigin stays permissive (empty string); the receiver
-  // enforces a specified one against its own origin in __obscura_deliverMessage.
+  return json === undefined ? '{"v":null}' : json;
+}
+
+function _readRealmMessage(text) {
+  const envelope = JSON.parse(text);
+  if (envelope && typeof envelope.sc === 'string') {
+    return __obscuraCore.ops.op_deserialize(
+      _messageBase64ToBytes(envelope.sc), undefined, undefined, undefined, false);
+  }
+  return envelope ? envelope.v : null;
+}
+
+// `targetOrigin` is the result of _postMessageTargetOrigin; the receiver
+// enforces it against its own origin in __obscura_deliverMessage. The host
+// takes the sender's frame and origin from the calling realm.
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+  const json = _serializeRealmMessage(data);
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
   if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
-  // Top-level self-posts also work in a standalone runtime without a Page to
-  // drain cross-realm messages. Serialize only once, before scheduling.
+  // A top-level self-post needs no host round trip, and also works in a
+  // standalone runtime without a Page to drain cross-realm messages. The clone
+  // is taken at the call: a later mutation of the original does not reach the
+  // listener. It is queued as a task because postMessage never delivers
+  // synchronously, and a targetOrigin naming another origin drops it.
   const origin = _realmOrigin();
   if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
-  const clone = JSON.parse(json).v;
+  const clone = _readRealmMessage(json);
   setTimeout(() => {
     try {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
@@ -14237,7 +14614,10 @@ function _ensureInitialFrameRealm(element) {
   // An opaque sandbox must never receive the creator's security token.
   if (element.hasAttribute('sandbox') &&
       !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
-  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
+  // The frame's viewport is the iframe's content box, as for a fetched frame.
+  const viewportWidth = Math.round(element.clientWidth) || 300;
+  const viewportHeight = Math.round(element.clientHeight) || 150;
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, viewportWidth, viewportHeight, (child, id) => {
     const core = child.__obscura_core_handoff;
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
     delete child.__obscura_core_handoff;
@@ -14255,8 +14635,8 @@ function _ensureInitialFrameRealm(element) {
       top: { value: globalThis.top, configurable: true },
       frameElement: { value: element, configurable: true },
     });
-    child.innerWidth = 300;
-    child.innerHeight = 150;
+    child.innerWidth = viewportWidth;
+    child.innerHeight = viewportHeight;
     globalThis.__obscura_frameObjects[id] = {
       window: child, document: child.document, initial: true,
     };
@@ -14277,46 +14657,79 @@ function _ensureInitialFrameRealm(element) {
 // wrapped only to keep `postMessage` meaning "send *into* the frame from
 // here". Calling the frame's own postMessage would make the frame both sender
 // and receiver, losing the sender's origin and source.
+// Window wrappers made here, so a wrapper is recognized without a marker
+// property a page could see through `in` or a property read.
+const _realmWindowWrappers = new WeakSet();
+
+// postMessage as Chrome exposes it on every window: one declared parameter, a
+// native-looking source, and argument handling before anything is sent.
+function _windowPostMessage(send) {
+  return _markNative({
+    postMessage(message) {
+      const targetOrigin = _postMessageTargetOrigin(arguments);
+      send.call(this, message, targetOrigin);
+    },
+  }.postMessage);
+}
+
 function _frameWindowFor(frameId) {
   if (!frameId) return null;
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || null;
+  if (!real) return existing ? _windowViewFor(existing) : null;
+  // An initial about:blank frame's global is the window itself: its own
+  // postMessage already targets it, and contentDocument.defaultView is it.
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
-  if (existing && existing.__obscura_wrapsRealm) return existing;
+  if (existing && _realmWindowWrappers.has(existing)) return existing;
 
-  const post = _markNative(function (data, targetOrigin, _transfer) {
+  const post = _windowPostMessage((data, targetOrigin) => {
     _sendRealmMessage(frameId, data, targetOrigin);
   });
   const win = new Proxy(real, {
     get(target, prop) {
       if (prop === 'postMessage') return post;
-      if (prop === '__obscura_wrapsRealm') return true;
       // Not `receiver`: an accessor on a real global must run with the global
       // itself as `this`, not with this proxy.
-      return Reflect.get(target, prop);
-    },
-    has(target, prop) {
-      return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
+      const value = Reflect.get(target, prop);
+      // `self`, `window` and `frames` name the WindowProxy the page holds.
+      return value === target ? win : value;
     },
   });
+  _realmWindowWrappers.add(win);
   globalThis.__obscura_frameWindows[frameId] = win;
   return win;
 }
 
 // The host calls this inside the target realm.
-globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+// `value`/`hasValue`: the host already deserialized a structured clone in
+// this realm (see deliver_message_in_realm); otherwise `dataJson` is decoded.
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin, value, hasValue) {
   // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
   // origin, the same check a real browser does at delivery time. A mismatch
   // drops the message silently.
   if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
   let data = null;
-  try { data = JSON.parse(dataJson).v; } catch (_) {}
-  // Who to reply to: the frame above, or one of the frames below.
+  try {
+    data = hasValue === true ? value : _readRealmMessage(dataJson);
+  } catch (error) {
+    // Chrome fires `messageerror` when a payload cannot be deserialized here.
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('messageerror', { data: null, origin, source: null })));
+    } catch (_) {}
+    return;
+  }
+  // Who to reply to: this window itself, the frame above, or one of the
+  // frames below.
   const source = (globalThis.__obscura_frameId !== 0
+                  && sourceFrameId === (globalThis.__obscura_frameId >>> 0))
+    ? globalThis
+    : (globalThis.__obscura_frameId !== 0
                   && sourceFrameId === globalThis.__obscura_parentFrameId)
     ? globalThis.parent
-    : _frameWindowFor(sourceFrameId);
+    : (globalThis.__obscura_frameId !== 0 && sourceFrameId === 0)
+      ? globalThis.top
+      : _frameWindowFor(sourceFrameId);
   try {
     // Trusted, because the user agent delivers this event: the sender called
     // postMessage, it did not dispatch this. Real embedders check the flag and
@@ -14339,7 +14752,6 @@ class _RemoteWindow {
   constructor(frameId) {
     Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
   }
-  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
@@ -14352,7 +14764,12 @@ class _RemoteWindow {
   blur() {}
   close() {}
 }
-_markNative(_RemoteWindow.prototype.postMessage);
+Object.defineProperty(_RemoteWindow.prototype, 'postMessage', {
+  value: _windowPostMessage(function (data, targetOrigin) {
+    _sendRealmMessage(this._frameId, data, targetOrigin);
+  }),
+  writable: true, enumerable: true, configurable: true,
+});
 
 const _remoteWindows = new Map();
 function _remoteWindow(frameId) {
@@ -14397,11 +14814,6 @@ class _IframeWindow {
     this.closed = false;
     this.navigator = globalThis.navigator;
     this.screen = globalThis.screen;
-    this.innerWidth = 300;
-    this.innerHeight = 150;
-    this.outerWidth = 300;
-    this.outerHeight = 150;
-    this.devicePixelRatio = globalThis.devicePixelRatio;
     this.localStorage = globalThis.localStorage;
     this.sessionStorage = globalThis.sessionStorage;
     this.performance = globalThis.performance;
@@ -14428,14 +14840,17 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, targetOrigin, _transfer) {
-    // Into the frame's own realm, through the host. This used to dispatch the
-    // event on the *parent's* window, so a page could never actually talk to
-    // the document inside its iframe. A frame that has not loaded yet has no
-    // browsing context to receive anything.
-    if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data, targetOrigin);
-  }
+  // Chrome reports the browser window's outer size and position in every
+  // frame, and the frame's own viewport, the iframe's box, as its inner size.
+  get outerWidth() { return globalThis.outerWidth; }
+  get outerHeight() { return globalThis.outerHeight; }
+  get screenX() { return globalThis.screenX; }
+  get screenY() { return globalThis.screenY; }
+  get screenLeft() { return globalThis.screenLeft; }
+  get screenTop() { return globalThis.screenTop; }
+  get devicePixelRatio() { return globalThis.devicePixelRatio; }
+  get innerWidth() { return _iframeViewportSize(this, 'clientWidth', 300); }
+  get innerHeight() { return _iframeViewportSize(this, 'clientHeight', 150); }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
   clearTimeout(id) { globalThis.clearTimeout(id); }
@@ -14468,12 +14883,130 @@ class _IframeWindow {
   blur() {}
 }
 
+// Into the frame's own realm, through the host. This used to dispatch the
+// event on the *parent's* window, so a page could never actually talk to the
+// document inside its iframe. A frame that has not loaded yet has no browsing
+// context to receive anything.
+Object.defineProperty(_IframeWindow.prototype, 'postMessage', {
+  value: _windowPostMessage(function (data, targetOrigin) {
+    if (!this._frameId) return;
+    _sendRealmMessage(this._frameId, data, targetOrigin);
+  }),
+  writable: true, enumerable: true, configurable: true,
+});
+
+// The iframe's content box, the viewport of the document inside it. The same
+// fallback as the realm's own viewport when there is no layout to ask.
+function _iframeViewportSize(win, metric, fallback) {
+  const element = win.document && win.document._iframeEl;
+  if (!element) return fallback;
+  let size = 0;
+  try { size = Math.round(element[metric]); } catch (_) {}
+  return size || fallback;
+}
+
+// A window in another origin, as script in this realm sees it: Chrome's
+// cross-origin WindowProxy. Only the cross-origin members are reachable; every
+// other read, write, definition or reflection throws SecurityError, and the
+// four names the HTML fallback covers read as undefined.
+const _crossOriginWindowViews = new WeakMap();
+const _crossOriginWindowNames = ['window', 'self', 'location', 'close', 'closed', 'focus', 'blur',
+  'frames', 'length', 'top', 'opener', 'parent', 'postMessage'];
+const _crossOriginFallbackKeys = ['then', Symbol.toStringTag, Symbol.hasInstance, Symbol.isConcatSpreadable];
+
+function _windowIsCrossOrigin(win) {
+  const url = win._url;
+  if (!url || url === 'about:blank' || url === 'about:srcdoc') return false;
+  let origin = 'null';
+  try { origin = new URL(url).origin; } catch (_) { return false; }
+  return origin === 'null' || origin !== _realmOrigin();
+}
+
+// Chrome names the operation for a property read or write, and reports only
+// the block for `in`, descriptor reflection, definition and deletion.
+function _crossOriginError(action, property, interfaceName) {
+  const blocked = `Blocked a frame with origin "${_realmOrigin()}" from accessing a cross-origin frame.`;
+  if (action !== 'read' && action !== 'set') return new DOMException(blocked, 'SecurityError');
+  const name = typeof property === 'symbol' ? property.toString() : String(property);
+  return new DOMException(`Failed to ${action} a named property '${name}' ${action === 'set' ? 'on' : 'from'} '${interfaceName}': `
+    + blocked, 'SecurityError');
+}
+
+function _crossOriginView(members, interfaceName, setter) {
+  const target = {};
+  const allowed = new Set(Object.keys(members));
+  const blocked = (action, prop) => { throw _crossOriginError(action, prop, interfaceName); };
+  const describe = (prop) => {
+    if (_crossOriginFallbackKeys.includes(prop)) {
+      return { value: undefined, writable: false, enumerable: false, configurable: true };
+    }
+    if (!allowed.has(prop)) blocked('get', prop);
+    const member = members[prop];
+    return member.method
+      ? { value: member.get(), writable: false, enumerable: false, configurable: true }
+      : { get: member.get, set: member.set, enumerable: false, configurable: true };
+  };
+  return new Proxy(target, {
+    get(_, prop) {
+      if (_crossOriginFallbackKeys.includes(prop)) return undefined;
+      if (!allowed.has(prop)) blocked('read', prop);
+      return members[prop].get();
+    },
+    set(_, prop, value) {
+      if (allowed.has(prop) && members[prop].set) { members[prop].set(value); return true; }
+      if (setter) return setter(prop, value);
+      blocked('set', prop);
+    },
+    has(_, prop) {
+      if (allowed.has(prop) || _crossOriginFallbackKeys.includes(prop)) return true;
+      blocked('get', prop);
+    },
+    ownKeys() { return [...allowed, ..._crossOriginFallbackKeys]; },
+    getOwnPropertyDescriptor(_, prop) { return describe(prop); },
+    defineProperty(_, prop) { blocked('define', prop); },
+    deleteProperty(_, prop) { blocked('delete', prop); },
+    getPrototypeOf() { return null; },
+    setPrototypeOf(_, proto) { return proto === null; },
+    isExtensible() { return true; },
+    preventExtensions() { return false; },
+  });
+}
+
+function _windowViewFor(win) {
+  if (!win || _realmWindowWrappers.has(win)) return win;
+  let raw = win;
+  try { if (!_windowIsCrossOrigin(raw)) return win; } catch (_) { return win; }
+  let view = _crossOriginWindowViews.get(raw);
+  if (view) return view;
+  const constant = (value) => ({ get: () => value });
+  const method = (fn) => ({ method: true, get: () => fn });
+  const close = _markNative({ close() {} }.close);
+  const focus = _markNative({ focus() {} }.focus);
+  const blur = _markNative({ blur() {} }.blur);
+  const post = _windowPostMessage(function (data, targetOrigin) {
+    if (raw._frameId) _sendRealmMessage(raw._frameId, data, targetOrigin);
+  });
+  const replace = _markNative({ replace(url) {} }.replace);
+  const location = _crossOriginView({ replace: method(replace), href: { get: () => { throw _crossOriginError('read', 'href', 'Location'); }, set: () => {} } }, 'Location');
+  const members = {
+    window: { get: () => view }, self: { get: () => view }, frames: { get: () => view },
+    location: { get: () => location, set: () => {} },
+    close: method(close), focus: method(focus), blur: method(blur), postMessage: method(post),
+    closed: { get: () => !!raw.closed }, length: constant(0),
+    top: { get: () => globalThis.top }, parent: { get: () => globalThis },
+    opener: { get: () => null, set: () => {} },
+  };
+  view = _crossOriginView(members, 'Window');
+  _crossOriginWindowViews.set(raw, view);
+  return view;
+}
+
 // Encode an RGBA pixel buffer into a valid PNG data URL.
 // Uses stored-block DEFLATE (no compression) wrapped in zlib.
 // This produces a larger file than a real browser but the hash is unique
 // per session (from _fpNoise) and valid, so it does not match the known
 // headless stub.
-function _encodePNG(w, h, rgba) {
+function _encodePNG(w, h, rgba, bytesOnly = false) {
   // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
   var rowLen = 1 + w * 4;
   var raw = new Uint8Array(h * rowLen);
@@ -14529,6 +15062,7 @@ function _encodePNG(w, h, rgba) {
   p = putChunk(png, p, 'IHDR', ihd);
   p = putChunk(png, p, 'IDAT', def);
   putChunk(png, p, 'IEND', new Uint8Array(0));
+  if (bytesOnly) return png;
   // Base64 encode
   var C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   var b64 = 'data:image/png;base64,';
@@ -14543,13 +15077,113 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+let _canvas2DPixels, _canvas2DTaint, _canvas2DTake;
+const _canvas2DContexts = new WeakMap();
+const _canvas2DContext = canvas => _canvas2DContexts.get(canvas);
+const _canvasDOMOwners = new WeakMap();
+let _canvasDocumentEpoch = 0;
+function _canvasDOMOwner(canvas) {
+  const owner = _canvasDOMOwners.get(canvas);
+  if (!owner || owner.frame !== _realmFrameId || owner.epoch !== _canvasDocumentEpoch
+      || owner.generation !== _hostState.documentGeneration || owner.node !== canvas._nid
+      || _cache.get(owner.node) !== canvas) return null;
+  return owner;
+}
+function _requireCanvasOwner(canvas) {
+  if (!_canvasDOMOwners.has(canvas)) throw new TypeError('Illegal invocation');
+  const owner = _canvasDOMOwner(canvas);
+  if (!owner) throw new DOMException('Canvas document is unavailable', 'InvalidStateError');
+  return owner;
+}
+// CSS <color> for canvas styles: hex, rgb()/rgba() in comma or space syntax
+// with numbers or percentages, hsl()/hsla(), named colors and transparent.
+// Alpha is clamped to [0, 1] as CSS requires, so `rgba(r, g, b, 255)` is opaque.
+const _cssNamedColors = (() => {
+  const table = {};
+  const packed = 'aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 azure f0ffff beige f5f5dc bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff blueviolet 8a2be2 brown a52a2a burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 chocolate d2691e coral ff7f50 cornflowerblue 6495ed cornsilk fff8dc crimson dc143c cyan 00ffff darkblue 00008b darkcyan 008b8b darkgoldenrod b8860b darkgray a9a9a9 darkgreen 006400 darkgrey a9a9a9 darkkhaki bdb76b darkmagenta 8b008b darkolivegreen 556b2f darkorange ff8c00 darkorchid 9932cc darkred 8b0000 darksalmon e9967a darkseagreen 8fbc8f darkslateblue 483d8b darkslategray 2f4f4f darkslategrey 2f4f4f darkturquoise 00ced1 darkviolet 9400d3 deeppink ff1493 deepskyblue 00bfff dimgray 696969 dimgrey 696969 dodgerblue 1e90ff firebrick b22222 floralwhite fffaf0 forestgreen 228b22 fuchsia ff00ff gainsboro dcdcdc ghostwhite f8f8ff gold ffd700 goldenrod daa520 gray 808080 green 008000 greenyellow adff2f grey 808080 honeydew f0fff0 hotpink ff69b4 indianred cd5c5c indigo 4b0082 ivory fffff0 khaki f0e68c lavender e6e6fa lavenderblush fff0f5 lawngreen 7cfc00 lemonchiffon fffacd lightblue add8e6 lightcoral f08080 lightcyan e0ffff lightgoldenrodyellow fafad2 lightgray d3d3d3 lightgreen 90ee90 lightgrey d3d3d3 lightpink ffb6c1 lightsalmon ffa07a lightseagreen 20b2aa lightskyblue 87cefa lightslategray 778899 lightslategrey 778899 lightsteelblue b0c4de lightyellow ffffe0 lime 00ff00 limegreen 32cd32 linen faf0e6 magenta ff00ff maroon 800000 mediumaquamarine 66cdaa mediumblue 0000cd mediumorchid ba55d3 mediumpurple 9370db mediumseagreen 3cb371 mediumslateblue 7b68ee mediumspringgreen 00fa9a mediumturquoise 48d1cc mediumvioletred c71585 midnightblue 191970 mintcream f5fffa mistyrose ffe4e1 moccasin ffe4b5 navajowhite ffdead navy 000080 oldlace fdf5e6 olive 808000 olivedrab 6b8e23 orange ffa500 orangered ff4500 orchid da70d6 palegoldenrod eee8aa palegreen 98fb98 paleturquoise afeeee palevioletred db7093 papayawhip ffefd5 peachpuff ffdab9 peru cd853f pink ffc0cb plum dda0dd powderblue b0e0e6 purple 800080 rebeccapurple 663399 red ff0000 rosybrown bc8f8f royalblue 4169e1 saddlebrown 8b4513 salmon fa8072 sandybrown f4a460 seagreen 2e8b57 seashell fff5ee sienna a0522d silver c0c0c0 skyblue 87ceeb slateblue 6a5acd slategray 708090 slategrey 708090 snow fffafa springgreen 00ff7f steelblue 4682b4 tan d2b48c teal 008080 thistle d8bfd8 tomato ff6347 turquoise 40e0d0 violet ee82ee wheat f5deb3 white ffffff whitesmoke f5f5f5 yellow ffff00 yellowgreen 9acd32';
+  const parts = packed.split(' ');
+  for (let i = 0; i < parts.length; i += 2) {
+    const hex = parts[i + 1];
+    table[parts[i]] = [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16), 255];
+  }
+  table.transparent = [0, 0, 0, 0];
+  return table;
+})();
+function _canvasParseColor(css) {
+  if (!css || typeof css !== 'string') return [0,0,0,0];
+  const text = css.trim().toLowerCase();
+  if (text === 'none') return [0,0,0,0];
+  if (text.startsWith('#')) {
+    const hex = text.slice(1);
+    if (/^[0-9a-f]+$/.test(hex)) {
+      if (hex.length === 3 || hex.length === 4) {
+        const v = Array.from(hex, (h) => parseInt(h + h, 16));
+        return [v[0], v[1], v[2], hex.length === 4 ? v[3] : 255];
+      }
+      if (hex.length === 6 || hex.length === 8) {
+        return [parseInt(hex.slice(0,2),16), parseInt(hex.slice(2,4),16), parseInt(hex.slice(4,6),16),
+          hex.length === 8 ? parseInt(hex.slice(6,8),16) : 255];
+      }
+    }
+    return [0,0,0,255];
+  }
+  const fn = text.match(/^(rgba?|hsla?)\(\s*([^)]*)\)$/);
+  if (fn) {
+    const args = fn[2].split(/\s*,\s*|\s*\/\s*|\s+/).filter(Boolean);
+    if (args.length < 3) return [0,0,0,255];
+    const clamp = (v, max) => Math.min(max, Math.max(0, v));
+    const alphaOf = (v) => v === undefined ? 255
+      : Math.round(clamp(v.endsWith('%') ? parseFloat(v) / 100 : parseFloat(v), 1) * 255);
+    let alpha = alphaOf(args[3]);
+    if (Number.isNaN(alpha)) alpha = 255;
+    if (fn[1].startsWith('rgb')) {
+      const channel = (v) => Math.round(clamp(v.endsWith('%') ? parseFloat(v) * 2.55 : parseFloat(v), 255)) || 0;
+      return [channel(args[0]), channel(args[1]), channel(args[2]), alpha];
+    }
+    const h = ((parseFloat(args[0]) % 360) + 360) % 360 / 360;
+    const sat = clamp(parseFloat(args[1]) / 100, 1) || 0, light = clamp(parseFloat(args[2]) / 100, 1) || 0;
+    const q = light < 0.5 ? light * (1 + sat) : light + sat - light * sat, p = 2 * light - q;
+    const hue = (t) => {
+      t = t < 0 ? t + 1 : t > 1 ? t - 1 : t;
+      return t < 1/6 ? p + (q - p) * 6 * t : t < 1/2 ? q : t < 2/3 ? p + (q - p) * (2/3 - t) * 6 : p;
+    };
+    return [Math.round(hue(h + 1/3) * 255), Math.round(hue(h) * 255), Math.round(hue(h - 1/3) * 255), alpha];
+  }
+  return _cssNamedColors[text] || [0,0,0,255];
+}
+let _canvasBitmapDraw = () => false;
 class _Canvas2D {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this._damageQueued = false;
+  #buf; #w; #h; #damageQueued; #stateStack; #path; #originClean = true; #owner; #domOwner;
+  // Set while a rasterizing operation (text, paths, gradients, scaled images)
+  // writes pixels; see _fpRenderVariance.
+  #variance = false; #rasterizing = false;
+  static {
+    // These accessors stay in the bootstrap closure, not on a constructor or
+    // prototype reachable by page code. Private fields keep the hot pixel
+    // operations free of repeated WeakMap lookups.
+    _canvas2DPixels = context => context && typeof context === 'object' && #buf in context
+      ? {width:context.#w,height:context.#h,bytes:context.#buf,originClean:context.#originClean,alpha:context.#owner?.alpha!==false} : null;
+    _canvas2DTaint = context => { context.#originClean = false; };
+    _canvas2DTake = context => {
+      if (!context.#owner) throw new TypeError('Standalone canvas required');
+      const replacement = context.#blankBuffer(context.#w, context.#h);
+      const previous = _canvas2DPixels(context);
+      context.#buf = replacement;
+      context.#originClean = true;
+      context._markPaintDamage();
+      return previous;
+    };
+  }
+  constructor(canvas, owner = null) {
+    this.#owner = owner;
+    this.#domOwner = owner ? null : _requireCanvasOwner(canvas);
+    Object.defineProperty(this, 'canvas', {value:canvas,enumerable:true});
+    this.#damageQueued = false;
     this._resizeFromCanvas();
+    if (!owner) _canvas2DContexts.set(canvas, this);
   }
   _canvasDimension(name, fallback) {
+    if (this.#owner) return this.#owner.dimensions()[name];
     const raw = this.canvas.getAttribute(name);
     if (raw === null || raw === '') return fallback;
     const parsed = Number.parseInt(raw, 10);
@@ -14564,76 +15198,90 @@ class _Canvas2D {
     this.textBaseline = 'alphabetic';
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
-    this._stateStack = [];
+    this.#stateStack = [];
+    this.#path = [];
+  }
+  #blankBuffer(width, height) {
+    const bytes = new Uint8ClampedArray(width * height * 4);
+    if (this.#owner?.alpha === false) for (let i = 3; i < bytes.length; i += 4) bytes[i] = 255;
+    return bytes;
   }
   _resizeFromCanvas() {
+    if (!this.#owner) _requireCanvasOwner(this.canvas);
     const requestedWidth = this._canvasDimension('width', 300);
     const requestedHeight = this._canvasDimension('height', 150);
     const valid = requestedWidth <= _MAX_CANVAS_DIMENSION
       && requestedHeight <= _MAX_CANVAS_DIMENSION
       && requestedWidth * requestedHeight <= _MAX_CANVAS_PIXELS;
-    this._w = valid ? requestedWidth : 0;
-    this._h = valid ? requestedHeight : 0;
-    this._buf = new Uint8ClampedArray(this._w * this._h * 4);
+    const width = valid ? requestedWidth : 0, height = valid ? requestedHeight : 0;
+    const replacement = this.#blankBuffer(width, height);
+    this.#w = width;
+    this.#h = height;
+    this.#buf = replacement;
+    this.#originClean = true;
     this._resetDrawingState();
     const register = __obscuraCore.ops.op_canvas_register_surface;
-    if (typeof register === 'function') {
+    if (!this.#owner && typeof register === 'function') {
       // op2 accepts Uint8Array, while Canvas exposes Uint8ClampedArray. This
       // second view shares the exact backing store; no pixel copy is made.
       const bytes = new Uint8Array(
-        this._buf.buffer,
-        this._buf.byteOffset,
-        this._buf.byteLength,
+        this.#buf.buffer,
+        this.#buf.byteOffset,
+        this.#buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      const native = this.#domOwner;
+      if (!register(native.frame, native.epoch, native.node, this.#w, this.#h, bytes)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
   }
   _markPaintDamage() {
-    if (this._damageQueued) return;
-    this._damageQueued = true;
+    // Standalone canvases do not participate in DOM paint or retain a native
+    // V8 backing-store root. Their pixel storage is owned entirely by JS.
+    if (this.#owner) { this.#owner.changed(); return; }
+    if (this.#damageQueued) return;
+    this.#damageQueued = true;
     queueMicrotask(() => {
-      this._damageQueued = false;
+      this.#damageQueued = false;
       const damage = __obscuraCore.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      const native = this.#domOwner;
+      if (typeof damage === 'function') damage(native.frame, native.epoch, native.node);
     });
   }
   _parseColor(css) {
-    if (!css || typeof css !== 'string' || css === 'none') return [0,0,0,0];
-    if (css.startsWith('#')) {
-      const hex = css.slice(1);
-      if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
-      if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
-      if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
-    }
-    const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
-    const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
-    return named[css] || [0,0,0,255];
+    return _canvasParseColor(css);
   }
   _setPixel(x, y, r, g, b, a) {
     x = Math.round(x); y = Math.round(y);
-    if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
-    const idx = (y * this._w + x) * 4;
+    if (x < 0 || x >= this.#w || y < 0 || y >= this.#h) return;
+    const idx = (y * this.#w + x) * 4;
     const alpha = (a / 255) * this.globalAlpha;
     if (this.globalCompositeOperation === 'multiply') {
-      this._buf[idx+0] = Math.round((r/255) * (this._buf[idx+0]/255) * 255);
-      this._buf[idx+1] = Math.round((g/255) * (this._buf[idx+1]/255) * 255);
-      this._buf[idx+2] = Math.round((b/255) * (this._buf[idx+2]/255) * 255);
-      this._buf[idx+3] = Math.min(255, this._buf[idx+3] + Math.round(a * alpha));
+      this.#buf[idx+0] = Math.round((r/255) * (this.#buf[idx+0]/255) * 255);
+      this.#buf[idx+1] = Math.round((g/255) * (this.#buf[idx+1]/255) * 255);
+      this.#buf[idx+2] = Math.round((b/255) * (this.#buf[idx+2]/255) * 255);
+      this.#buf[idx+3] = Math.min(255, this.#buf[idx+3] + Math.round(a * alpha));
     } else {
-      this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-      this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-      this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-      this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+      this.#buf[idx+0] = Math.round(r * alpha + this.#buf[idx+0] * (1 - alpha));
+      this.#buf[idx+1] = Math.round(g * alpha + this.#buf[idx+1] * (1 - alpha));
+      this.#buf[idx+2] = Math.round(b * alpha + this.#buf[idx+2] * (1 - alpha));
+      this.#buf[idx+3] = Math.min(255, Math.round(a * alpha + this.#buf[idx+3] * (1 - alpha)));
     }
+    if (this.#owner?.alpha === false) this.#buf[idx+3] = 255;
+    if (this.#variance && this.#buf[idx+3] !== 0) _fpNudgePixel(this.#buf, idx, x, y);
+  }
+  #rasterize(draw) {
+    this.#rasterizing = true;
+    this.#variance = _fpRenderVariance();
+    try { return draw(); } finally { this.#rasterizing = false; this.#variance = false; }
   }
   fillRect(x, y, w, h) {
+    if (!this.#rasterizing && typeof this.fillStyle === 'object' && this.fillStyle !== null)
+      return this.#rasterize(() => this.fillRect(x, y, w, h));
     const style = this._resolvePaint(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
+    for (let py = Math.max(0,y); py < Math.min(this.#h, y+h); py++) {
+      for (let px = Math.max(0,x); px < Math.min(this.#w, x+w); px++) {
         const c = style.at(px, py);
         this._setPixel(px, py, c[0], c[1], c[2], c[3]);
       }
@@ -14642,15 +15290,18 @@ class _Canvas2D {
   }
   clearRect(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        const idx = (py * this._w + px) * 4;
-        this._buf[idx] = this._buf[idx+1] = this._buf[idx+2] = this._buf[idx+3] = 0;
+    for (let py = Math.max(0,y); py < Math.min(this.#h, y+h); py++) {
+      for (let px = Math.max(0,x); px < Math.min(this.#w, x+w); px++) {
+        const idx = (py * this.#w + px) * 4;
+        this.#buf[idx] = this.#buf[idx+1] = this.#buf[idx+2] = this.#buf[idx+3] = 0;
+        if (this.#owner?.alpha === false) this.#buf[idx+3] = 255;
       }
     }
     this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
+    if (!this.#rasterizing && typeof this.strokeStyle === 'object' && this.strokeStyle !== null)
+      return this.#rasterize(() => this.strokeRect(x, y, w, h));
     const style = this._resolvePaint(this.strokeStyle);
     const put = (px, py) => {
       const c = style.at(px, py);
@@ -14666,6 +15317,7 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   fillText(text, x, y) {
+    if (!this.#rasterizing) return this.#rasterize(() => this.fillText(text, x, y));
     const [r,g,b,a] = this._parseColor(this.fillStyle);
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
@@ -14695,21 +15347,26 @@ class _Canvas2D {
   measureText(t) {
     const fontSize = parseInt(this.font) || 10;
     const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
+    let width = String(t).length * 6 * scale;
+    // Advance widths depend on the device's fonts and text shaping. Scale them
+    // by a per-profile factor within 0.3% and keep Skia's 1/64 px precision.
+    if (width && _fpRenderVariance()) width = Math.round(width * (0.997 + _fpRand(7703) * 0.006) * 64) / 64;
+    return { width, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
+    if (!this.#originClean) throw new DOMException('The canvas is not origin-clean', 'SecurityError');
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     const data = new Uint8ClampedArray(w * h * 4);
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const srcX = x + px, srcY = y + py;
         const dstIdx = (py * w + px) * 4;
-        if (srcX >= 0 && srcX < this._w && srcY >= 0 && srcY < this._h) {
-          const srcIdx = (srcY * this._w + srcX) * 4;
-          data[dstIdx] = this._buf[srcIdx];
-          data[dstIdx+1] = this._buf[srcIdx+1];
-          data[dstIdx+2] = this._buf[srcIdx+2];
-          data[dstIdx+3] = this._buf[srcIdx+3];
+        if (srcX >= 0 && srcX < this.#w && srcY >= 0 && srcY < this.#h) {
+          const srcIdx = (srcY * this.#w + srcX) * 4;
+          data[dstIdx] = this.#buf[srcIdx];
+          data[dstIdx+1] = this.#buf[srcIdx+1];
+          data[dstIdx+2] = this.#buf[srcIdx+2];
+          data[dstIdx+3] = this.#buf[srcIdx+3];
         }
       }
     }
@@ -14722,12 +15379,15 @@ class _Canvas2D {
       for (let px = 0; px < w; px++) {
         const srcIdx = (py * w + px) * 4;
         const x = dx + px, y = dy + py;
-        if (x >= 0 && x < this._w && y >= 0 && y < this._h) {
-          const dstIdx = (y * this._w + x) * 4;
-          this._buf[dstIdx] = data[srcIdx];
-          this._buf[dstIdx+1] = data[srcIdx+1];
-          this._buf[dstIdx+2] = data[srcIdx+2];
-          this._buf[dstIdx+3] = data[srcIdx+3];
+        if (x >= 0 && x < this.#w && y >= 0 && y < this.#h) {
+          const dstIdx = (y * this.#w + x) * 4;
+          this.#buf[dstIdx] = data[srcIdx];
+          this.#buf[dstIdx+1] = data[srcIdx+1];
+          this.#buf[dstIdx+2] = data[srcIdx+2];
+          this.#buf[dstIdx+3] = data[srcIdx+3];
+          // putImageData replaces components directly; opaque storage ignores
+          // the supplied alpha instead of compositing it over black.
+          if (this.#owner?.alpha === false) this.#buf[dstIdx+3] = 255;
         }
       }
     }
@@ -14735,32 +15395,46 @@ class _Canvas2D {
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
   drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
+    if (_canvasBitmapDraw(this, img, Array.prototype.slice.call(arguments, 1))) return;
+    // A scaled draw is resampled, which devices do differently; a 1:1 copy is exact.
+    if (!this.#rasterizing && arguments.length > 3) {
+      const src = _canvas2DPixels(_canvas2DContext(img));
+      const sourceWidth = arguments.length > 5 ? sw : (src ? src.width : 0);
+      const sourceHeight = arguments.length > 5 ? sh : (src ? src.height : 0);
+      const targetWidth = arguments.length > 5 ? dw : sw, targetHeight = arguments.length > 5 ? dh : sh;
+      if (src && (targetWidth !== sourceWidth || targetHeight !== sourceHeight)) {
+        const args = arguments;
+        return this.#rasterize(() => this.drawImage(...args));
+      }
+    }
+    const src = _canvas2DPixels(_canvas2DContext(img));
+    if (src) {
+      if (!src.originClean) this.#originClean = false;
+      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src.width); dh = dh ?? (sh ?? src.height);
       for (let py = 0; py < dh; py++) {
         for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
+          const srcX = Math.floor((sx||0) + px * (sw||src.width) / dw);
+          const srcY = Math.floor((sy||0) + py * (sh||src.height) / dh);
+          if (srcX >= 0 && srcX < src.width && srcY >= 0 && srcY < src.height) {
+            const srcIdx = (srcY * src.width + srcX) * 4;
+            this._setPixel(dx+px, dy+py, src.bytes[srcIdx], src.bytes[srcIdx+1], src.bytes[srcIdx+2], src.bytes[srcIdx+3]);
           }
         }
       }
     }
     this._markPaintDamage();
   }
-  beginPath() { this._path = []; }
-  closePath() { if (this._path && this._path.length) this._path.push({t:'Z'}); }
-  moveTo(x, y) { if (this._path) this._path.push({t:'M',x,y}); }
-  lineTo(x, y) { if (this._path) this._path.push({t:'L',x,y}); }
+  beginPath() { this.#path = []; }
+  closePath() { if (this.#path && this.#path.length) this.#path.push({t:'Z'}); }
+  moveTo(x, y) { if (this.#path) this.#path.push({t:'M',x,y}); }
+  lineTo(x, y) { if (this.#path) this.#path.push({t:'L',x,y}); }
   bezierCurveTo() {} quadraticCurveTo() {}
-  arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
+  arc(x, y, r, s, e) { if (this.#path) this.#path.push({t:'A',x,y,r}); }
   arcTo() {}
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
-    if (!this._path) return;
+    if (!this.#path) return;
+    if (!this.#rasterizing) return this.#rasterize(() => this.fill());
     const style = this._resolvePaint(this.fillStyle);
     const put = (px, py) => {
       const c = style.at(px, py);
@@ -14769,11 +15443,11 @@ class _Canvas2D {
     // Polygon fill: the old code only handled arcs, so a path built from
     // moveTo/lineTo (area charts, wedges, any closed shape) filled nothing.
     // Even-odd scanline over the M/L vertices, arcs still handled below.
-    const poly = this._path.filter((s) => s.t === 'M' || s.t === 'L');
+    const poly = this.#path.filter((s) => s.t === 'M' || s.t === 'L');
     if (poly.length >= 3) {
       let minY = Infinity, maxY = -Infinity;
       for (const p of poly) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
-      minY = Math.max(0, Math.round(minY)); maxY = Math.min(this._h - 1, Math.round(maxY));
+      minY = Math.max(0, Math.round(minY)); maxY = Math.min(this.#h - 1, Math.round(maxY));
       for (let py = minY; py <= maxY; py++) {
         const xs = [];
         for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -14785,23 +15459,23 @@ class _Canvas2D {
         xs.sort((m, n) => m - n);
         for (let k = 0; k + 1 < xs.length; k += 2) {
           const from = Math.max(0, Math.round(xs[k]));
-          const to = Math.min(this._w - 1, Math.round(xs[k+1]));
+          const to = Math.min(this.#w - 1, Math.round(xs[k+1]));
           for (let px = from; px <= to; px++) put(px, py);
         }
       }
     }
-    for (const seg of this._path) {
+    for (const seg of this.#path) {
       if (seg.t === 'A') {
         const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
         const r2 = rad * rad;
-        for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
-          for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
+        for (let py = Math.max(0, cy - rad); py <= Math.min(this.#h - 1, cy + rad); py++) {
+          for (let px = Math.max(0, cx - rad); px <= Math.min(this.#w - 1, cx + rad); px++) {
             if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) put(px, py);
           }
         }
       }
     }
-    this._path = [];
+    this.#path = [];
     this._markPaintDamage();
   }
   // Draw the accumulated path. Was a no-op, so every line chart, sparkline and
@@ -14810,7 +15484,8 @@ class _Canvas2D {
   // Bresenham per segment, thickened perpendicular to the run so lineWidth is
   // honoured; arcs are stroked as a circle outline of the same width.
   stroke() {
-    if (!this._path || this._path.length === 0) return;
+    if (!this.#path || this.#path.length === 0) return;
+    if (!this.#rasterizing) return this.#rasterize(() => this.stroke());
     const style = this._resolvePaint(this.strokeStyle);
     const lw = Math.max(1, Math.round(this.lineWidth || 1));
     const half = (lw - 1) / 2;
@@ -14838,7 +15513,7 @@ class _Canvas2D {
       }
     };
     let cur = null, sub = null;
-    for (const seg of this._path) {
+    for (const seg of this.#path) {
       if (seg.t === 'M') { cur = seg; sub = seg; }
       else if (seg.t === 'L') { if (cur) segment(cur.x, cur.y, seg.x, seg.y); cur = seg; }
       else if (seg.t === 'A') {
@@ -14856,8 +15531,8 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
-  restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
+  save() { this.#stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
+  restore() { const s = this.#stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
   // Gradients used to swallow their colour stops (addColorStop was a no-op), so
@@ -14925,63 +15600,118 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
+let _webglCreate = () => null, _webglHas = () => false, _webglResize = () => {}, _webglReadback = () => null;
+let _placeholderHas = () => false, _placeholderPixels = () => null, _placeholderBlob, _transferOffscreen, _reflectCanvasDimensions;
+/* @obscura-webgl */
+
 class HTMLCanvasElement extends Element {
+  constructor(nid) {
+    super(nid);
+    _canvasDOMOwners.set(this, {node:this._nid,frame:_realmFrameId,
+      epoch:_canvasDocumentEpoch,generation:_hostState.documentGeneration});
+  }
   get width() {
+    _requireCanvasOwner(this);
     const raw = this.getAttribute('width');
     const parsed = raw === null ? 300 : Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300;
   }
-  set width(value) { this.setAttribute('width', Math.max(0, Number(value) || 0)); }
+  set width(value) { if (_placeholderHas(this)) throw new DOMException('Canvas control was transferred', 'InvalidStateError'); this.setAttribute('width', Math.max(0, Number(value) || 0)); }
   get height() {
+    _requireCanvasOwner(this);
     const raw = this.getAttribute('height');
     const parsed = raw === null ? 150 : Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 150;
   }
-  set height(value) { this.setAttribute('height', Math.max(0, Number(value) || 0)); }
+  set height(value) { if (_placeholderHas(this)) throw new DOMException('Canvas control was transferred', 'InvalidStateError'); this.setAttribute('height', Math.max(0, Number(value) || 0)); }
   setAttribute(name, value) {
+    _requireCanvasOwner(this);
     super.setAttribute(name, value);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      this._ctx._resizeFromCanvas();
+    if (normalized === 'width' || normalized === 'height') {
+      if (_canvas2DContext(this)) _canvas2DContext(this)._resizeFromCanvas();
+      _webglResize(this);
     }
   }
   removeAttribute(name) {
+    _requireCanvasOwner(this);
     super.removeAttribute(name);
     const normalized = String(name).toLowerCase();
-    if (this._ctx && (normalized === 'width' || normalized === 'height')) {
-      this._ctx._resizeFromCanvas();
+    if (normalized === 'width' || normalized === 'height') {
+      if (_canvas2DContext(this)) _canvas2DContext(this)._resizeFromCanvas();
+      _webglResize(this);
     }
   }
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
+const _canvasAttributeSetter = Element.prototype.setAttribute;
+_reflectCanvasDimensions = (canvas, width, height) => {
+  const owner = _requireCanvasOwner(canvas);
+  const dimension = (name, fallback) => {
+    const raw = _domParse('get_attribute', owner.node, name);
+    const parsed = raw === null ? fallback : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  // A changed displayed size replaces both attributes, including a
+  // same-valued opposite axis. Same-sized frames do not mutate attributes.
+  if (dimension('width', 300) === width && dimension('height', 150) === height) return;
+  _canvasAttributeSetter.call(canvas, 'width', width);
+  _canvasAttributeSetter.call(canvas, 'height', height);
+};
+
+HTMLCanvasElement.prototype.getContext = function getContext(type, options = undefined) {
+  if (!_canvasDOMOwner(this)) return null;
+  if (_placeholderHas(this)) throw new DOMException('Canvas control was transferred', 'InvalidStateError');
   if (type === '2d') {
-    if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
+    if (_webglHas(this)) return null;
+    if (!_canvas2DContext(this)) {
+      try { new _Canvas2D(this); }
       catch (_error) { return null; }
     }
-    return this._ctx;
+    return _canvas2DContext(this);
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    // Context creation is allowed to fail, and that is the only truthful
-    // behavior until the renderer has a real WebGL backend. The former shim
-    // reported successful shader/program creation while every draw call was a
-    // no-op. Feature-detecting applications consequently selected their WebGL
-    // path, hid their HTML/image fallback, and produced a blank canvas.
-    return null;
+    return _webglCreate(this, type, options);
   }
   return null;
 };
+if (_transferOffscreen) {
+  Object.defineProperty(HTMLCanvasElement.prototype, 'transferControlToOffscreen', {
+    value: _transferOffscreen, writable: true, configurable: true, enumerable: true,
+  });
+  _markNative(_transferOffscreen);
+}
 HTMLCanvasElement.prototype.toDataURL = function(type) {
-  const ctx = this._ctx || this.getContext('2d');
-  if (ctx && ctx._buf) {
-    if (ctx._w === 0 || ctx._h === 0) return 'data:,';
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
+  if (_placeholderHas(this)) {
+    try {
+      const pixels = _placeholderPixels(this, false);
+      return pixels.width && pixels.height ? _encodePNG(pixels.width, pixels.height, pixels.bytes) : 'data:,';
+    } catch (error) {
+      if (error.name === 'SecurityError') throw error;
+      return 'data:,';
+    }
   }
-  return 'data:,';
+  if (_webglHas(this)) {
+    const pixels = _webglReadback(this);
+    return pixels && pixels.width && pixels.height
+      ? _encodePNG(pixels.width, pixels.height, pixels.bytes) : 'data:,';
+  }
+  const surface = _canvas2DPixels(_canvas2DContext(this));
+  if (surface) {
+    if (!surface.originClean) throw new DOMException('The canvas is not origin-clean', 'SecurityError');
+    if (surface.width === 0 || surface.height === 0) return 'data:,';
+    return _encodePNG(surface.width, surface.height, surface.bytes);
+  }
+  // Serializing an unused bitmap does not select or lock a context type.
+  const width = this.width, height = this.height;
+  if (!width || !height || width > _MAX_CANVAS_DIMENSION || height > _MAX_CANVAS_DIMENSION
+      || width * height > _MAX_CANVAS_PIXELS) return 'data:,';
+  try { return _encodePNG(width, height, new Uint8Array(width * height * 4)); }
+  catch (_error) { return 'data:,'; }
 };
 HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
+  if (_placeholderHas(this)) return _placeholderBlob(this, cb, type, q);
   const url = this.toDataURL(type, q);
   const comma = url.indexOf(',');
   if (comma < 0 || !url.startsWith('data:image/')) { cb(null); return; }
@@ -15086,12 +15816,17 @@ globalThis.AudioContext = class AudioContext {
   addEventListener(type, fn) { if (!this._listeners[type]) this._listeners[type]=[]; this._listeners[type].push(fn); }
   removeEventListener(type, fn) { if (this._listeners[type]) this._listeners[type]=this._listeners[type].filter(h=>h!==fn); }
   _ap(v, min=-3.4028235e38, max=3.4028235e38) { return { value: v, defaultValue: v, minValue: min, maxValue: max, setValueAtTime(){} }; }
-  createOscillator() { return {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}}; }
-  createDynamicsCompressor() { return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
+  createOscillator() {
+    const oscillator = {context:this,type:'sine',frequency:this._ap(440, -22050, 22050),detune:this._ap(0, -153600, 153600),connect(){},start(){},stop(){},disconnect(){},addEventListener(){},removeEventListener(){}};
+    (this._oscillators || (this._oscillators = [])).push(oscillator);
+    return oscillator;
+  }
+  createDynamicsCompressor() { this._compressed = true; return {context:this,threshold:this._ap(_fp('compThreshold'), -100, 0),knee:this._ap(_fp('compKnee'), 0, 40),ratio:this._ap(_fp('compRatio'), 1, 20),attack:this._ap(0.003, 0, 1),release:this._ap(0.25, 0, 1),reduction:0,connect(){},disconnect(){}}; }
   createAnalyser() {
     return {context:this,fftSize:2048,frequencyBinCount:1024,channelCount:2,channelCountMode:'max',channelInterpretation:'speakers',maxDecibels:-30,minDecibels:-100,numberOfInputs:1,numberOfOutputs:1,smoothingTimeConstant:0.8,connect(){},disconnect(){},
-      getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
-      getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
+      // An analyser reports silence until its context has rendered audio.
+      getByteFrequencyData(a){const live=this.context._rendered;for(let i=0;i<a.length;i++)a[i]=live?Math.floor(_fpRand(600+i)*10):0;},
+      getFloatFrequencyData(a){const live=this.context._rendered;for(let i=0;i<a.length;i++)a[i]=live?-100+_fpRand(700+i)*5:-Infinity;}
     };
   }
   createGain() { return {context:this,gain:this._ap(1),connect(){},disconnect(){}}; }
@@ -15124,14 +15859,22 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
     // Target: sum(|data[4500..5000]|) matches Chrome Linux (~124.04347527516074).
     var target = 124.04347527516074 + (_fpRand(9991) - 0.5) * 0.002;
     var freq = 10000, sr = 44100;
-    for (var i = 0; i < self.length; i++) {
-      var phase = ((i * freq / sr) % 1 + 1) % 1;
-      data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+    // A graph whose oscillators are all at 0 Hz renders silence.
+    var audible = (self._oscillators || []).some(function(o) { return Number(o.frequency.value) !== 0; });
+    if (audible) {
+      for (var i = 0; i < self.length; i++) {
+        var phase = ((i * freq / sr) % 1 + 1) % 1;
+        data[i] = phase < 0.5 ? 4*phase - 1 : 3 - 4*phase;
+      }
+      var s = 0;
+      for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
+      var scale = s > 0 ? target / s : 0;
+      for (var i = 0; i < self.length; i++) data[i] *= scale;
+      // A DynamicsCompressorNode delays its input by its 6 ms look-ahead, so
+      // the first 265 output frames at 44.1 kHz are silent.
+      if (self._compressed) for (var i = 0; i < Math.min(265, self.length); i++) data[i] = 0;
     }
-    var s = 0;
-    for (var i = 4500; i < 5000; i++) s += Math.abs(data[i]);
-    var scale = s > 0 ? target / s : 0;
-    for (var i = 0; i < self.length; i++) data[i] *= scale;
+    self._rendered = true;
     // Fire oncomplete + 'complete' listeners on next microtask so callers
     // can register handlers synchronously after startRendering().
     var p = Promise.resolve().then(function() {
@@ -15150,13 +15893,33 @@ globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext 
 };
 globalThis.webkitAudioContext = globalThis.AudioContext;
 
-globalThis.speechSynthesis = {
-  speaking: false, pending: false, paused: false,
-  getVoices() { return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; },
-  speak() {}, cancel() {}, pause() {}, resume() {},
-  addEventListener() {}, removeEventListener() {},
-  onvoiceschanged: null,
-};
+// speechSynthesis is a SpeechSynthesis instance with its attributes and
+// operations on the prototype, as in Chrome.
+const _speechStates = new WeakMap();
+function _speechState(receiver) {
+  const state = _speechStates.get(receiver);
+  if (!state) throw new TypeError('Illegal invocation');
+  return state;
+}
+class SpeechSynthesis {
+  get pending() { _speechState(this); return false; }
+  get speaking() { _speechState(this); return false; }
+  get paused() { _speechState(this); return false; }
+  get onvoiceschanged() { return _speechState(this).onvoiceschanged; }
+  set onvoiceschanged(value) { _speechState(this).onvoiceschanged = typeof value === 'function' ? value : null; }
+  getVoices() { _speechState(this); return [{ name:'Google US English', lang:'en-US', default:true, localService:true, voiceURI:'Google US English' }]; }
+  speak() { _speechState(this); }
+  cancel() { _speechState(this); }
+  pause() { _speechState(this); }
+  resume() { _speechState(this); }
+  addEventListener() { _speechState(this); }
+  removeEventListener() { _speechState(this); }
+  dispatchEvent() { _speechState(this); return true; }
+}
+Object.defineProperty(SpeechSynthesis.prototype, Symbol.toStringTag, {value: 'SpeechSynthesis', configurable: true});
+globalThis.SpeechSynthesis = SpeechSynthesis;
+globalThis.speechSynthesis = new SpeechSynthesis();
+_speechStates.set(globalThis.speechSynthesis, { onvoiceschanged: null });
 globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance { constructor(t){this.text=t;this.lang='en-US';this.rate=1;this.pitch=1;this.volume=1;} };
 
 globalThis.MediaStream = class MediaStream { constructor(){this.id='';this.active=true;} getTracks(){return [];} getAudioTracks(){return [];} getVideoTracks(){return [];} addTrack(){} removeTrack(){} clone(){return new MediaStream();} };
@@ -15344,10 +16107,762 @@ navigator.keyboard = {
 navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
+// Chrome's page navigator also has the legacy identity strings and the device
+// and storage bucket managers (WebHID, WebUSB, Web Serial, Storage Buckets);
+// a navigator without them is not a desktop Chrome. No devices are connected
+// or permitted, and a device chooser needs a user gesture, as in Chrome before
+// the user interacts. The members are hoisted onto Navigator.prototype below
+// like the others, so workers read them through WorkerNavigator.
+navigator.appCodeName = 'Mozilla';
+navigator.appName = 'Netscape';
+navigator.vendorSub = '';
+(function _deviceManagers() {
+  const key = Symbol('device manager');
+  const handlers = new WeakMap();
+  const buckets = new WeakSet();
+  const state = (receiver) => {
+    const value = handlers.get(receiver);
+    if (!value) throw new TypeError('Illegal invocation');
+    return value;
+  };
+  // Promise-returning operations reject, rather than throw, on a bad receiver.
+  const live = (receiver) => handlers.has(receiver);
+  const illegal = () => Promise.reject(new TypeError('Illegal invocation'));
+  const gesture = (iface, op) => Promise.reject(new DOMException(
+    `Failed to execute '${op}' on '${iface}': Must be handling a user gesture to show a permission request.`,
+    'SecurityError'));
+  const chooser = (iface, count) => count ? gesture(iface, 'requestDevice') : Promise.reject(new TypeError(
+    `Failed to execute 'requestDevice' on '${iface}': 1 argument required, but only 0 present.`));
+  const check = (token, name) => {
+    if (token !== key) throw new TypeError(`Failed to construct '${name}': Illegal constructor`);
+  };
+  const register = (target) => {
+    handlers.set(target, { onconnect: null, ondisconnect: null, listeners: Object.create(null) });
+  };
+  class DeviceEvents {
+    get onconnect() { return state(this).onconnect; }
+    set onconnect(value) { state(this).onconnect = typeof value === 'function' ? value : null; }
+    get ondisconnect() { return state(this).ondisconnect; }
+    set ondisconnect(value) { state(this).ondisconnect = typeof value === 'function' ? value : null; }
+    addEventListener(type, listener) {
+      if (typeof listener !== 'function') return;
+      const listeners = state(this).listeners;
+      (listeners[type] || (listeners[type] = [])).push(listener);
+    }
+    removeEventListener(type, listener) {
+      const listeners = state(this).listeners;
+      if (listeners[type]) listeners[type] = listeners[type].filter((item) => item !== listener);
+    }
+    dispatchEvent(event) { state(this); return !(event && event.defaultPrevented); }
+  }
+  class HID {
+    constructor(token) { check(token, 'HID'); register(this); }
+    getDevices() { return live(this) ? Promise.resolve([]) : illegal(); }
+    requestDevice(options) { return live(this) ? chooser('HID', arguments.length) : illegal(); }
+  }
+  class USB {
+    constructor(token) { check(token, 'USB'); register(this); }
+    getDevices() { return live(this) ? Promise.resolve([]) : illegal(); }
+    requestDevice(options) { return live(this) ? chooser('USB', arguments.length) : illegal(); }
+  }
+  class Serial {
+    constructor(token) { check(token, 'Serial'); register(this); }
+    getPorts() { return live(this) ? Promise.resolve([]) : illegal(); }
+    requestPort() { return live(this) ? gesture('Serial', 'requestPort') : illegal(); }
+  }
+  const bucketName = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+  class StorageBucketManager {
+    constructor(token) {
+      check(token, 'StorageBucketManager');
+      buckets.add(this);
+    }
+    open(name) {
+      if (!buckets.has(this)) return illegal();
+      if (!bucketName.test(String(name))) {
+        return Promise.reject(new TypeError(`The bucket name '${name}' is not a valid name.`));
+      }
+      return Promise.reject(new DOMException("Failed to execute 'open' on 'StorageBucketManager': Unknown error.", 'UnknownError'));
+    }
+    keys() {
+      if (!buckets.has(this)) return illegal();
+      return Promise.resolve([]);
+    }
+    delete(name) {
+      if (!buckets.has(this)) return illegal();
+      if (!bucketName.test(String(name))) {
+        return Promise.reject(new TypeError(`The bucket name '${name}' is not a valid name.`));
+      }
+      return Promise.resolve(undefined);
+    }
+  }
+  // Each device manager carries the event target members itself, as the
+  // other EventTarget shims (NetworkInformation) do.
+  for (const ctor of [HID, USB, Serial]) {
+    for (const name of ['onconnect', 'ondisconnect', 'addEventListener', 'removeEventListener', 'dispatchEvent']) {
+      Object.defineProperty(ctor.prototype, name, Object.getOwnPropertyDescriptor(DeviceEvents.prototype, name));
+    }
+  }
+  for (const ctor of [HID, USB, Serial, StorageBucketManager]) {
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: ctor.name, configurable: true });
+    _markNative(ctor);
+    Object.defineProperty(globalThis, ctor.name, { value: ctor, writable: true, enumerable: false, configurable: true });
+  }
+  navigator.hid = new HID(key);
+  navigator.usb = new USB(key);
+  navigator.serial = new Serial(key);
+  navigator.storageBuckets = new StorageBucketManager(key);
+})();
+
 globalThis.opener = null;
 
+// Worker scripts run in this realm inside `with (scope)`, so every name the
+// scope does not define resolves to the window global. A worker therefore saw
+// `window`, `document`, `screen`, `devicePixelRatio`, `localStorage` and the
+// DOM interfaces, which no WorkerGlobalScope has, and `'document' in self` or
+// `typeof window` exposed the shim. Shadow the window-only names on the scope
+// with configurable accessors, and expose the scope through a proxy whose
+// `self`/`globalThis` report them absent, as a worker does. A bare reference
+// to one of them throws a ReferenceError, as an unresolvable name does in a
+// worker; `typeof` still reads 'undefined' (see _workerSourceRewrite).
+// Assigning one of these names (`self.window = self`, a common worker
+// polyfill) defines it as an ordinary global again. The proxy also gives the
+// scope its worker prototype chain and toStringTag, and lists the worker's
+// globals the way a worker global object does. Names that workers have
+// (timers, fetch, crypto, OffscreenCanvas, WebGL, ...) still resolve to this
+// realm, and the worker's own WorkerNavigator reads the page navigator, so the
+// worker identity matches the page.
+const _workerGlobalScope = (() => {
+  const windowOnly = new Set([
+    'window', 'document', 'parent', 'top', 'frames', 'opener', 'frameElement', 'length', 'closed',
+    'status', 'event', 'external', 'clientInformation', 'styleMedia', 'chrome', 'history', 'navigation',
+    'screen', 'devicePixelRatio', 'innerWidth', 'innerHeight', 'outerWidth', 'outerHeight', 'screenX',
+    'screenY', 'screenLeft', 'screenTop', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset',
+    'visualViewport', 'scroll', 'scrollTo', 'scrollBy', 'moveTo', 'moveBy', 'resizeTo', 'resizeBy',
+    'localStorage', 'sessionStorage', 'alert', 'confirm', 'prompt', 'print', 'open', 'stop', 'focus',
+    'blur', 'find', 'captureEvents', 'releaseEvents', 'getComputedStyle', 'getSelection', 'matchMedia',
+    'requestIdleCallback', 'cancelIdleCallback', 'customElements', 'speechSynthesis', 'cookieStore',
+    'toolbar', 'menubar', 'locationbar', 'personalbar', 'scrollbars', 'statusbar', 'originAgentCluster',
+    'credentialless', 'launchQueue', 'documentPictureInPicture', 'sharedStorage', 'getScreenDetails',
+    'queryLocalFonts', 'showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker', 'fence',
+    'Window', 'Document', 'XMLDocument', 'DocumentFragment', 'DocumentType', 'Node', 'NodeList',
+    'NodeFilter', 'NodeIterator', 'TreeWalker', 'NamedNodeMap', 'Element', 'Attr', 'CharacterData',
+    'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'ShadowRoot', 'Range', 'StaticRange',
+    'AbstractRange', 'Selection', 'MutationObserver', 'MutationRecord', 'IntersectionObserver',
+    'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry', 'ResizeObserverSize',
+    'DOMParser', 'XMLSerializer', 'XSLTProcessor', 'XPathResult', 'XPathEvaluator', 'XPathExpression',
+    'DOMImplementation', 'DOMTokenList', 'DOMStringMap', 'DOMRectList', 'RadioNodeList',
+    'ValidityState', 'ElementInternals', 'CustomElementRegistry', 'CustomStateSet', 'StyleSheet',
+    'StyleSheetList', 'CSS', 'MediaList', 'MediaQueryList', 'MediaQueryListEvent', 'Screen',
+    'ScreenOrientation', 'VisualViewport', 'BarProp', 'External', 'History', 'Navigation', 'Storage',
+    'StorageEvent', 'Navigator', 'Location', 'Plugin', 'PluginArray', 'MimeType', 'MimeTypeArray',
+    'Image', 'Audio', 'Option', 'IdleDeadline', 'SharedWorker', 'CanvasRenderingContext2D',
+    'Geolocation', 'GeolocationPosition', 'GeolocationCoordinates', 'GeolocationPositionError',
+    'Clipboard', 'ClipboardItem', 'ClipboardEvent', 'DataTransfer', 'DataTransferItem',
+    'DataTransferItemList', 'MediaDevices', 'MediaStream', 'MediaStreamTrack', 'MediaRecorder', 'RTCPeerConnection',
+    'RTCIceCandidate', 'RTCSessionDescription', 'RTCPeerConnectionIceEvent', 'SpeechSynthesis',
+    'SpeechSynthesisUtterance', 'SpeechSynthesisEvent', 'SpeechSynthesisErrorEvent',
+    'SpeechSynthesisVoice', 'BatteryManager', 'Gamepad', 'GamepadButton', 'GamepadEvent',
+    'AudioContext', 'BaseAudioContext', 'OfflineAudioContext', 'OfflineAudioCompletionEvent',
+    'AudioBuffer', 'AudioParam', 'AudioParamMap', 'AudioListener', 'AudioProcessingEvent',
+    'AudioWorklet', 'PeriodicWave', 'TextTrack', 'TextTrackCue', 'TextTrackCueList', 'TextTrackList',
+    'VTTCue', 'TimeRanges', 'Animation', 'AnimationEffect', 'AnimationTimeline', 'KeyframeEffect',
+    'DocumentTimeline', 'PerformanceNavigation', 'PerformanceTiming', 'PerformanceNavigationTiming',
+    'PerformancePaintTiming', 'PerformanceEventTiming', 'LargestContentfulPaint', 'LayoutShift',
+    'UIEvent', 'MouseEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'PointerEvent',
+    'WheelEvent', 'CompositionEvent', 'DragEvent', 'TouchEvent', 'Touch', 'TouchList',
+    'HashChangeEvent', 'PopStateEvent', 'PageTransitionEvent', 'BeforeUnloadEvent', 'AnimationEvent',
+    'TransitionEvent', 'SubmitEvent', 'FormDataEvent', 'ToggleEvent', 'DeviceOrientationEvent',
+    'DeviceMotionEvent', 'Highlight', 'HighlightRegistry', 'CaretPosition',
+  ]);
+  // HTML*/SVG*/MathML* elements and collections, CSSOM rules and sheets,
+  // prefixed window APIs (webkitURL, webkitRTCPeerConnection, ...; workers do
+  // have the webkit file system entry points) and the audio graph nodes are
+  // window-only.
+  const windowOnlyPattern = /^(?:HTML|SVG|MathML|webkit(?!RequestFileSystem|ResolveLocalFileSystem))|^CSS\w*(?:Rule|Sheet|Declaration|List)$|Node$/;
+  // Event handler attributes a worker global scope has; every other `on*`
+  // global (onclick, onresize, onbeforeunload, ...) belongs to Window.
+  const workerHandlers = new Set(['onmessage', 'onmessageerror', 'onerror', 'onlanguagechange',
+    'onrejectionhandled', 'onunhandledrejection', 'onconnect', 'onrtctransform']);
+  // Present on DedicatedWorkerGlobalScope but not on SharedWorkerGlobalScope
+  // (Chrome has no nested workers in a shared worker, and no WebHID, WebUSB or
+  // Web Serial there).
+  const dedicatedOnly = new Set(['postMessage', 'requestAnimationFrame', 'cancelAnimationFrame', 'Worker',
+    'HID', 'USB', 'Serial']);
+  const isWindowOnly = (key, kind) =>
+    windowOnly.has(key) ||
+    (kind === 'shared' && dedicatedOnly.has(key)) ||
+    (key[0] !== '_' && windowOnlyPattern.test(key)) ||
+    (/^on[a-z]/.test(key) && !workerHandlers.has(key));
+  // The engine's own globals (see __obscura_hide_list): never part of a worker.
+  const isInternal = (key) => typeof key === 'string' && (key[0] === '_' || /obscura/i.test(key));
+  const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const defineProperty = Object.defineProperty;
+  const nativeGetter = (name, get) => {
+    const fn = getDescriptor({ get [name]() { return get(this); } }, name).get;
+    return _markNativeAs(fn, 'function get ' + name + '() { [native code] }');
+  };
+  const nativeSetter = (name, set) => {
+    const fn = getDescriptor({ set [name](value) { set(this, value); } }, name).set;
+    return _markNativeAs(fn, 'function set ' + name + '() { [native code] }');
+  };
+  const iface = (name, parent) => {
+    const ctor = _markNative({ [name]: function () {
+      throw new TypeError(`Failed to construct '${name}': Illegal constructor`);
+    } }[name]);
+    Object.setPrototypeOf(ctor, parent === Object ? Function.prototype : parent);
+    ctor.prototype = Object.create(parent.prototype, {
+      constructor: { value: ctor, writable: true, enumerable: false, configurable: true },
+      [Symbol.toStringTag]: { value: name, writable: false, enumerable: false, configurable: true },
+    });
+    defineProperty(ctor, 'prototype', { writable: false, enumerable: false, configurable: false });
+    return ctor;
+  };
+  const eventTarget = typeof globalThis.EventTarget === 'function' ? globalThis.EventTarget : Object;
+  const WorkerGlobalScope = iface('WorkerGlobalScope', eventTarget);
+  const scopes = {
+    dedicated: iface('DedicatedWorkerGlobalScope', WorkerGlobalScope),
+    shared: iface('SharedWorkerGlobalScope', WorkerGlobalScope),
+  };
+
+  // The names the page global had when the bootstrap finished: the browser's
+  // own globals. Globals page scripts add later are not part of a worker.
+  let builtinNames = null;
+  const isBuiltin = (key) => typeof key === 'string' && !isInternal(key)
+    && (builtinNames ? builtinNames.has(key) : true) && key in globalThis;
+
+  // Chrome 151 defines these on WorkerGlobalScope.prototype, not on the global
+  // object, and the EventTarget methods on EventTarget.prototype. The scope
+  // still holds them for `with` resolution; the proxy reports them inherited.
+  const protoAttributes = ['caches', 'crossOriginIsolated', 'crypto', 'fonts', 'indexedDB',
+    'isSecureContext', 'location', 'navigator', 'onerror', 'onlanguagechange', 'onrejectionhandled',
+    'onunhandledrejection', 'origin', 'performance', 'scheduler', 'self', 'trustedTypes'];
+  const protoOperations = ['atob', 'btoa', 'clearInterval', 'clearTimeout', 'createImageBitmap',
+    'fetch', 'importScripts', 'queueMicrotask', 'reportError', 'setInterval', 'setTimeout',
+    'structuredClone'];
+  const inherited = new Set([...protoAttributes, ...protoOperations,
+    'addEventListener', 'removeEventListener', 'dispatchEvent']);
+  // Own members Chrome reports enumerable on the worker global object; the
+  // interfaces and builtins are non-enumerable.
+  const enumerableOwn = new Set(['name', 'onmessage', 'onmessageerror', 'onrtctransform', 'postMessage',
+    'close', 'requestAnimationFrame', 'cancelAnimationFrame', 'onconnect']);
+
+  // scope or self -> scope, the brand check for the shared prototype members.
+  const scopeOf = new WeakMap();
+  const scopeFor = (receiver) => {
+    const scope = receiver !== null && (typeof receiver === 'object' || typeof receiver === 'function')
+      ? scopeOf.get(receiver) : undefined;
+    if (!scope) throw new TypeError('Illegal invocation');
+    return scope;
+  };
+  const scopeRead = (scope, key) => hasOwn(scope, key) ? scope[key] : globalThis[key];
+  let prototypeReady = false;
+  const preparePrototype = () => {
+    if (prototypeReady) return;
+    prototypeReady = true;
+    const proto = WorkerGlobalScope.prototype;
+    for (const name of protoAttributes) {
+      if (!(name in globalThis) && !['location', 'navigator', 'self', 'onerror', 'onlanguagechange',
+        'onrejectionhandled', 'onunhandledrejection'].includes(name)) continue;
+      const descriptor = { get: nativeGetter(name, (receiver) => scopeRead(scopeFor(receiver), name)),
+        enumerable: true, configurable: true };
+      if (name === 'self' || name.startsWith('on')) {
+        descriptor.set = nativeSetter(name, (receiver, value) => { scopeFor(receiver)[name] = value; });
+      }
+      defineProperty(proto, name, descriptor);
+    }
+    for (const name of protoOperations) {
+      if (name === 'importScripts') {
+        const importScripts = _markNative({ importScripts(...urls) {
+          return scopeFor(this === undefined ? globalThis : this).importScripts(...urls);
+        } }.importScripts);
+        defineProperty(proto, name, { value: importScripts, writable: true, enumerable: true, configurable: true });
+      } else if (typeof globalThis[name] === 'function') {
+        defineProperty(proto, name, { value: globalThis[name], writable: true, enumerable: true, configurable: true });
+      }
+    }
+  };
+
+  // WorkerNavigator: Chrome 151's member set for each worker kind. Only
+  // members the page navigator has are exposed, and every value is read from
+  // the page navigator, so the worker identity cannot drift from the page.
+  const navigatorMembers = {
+    dedicated: ['appCodeName', 'appName', 'appVersion', 'connection', 'deviceMemory', 'gpu',
+      'hardwareConcurrency', 'hid', 'language', 'languages', 'locks', 'mediaCapabilities', 'onLine',
+      'permissions', 'platform', 'product', 'serial', 'storage', 'storageBuckets', 'usb', 'userAgent',
+      'userAgentData'],
+  };
+  navigatorMembers.shared = navigatorMembers.dedicated.filter((name) => !['hid', 'serial', 'usb'].includes(name));
+  const navigatorInterfaces = {};
+  const navigators = new WeakSet();
+  const workerNavigatorInterface = (kind) => {
+    if (navigatorInterfaces[kind]) return navigatorInterfaces[kind];
+    const ctor = iface('WorkerNavigator', Object);
+    const page = globalThis.navigator;
+    for (const name of navigatorMembers[kind]) {
+      if (!page || !(name in page)) continue;
+      defineProperty(ctor.prototype, name, {
+        get: nativeGetter(name, (receiver) => {
+          if (!navigators.has(receiver)) throw new TypeError('Illegal invocation');
+          return globalThis.navigator[name];
+        }),
+        enumerable: true, configurable: true,
+      });
+    }
+    return (navigatorInterfaces[kind] = ctor);
+  };
+
+  // WorkerLocation: the worker script's URL, read-only.
+  const locations = new WeakMap();
+  let WorkerLocation = null;
+  const workerLocationInterface = () => {
+    if (WorkerLocation) return WorkerLocation;
+    WorkerLocation = iface('WorkerLocation', Object);
+    const read = (receiver) => {
+      const parts = locations.get(receiver);
+      if (!parts) throw new TypeError('Illegal invocation');
+      return parts;
+    };
+    for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+      defineProperty(WorkerLocation.prototype, name, {
+        get: nativeGetter(name, (receiver) => read(receiver)[name]), enumerable: true, configurable: true,
+      });
+    }
+    const toString = _markNative({ toString() { return read(this).href; } }.toString);
+    defineProperty(WorkerLocation.prototype, 'toString', { value: toString, writable: true, enumerable: true, configurable: true });
+    return WorkerLocation;
+  };
+  const makeLocation = (href) => {
+    const location = Object.create(workerLocationInterface().prototype);
+    let parts;
+    try {
+      const url = new URL(href);
+      parts = { href: url.href, origin: url.origin, protocol: url.protocol, host: url.host,
+        hostname: url.hostname, port: url.port, pathname: url.pathname, search: url.search, hash: url.hash };
+    } catch (e) {
+      parts = { href: String(href), origin: 'null', protocol: '', host: '', hostname: '', port: '',
+        pathname: String(href), search: '', hash: '' };
+    }
+    locations.set(location, parts);
+    return location;
+  };
+
+  // A bare reference to a hidden name throws this; `typeof` (rewritten to
+  // __obscura_wst) recognizes it and reads 'undefined' instead.
+  const unresolvable = new WeakSet();
+  const typeofProbe = (read) => {
+    try { return read(); } catch (e) {
+      if (unresolvable.has(e)) return undefined;
+      throw e;
+    }
+  };
+
+  // A classic script fetched synchronously, as importScripts does. Returns
+  // null when it cannot be loaded.
+  const loadScriptSync = (url, referrer) => {
+    if (url.startsWith('blob:')) {
+      const text = globalThis.__blobStore && globalThis.__blobStore[url];
+      return typeof text === 'string' ? text : null;
+    }
+    if (url.startsWith('data:')) {
+      const match = /^data:([^,]*?)(;base64)?,([\s\S]*)$/i.exec(url);
+      if (!match) return null;
+      try {
+        if (!match[2]) return decodeURIComponent(match[3]);
+        const binary = atob(match[3]);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new TextDecoder().decode(bytes);
+      } catch (e) { return null; }
+    }
+    if (!/^https?:/i.test(url)) return null;
+    const op = __obscuraCore.ops.op_fetch_script_sync;
+    if (typeof op !== 'function') return null;
+    let origin = 'null';
+    try { origin = new URL(globalThis.location.href).origin; } catch (e) {}
+    let result;
+    try { result = JSON.parse(op(url, origin, referrer || '')); } catch (e) { return null; }
+    if (!result || result.blocked || !(result.status >= 200 && result.status < 300)) return null;
+    return typeof result.body === 'string' ? result.body : null;
+  };
+
+  // `own` holds the members the worker scope defines itself. `options.url` is
+  // the worker script URL (its WorkerLocation) and `options.type` 'module' for
+  // a module worker. Returns the object to run the script `with`, the `self`
+  // that scripts observe and `run`, which evaluates a script in the scope.
+  const make = function make(kind, own, options = {}) {
+    preparePrototype();
+    const ctor = scopes[kind];
+    const scope = {};
+    const hidden = new Set();
+    // Window-only names, and the globals page scripts added: a worker sees
+    // neither.
+    const consider = (key) => {
+      if (typeof key === 'string' && !hasOwn(own, key) && !hidden.has(key)
+          && (isWindowOnly(key, kind) || (builtinNames && !builtinNames.has(key) && !isInternal(key)))) {
+        hidden.add(key);
+      }
+    };
+    for (const key of windowOnly) if (key in globalThis) consider(key);
+    for (const key of dedicatedOnly) if (key in globalThis) consider(key);
+    for (let o = globalThis; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      for (const key of Object.getOwnPropertyNames(o)) consider(key);
+    }
+    const expose = (key, value) => {
+      hidden.delete(key);
+      defineProperty(scope, key, { value, writable: true, enumerable: true, configurable: true });
+    };
+    for (const key of hidden) {
+      const get = function () {
+        const error = new ReferenceError(key + ' is not defined');
+        if (typeof Error.captureStackTrace === 'function') Error.captureStackTrace(error, get);
+        unresolvable.add(error);
+        throw error;
+      };
+      defineProperty(scope, key, { get, set(value) { expose(key, value); }, enumerable: false, configurable: true });
+    }
+    // Non-configurable globals (NaN, Infinity, undefined) must be own
+    // properties of the proxy target to be reported as the global's own.
+    for (const key of Object.getOwnPropertyNames(globalThis)) {
+      const descriptor = getDescriptor(globalThis, key);
+      if (descriptor && !descriptor.configurable && 'value' in descriptor && !isInternal(key)
+          && !isWindowOnly(key, kind) && !inherited.has(key) && !hasOwn(own, key) && !hasOwn(scope, key)
+          && !['globalThis', 'WorkerNavigator', 'WorkerLocation'].includes(key)) {
+        defineProperty(scope, key, descriptor);
+      }
+    }
+    const NavigatorInterface = workerNavigatorInterface(kind);
+    const navigator = Object.create(NavigatorInterface.prototype);
+    navigators.add(navigator);
+    let base = String(options.url || '');
+    const location = makeLocation(base);
+    try { base = new URL(base).href; } catch (e) {}
+    let self = null;
+
+    const run = (source, url) => {
+      const code = _workerSourceRewrite(source, hidden);
+      // Direct eval preserves script directives and resolves bare names
+      // against the worker scope.
+      const runner = new Function('scope', 'source', 'with (scope) { eval(source); }');
+      runner.call(self, scope, code);
+    };
+    // A classic script imported by importScripts runs as global code, so its
+    // top-level `var` and function declarations become worker globals that
+    // later scripts see. It runs at the top level of this realm under
+    // `with (scope)`; the globals it declares are moved onto the scope.
+    const runImport = (source) => {
+      const code = _workerSourceRewrite(source, hidden);
+      try { new Function(code); } catch (e) {
+        if (e instanceof SyntaxError) {
+          throw new SyntaxError("Failed to execute 'importScripts' on 'WorkerGlobalScope': " + e.message);
+        }
+      }
+      const before = new Map();
+      for (const key of Object.getOwnPropertyNames(globalThis)) before.set(key, getDescriptor(globalThis, key));
+      const holder = getDescriptor(globalThis, '__obscura_wsimport');
+      defineProperty(globalThis, '__obscura_wsimport', { value: { scope, code }, writable: true, enumerable: false, configurable: true });
+      try {
+        (0, eval)('with (__obscura_wsimport.scope) { eval(__obscura_wsimport.code); }');
+      } finally {
+        if (holder) defineProperty(globalThis, '__obscura_wsimport', holder);
+        else delete globalThis.__obscura_wsimport;
+        const same = (a, b) => a.value === b.value && a.get === b.get && a.set === b.set
+          && a.writable === b.writable && a.enumerable === b.enumerable && a.configurable === b.configurable;
+        for (const key of Object.getOwnPropertyNames(globalThis)) {
+          if (isInternal(key)) continue;
+          const now = getDescriptor(globalThis, key);
+          const was = before.get(key);
+          if (!now || (was && same(was, now))) continue;
+          try {
+            hidden.delete(key);
+            defineProperty(scope, key, { ...now, configurable: true });
+          } catch (e) {}
+          try {
+            if (was) defineProperty(globalThis, key, was);
+            else delete globalThis[key];
+          } catch (e) {}
+        }
+      }
+    };
+    const importScripts = _markNative({ importScripts(...urls) {
+      if (options.type === 'module') {
+        throw new TypeError("Failed to execute 'importScripts' on 'WorkerGlobalScope': Module scripts don't support importScripts().");
+      }
+      const resolved = urls.map((input) => {
+        const text = String(input);
+        try { return new URL(text, base).href; } catch (e) {
+          throw new DOMException(`Failed to execute 'importScripts' on 'WorkerGlobalScope': The URL '${text}' is invalid.`, 'SyntaxError');
+        }
+      });
+      for (const url of resolved) {
+        const source = loadScriptSync(url, options.url);
+        if (source === null) {
+          throw new DOMException(`Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '${url}' failed to load.`, 'NetworkError');
+        }
+        runImport(source);
+      }
+    } }.importScripts);
+
+    // fetch() from the worker: Chrome sends the worker's own request profile
+    // (no client hints) with the worker script as referrer.
+    const fetch = _markNative({ fetch(input, init = undefined) {
+      return _obscuraFetch(input, init, { worker: true, referrer: options.url });
+    } }.fetch);
+    Object.assign(scope, { navigator, location, importScripts, fetch, WorkerNavigator: NavigatorInterface,
+      WorkerLocation: workerLocationInterface() }, own, { WorkerGlobalScope, [ctor.name]: ctor });
+    for (const key of Object.keys(scope)) {
+      if (!enumerableOwn.has(key)) defineProperty(scope, key, { enumerable: false });
+    }
+    defineProperty(scope, '__obscura_wst', { value: typeofProbe, writable: false, enumerable: false, configurable: true });
+    defineProperty(scope, '__obscura_wsrw', {
+      value: (source) => typeof source === 'string' ? _workerSourceRewrite(source, hidden) : source,
+      writable: false, enumerable: false, configurable: true,
+    });
+    const listed = (key) => !hidden.has(key) && !isInternal(key) && !inherited.has(key);
+    self = new Proxy(scope, {
+      get(target, key, receiver) {
+        if (hidden.has(key) || isInternal(key)) return undefined;
+        if (hasOwn(target, key)) return target[key];
+        if (key === 'constructor' || key === Symbol.toStringTag) return ctor.prototype[key];
+        if (key in Object.prototype) return Reflect.get(target, key, receiver);
+        return isBuiltin(key) && !isWindowOnly(key, kind) ? globalThis[key] : undefined;
+      },
+      has(target, key) {
+        if (hidden.has(key) || isInternal(key)) return false;
+        return key in target || (isBuiltin(key) && !isWindowOnly(key, kind));
+      },
+      set(target, key, value) {
+        if (hidden.has(key)) { expose(key, value); return true; }
+        return Reflect.set(target, key, value);
+      },
+      defineProperty(target, key, descriptor) {
+        const defined = Reflect.defineProperty(target, key, descriptor);
+        if (defined) hidden.delete(key);
+        return defined;
+      },
+      deleteProperty(target, key) { return hidden.has(key) || Reflect.deleteProperty(target, key); },
+      getOwnPropertyDescriptor(target, key) {
+        if (!listed(key)) return undefined;
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        if (descriptor) return descriptor;
+        if (isBuiltin(key) && !isWindowOnly(key, kind)) {
+          return { value: globalThis[key], writable: true, enumerable: false, configurable: true };
+        }
+        return undefined;
+      },
+      // Like a worker global object, list every global the worker has: its
+      // own members and declarations, the interfaces and the builtins.
+      ownKeys(target) {
+        const keys = [];
+        const seen = new Set();
+        for (const key of Reflect.ownKeys(target)) {
+          if (listed(key) || !getDescriptor(target, key).configurable) { seen.add(key); keys.push(key); }
+        }
+        for (const key of builtinNames || []) {
+          if (!seen.has(key) && listed(key) && !isWindowOnly(key, kind) && key in globalThis) {
+            seen.add(key);
+            keys.push(key);
+          }
+        }
+        return keys;
+      },
+      getPrototypeOf() { return ctor.prototype; },
+    });
+    scope.self = self;
+    defineProperty(scope, 'self', { enumerable: false });
+    defineProperty(scope, 'globalThis', { value: self, writable: true, enumerable: false, configurable: true });
+    scopeOf.set(scope, scope);
+    scopeOf.set(self, scope);
+    return { scope, self, run };
+  };
+  // Called once the bootstrap has installed every global (snapshot time), and
+  // again when a document initializes, before its scripts run: the host and
+  // V8 install some globals (WebAssembly) only after the snapshot.
+  make.captureBuiltins = () => {
+    if (!builtinNames) builtinNames = new Set();
+    for (let o = globalThis; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      for (const key of Object.getOwnPropertyNames(o)) if (!isInternal(key)) builtinNames.add(key);
+    }
+  };
+  return make;
+})();
+
+// Worker scripts run in this realm under `with (scope)` (see
+// _workerGlobalScope), where a hidden window-only name is an accessor that
+// throws a ReferenceError, as an unresolvable reference does in a worker.
+// `typeof name` must still read 'undefined', so `typeof <hidden name>` is
+// rewritten to `typeof __obscura_wst(() => <name>)`, which evaluates the name
+// in place (a local of that name still wins) and maps only that
+// ReferenceError to undefined. A direct `eval(...)`'s argument goes through
+// the same rewrite at run time, and stays a direct eval. The scanner skips
+// strings, template text, comments and regular expression literals; if a
+// rewrite does not parse, the original source runs unchanged.
+const _workerSourceRewrite = (() => {
+  const regexAfterWord = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void',
+    'throw', 'case', 'do', 'else', 'yield', 'await']);
+  const isIdStart = (c) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_' || c === '$' || c > '\x7f';
+  const isIdPart = (c) => isIdStart(c) || (c >= '0' && c <= '9');
+  const isSpace = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\v' || c === '\f'
+    || c === ' ' || c === '﻿' || c === ' ' || c === ' ';
+  return function rewrite(source, hidden) {
+    if (typeof source !== 'string' || !/\btypeof\b|\beval\b/.test(source)) return source;
+    const n = source.length;
+    const inserts = [];
+    // Each open bracket: '{', '(', '[', 'tpl' (a template `${`) or 'eval' (an
+    // eval call's argument list).
+    const stack = [];
+    let prevKind = null;
+    let prevValue = '';
+    let i = 0;
+    // Index of the next significant character at or after j.
+    const skipTrivia = (j) => {
+      while (j < n) {
+        const c = source[j];
+        if (isSpace(c)) { j++; continue; }
+        if (c === '/' && source[j + 1] === '/') { while (j < n && source[j] !== '\n') j++; continue; }
+        if (c === '/' && source[j + 1] === '*') { const end = source.indexOf('*/', j + 2); j = end < 0 ? n : end + 2; continue; }
+        break;
+      }
+      return j;
+    };
+    const regexAllowed = () => {
+      if (prevKind === null) return true;
+      if (prevKind === 'word') return regexAfterWord.has(prevValue);
+      if (prevKind === 'punct') return !(prevValue === ')' || prevValue === ']' || prevValue === '}');
+      return false;
+    };
+    // Scans template text from i (after '`' or a closing '}'), stopping after
+    // the closing '`' or at an opening '${'.
+    const scanTemplate = () => {
+      while (i < n) {
+        const c = source[i];
+        if (c === '\\') { i += 2; continue; }
+        if (c === '`') { i++; prevKind = 'value'; return; }
+        if (c === '$' && source[i + 1] === '{') { i += 2; stack.push('tpl'); prevKind = 'punct'; prevValue = '{'; return; }
+        i++;
+      }
+    };
+    while (i < n) {
+      const c = source[i];
+      if (isSpace(c)) { i++; continue; }
+      if (c === '/' && (source[i + 1] === '/' || source[i + 1] === '*')) { i = skipTrivia(i); continue; }
+      if (c === '"' || c === "'") {
+        i++;
+        while (i < n && source[i] !== c) { if (source[i] === '\\') i++; i++; }
+        i++;
+        prevKind = 'value';
+        continue;
+      }
+      if (c === '`') { i++; scanTemplate(); continue; }
+      if (c === '/' && regexAllowed()) {
+        i++;
+        let inClass = false;
+        while (i < n) {
+          const d = source[i];
+          if (d === '\\') { i += 2; continue; }
+          if (d === '\n') break;
+          if (inClass) { if (d === ']') inClass = false; }
+          else if (d === '[') inClass = true;
+          else if (d === '/') break;
+          i++;
+        }
+        i++;
+        while (i < n && isIdPart(source[i])) i++;
+        prevKind = 'value';
+        continue;
+      }
+      if (isIdStart(c) || c === '\\') {
+        const start = i;
+        i++;
+        while (i < n && (isIdPart(source[i]) || source[i] === '\\')) i++;
+        const word = source.slice(start, i);
+        const member = prevKind === 'punct' && (prevValue === '.' || prevValue === '?.');
+        if (!member && word === 'typeof') {
+          let j = skipTrivia(i);
+          // `typeof(name)` is as common as `typeof name` in minified code.
+          const parenthesized = source[j] === '(';
+          if (parenthesized) j = skipTrivia(j + 1);
+          if (j < n && isIdStart(source[j])) {
+            let k = j + 1;
+            while (k < n && isIdPart(source[k])) k++;
+            const name = source.slice(j, k);
+            const after = skipTrivia(k);
+            const next = source[after];
+            const continues = parenthesized ? next !== ')' : next === '.' || next === '[' || next === '(' || next === '`'
+              || (next === '?' && source[after + 1] === '.') || (next === '=' && source[after + 1] === '>');
+            if (hidden.has(name) && !continues) {
+              inserts.push([j, '__obscura_wst(() => '], [k, ')']);
+            }
+          }
+        } else if (!member && word === 'eval') {
+          const j = skipTrivia(i);
+          if (source[j] === '(') {
+            inserts.push([j + 1, '__obscura_wsrw(']);
+            stack.push('eval');
+            i = j + 1;
+            prevKind = 'punct';
+            prevValue = '(';
+            continue;
+          }
+        }
+        prevKind = 'word';
+        prevValue = word;
+        continue;
+      }
+      if (c >= '0' && c <= '9' || (c === '.' && source[i + 1] >= '0' && source[i + 1] <= '9')) {
+        i++;
+        while (i < n && (isIdPart(source[i]) || source[i] === '.')) i++;
+        prevKind = 'value';
+        continue;
+      }
+      if (c === '{' || c === '(' || c === '[') { stack.push(c); i++; prevKind = 'punct'; prevValue = c; continue; }
+      if (c === '}') {
+        const open = stack.pop();
+        i++;
+        if (open === 'tpl') { scanTemplate(); continue; }
+        prevKind = 'punct';
+        prevValue = '}';
+        continue;
+      }
+      if (c === ')' || c === ']') {
+        const open = stack.pop();
+        if (open === 'eval') inserts.push([i, ')']);
+        i++;
+        prevKind = 'punct';
+        prevValue = c;
+        continue;
+      }
+      if (c === '?' && source[i + 1] === '.' && !(source[i + 2] >= '0' && source[i + 2] <= '9')) {
+        i += 2; prevKind = 'punct'; prevValue = '?.'; continue;
+      }
+      if ((c === '+' || c === '-') && source[i + 1] === c) {
+        // `a++ / b` divides; `++/re/.x` is not valid code.
+        i += 2; prevKind = 'value'; continue;
+      }
+      i++;
+      prevKind = 'punct';
+      prevValue = c;
+    }
+    if (!inserts.length) return source;
+    let out = '';
+    let last = 0;
+    for (const [at, text] of inserts) {
+      out += source.slice(last, at) + text;
+      last = at;
+    }
+    out += source.slice(last);
+    try { new Function(out); } catch (e) {
+      if (e instanceof SyntaxError) return source;
+    }
+    return out;
+  };
+})();
+
 globalThis.Worker = class Worker {
-  constructor(url) {
+  constructor(url, options) {
+    this._name = options && typeof options === 'object' && options.name !== undefined ? String(options.name) : '';
+    this._type = options && typeof options === 'object' && options.type === 'module' ? 'module' : 'classic';
+    this._url = typeof url === 'string' ? url : String(url);
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
@@ -15369,9 +16884,12 @@ globalThis.Worker = class Worker {
       if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
         try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
       }
+      worker._url = resolvedUrl;
       (async () => {
         try {
-          const resp = await fetch(resolvedUrl);
+          const resp = await _obscuraFetch(resolvedUrl, { mode: 'same-origin', credentials: 'same-origin' },
+            { dest: 'worker', priority: 'u=4, i', internal: true });
+          if (!resp.ok) throw new Error('Failed to load ' + resolvedUrl);
           worker._code = await resp.text();
           if (!worker._terminated) worker._autoRun();
         } catch(e) { if (worker.onerror) worker.onerror(e); }
@@ -15380,10 +16898,12 @@ globalThis.Worker = class Worker {
   }
   _makeScope() {
     const worker = this;
-    const scope = {
+    const listeners = {};
+    const { scope, self, run } = _workerGlobalScope('dedicated', {
+      name: worker._name,
       onmessage: null,
-      WorkerGlobalScope: function WorkerGlobalScope() {},
-      DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
+      onmessageerror: null,
+      onerror: null,
       postMessage: (msg) => {
         if (worker._terminated) return;
         const evt = { data: msg };
@@ -15392,9 +16912,18 @@ globalThis.Worker = class Worker {
         for (const h of ls) h(evt);
       },
       addEventListener: (type, fn) => {
-        if (!scope._ev) scope._ev = {};
-        if (!scope._ev[type]) scope._ev[type] = [];
-        scope._ev[type].push(fn);
+        if (typeof fn !== 'function') return;
+        (listeners[type] || (listeners[type] = [])).push(fn);
+      },
+      removeEventListener: (type, fn) => {
+        if (listeners[type]) listeners[type] = listeners[type].filter(h => h !== fn);
+      },
+      dispatchEvent: (event) => {
+        const type = event && event.type;
+        const handler = self['on' + type];
+        if (typeof handler === 'function') handler.call(self, event);
+        for (const h of (listeners[type] || []).slice()) h.call(self, event);
+        return true;
       },
       close: () => { worker.terminate(); },
       crypto: globalThis.crypto,
@@ -15409,22 +16938,20 @@ globalThis.Worker = class Worker {
       clearInterval: globalThis.clearInterval,
       scheduler: globalThis.scheduler,
       Scheduler: globalThis.Scheduler,
-      fetch: globalThis.fetch,
       console: globalThis.console,
       performance: globalThis.performance,
-      location: globalThis.location,
-    };
-    scope.self = scope;
+    }, { url: worker._url, type: worker._type });
+    worker._self = self;
+    worker._run = run;
+    worker._scopeListeners = listeners;
     return scope;
   }
   _autoRun() {
     if (this._terminated || this._scope || this._code === undefined) return;
     const scope = this._makeScope();
     try {
-      // Direct eval preserves script directives and resolves bare handler names
-      // against the worker scope. Run once so message closures retain their state.
-      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      // Run once so message closures retain their state.
+      this._run(this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
       if (this.onerror) this.onerror(e);
@@ -15445,11 +16972,12 @@ globalThis.Worker = class Worker {
     setTimeout(() => {
       if (worker._terminated || !worker._scope) return;
       const scope = worker._scope;
+      const self = worker._self;
       try {
         const event = { data };
-        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
-        const evs = (scope._ev && scope._ev['message']) || [];
-        for (const handler of evs.slice()) handler.call(scope, event);
+        if (typeof scope.onmessage === 'function') scope.onmessage.call(self, event);
+        const evs = worker._scopeListeners['message'] || [];
+        for (const handler of evs.slice()) handler.call(self, event);
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
@@ -15599,12 +17127,12 @@ globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
 // `window.postMessage` targets this same window. It was a no-op, so a page
 // that posted to itself and waited for the `message` event waited forever.
-// Same realm, so this needs no host round trip; it is queued as a task because
-// postMessage never delivers synchronously.
-globalThis.postMessage = function(data, targetOrigin, _transfer) {
+// A frame realm posts through the host, which records the calling realm as the
+// sender; the top-level page dispatches locally (see _sendRealmMessage). Either
+// way it is queued as a task because postMessage never delivers synchronously.
+globalThis.postMessage = _windowPostMessage(function (data, targetOrigin) {
   _sendRealmMessage(_realmFrameId, data, targetOrigin);
-};
-_markNative(globalThis.postMessage);
+});
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -16854,8 +18382,120 @@ if (typeof FontFace === 'undefined') {
 }
 
 if (typeof SharedWorker === 'undefined') {
+  // A shared worker runs its script once per document for each (URL, name).
+  // Every constructor call gets a new MessageChannel: the page keeps port1 and
+  // the worker receives port2 in a 'connect' event, as in a browser. Like the
+  // Worker shim, the script runs in this realm, under a scope object that
+  // stands in for SharedWorkerGlobalScope (see _workerGlobalScope) and falls
+  // back to the realm for the names a worker has. A port that never connected
+  // made scripts wait for a reply until their own timeout.
+  const sharedWorkers = new Map();
+  const connect = (instance, port) => {
+    setTimeout(() => {
+      const scope = instance.scope;
+      if (!scope || instance.closed) return;
+      const event = { type: 'connect', data: '', origin: '', lastEventId: '', source: port, ports: [port] };
+      try {
+        if (typeof scope.onconnect === 'function') scope.onconnect.call(instance.self, event);
+        for (const handler of (instance.listeners.connect || []).slice()) handler.call(instance.self, event);
+      } catch (e) {
+        console.error('SharedWorker error:', e && e.message);
+      }
+    }, 0);
+  };
+  const fail = (instance, error) => {
+    instance.failed = true;
+    for (const owner of instance.owners) {
+      const event = { type: 'error', message: String(error && error.message || error), error };
+      try {
+        if (typeof owner.onerror === 'function') owner.onerror(event);
+        for (const handler of (owner._listeners.error || []).slice()) handler.call(owner, event);
+      } catch (_) {}
+    }
+  };
+  const start = (instance, code) => {
+    if (instance.closed) return;
+    const listeners = {};
+    const { scope, self, run } = _workerGlobalScope('shared', {
+      onconnect: null,
+      onerror: null,
+      name: instance.name,
+      addEventListener: (type, fn) => {
+        if (typeof fn !== 'function') return;
+        (listeners[type] || (listeners[type] = [])).push(fn);
+      },
+      removeEventListener: (type, fn) => {
+        if (listeners[type]) listeners[type] = listeners[type].filter(h => h !== fn);
+      },
+      dispatchEvent: (event) => {
+        const type = event && event.type;
+        const handler = self['on' + type];
+        if (typeof handler === 'function') handler.call(self, event);
+        for (const h of (listeners[type] || []).slice()) h.call(self, event);
+        return true;
+      },
+      close: () => { instance.closed = true; },
+    }, { url: instance.url });
+    instance.self = self;
+    instance.listeners = listeners;
+    try {
+      run(code);
+    } catch (e) {
+      console.error('SharedWorker error:', e && e.message);
+      fail(instance, e);
+      return;
+    }
+    instance.scope = scope;
+    for (const port of instance.pending.splice(0)) connect(instance, port);
+  };
   globalThis.SharedWorker = class SharedWorker {
-    constructor() { this.port = { postMessage(){}, onmessage:null, start(){}, close(){}, addEventListener(){}, removeEventListener(){} }; this.onerror = null; }
+    constructor(url, options) {
+      if (arguments.length === 0) {
+        throw new TypeError("Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+      }
+      const name = typeof options === 'string' ? options
+        : options && options.name !== undefined ? String(options.name) : '';
+      let resolved = String(url);
+      if (!resolved.startsWith('blob:') && !resolved.startsWith('data:')) {
+        try { resolved = new URL(resolved, globalThis.location?.href || undefined).href; } catch (e) {}
+      }
+      const channel = new MessageChannel();
+      this.port = channel.port1;
+      this.onerror = null;
+      this._listeners = {};
+      const key = resolved + '\0' + name;
+      let instance = sharedWorkers.get(key);
+      if (!instance) {
+        instance = { name, url: resolved, scope: null, pending: [], owners: [], closed: false, failed: false };
+        sharedWorkers.set(key, instance);
+        const blob = globalThis.__blobStore?.[resolved];
+        if (blob !== undefined) {
+          setTimeout(() => start(instance, blob), 0);
+        } else {
+          (async () => {
+            try {
+              const response = await _obscuraFetch(resolved, { mode: 'same-origin', credentials: 'same-origin' },
+                { dest: 'sharedworker', priority: 'u=4, i', internal: true });
+              if (!response.ok) throw new Error('Failed to load ' + resolved);
+              start(instance, await response.text());
+            } catch (e) {
+              fail(instance, e);
+            }
+          })();
+        }
+      }
+      instance.owners.push(this);
+      if (instance.failed) return;
+      if (instance.scope) connect(instance, channel.port2);
+      else instance.pending.push(channel.port2);
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners[type]) this._listeners[type] = [];
+      this._listeners[type].push(fn);
+    }
+    removeEventListener(type, fn) {
+      if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+    }
   };
 }
 if (typeof ServiceWorkerContainer === 'undefined') {
@@ -17028,13 +18668,35 @@ const _documentMembers = Object.freeze(Object.fromEntries(
     return [name, descriptor.value || descriptor.get];
   })));
 
-globalThis.__obscura_init = function() {
+_hostState.initializeDocument = globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   __obscuraCore.ops.op_register_document_realm(_documentMembers, _realmFrameId);
+  const documentGeneration = _dom("document_generation");
+  // The public bootstrap hook is deleted after first use. Keep the host's
+  // initializer private so replacement documents still retire old wrappers.
+  // Repeated setup of the same document must preserve its state and entropy.
+  if (_hostState.documentGeneration === documentGeneration) return;
+  _hostState.clickTarget = null;
+  _hostState.mouseDown = null;
+  _hostState.mouseOverTarget = null;
+  _hostState.awaitRejected = false;
+  if (_hostState.documentGeneration !== documentGeneration) {
+    // Native node IDs are reused by a newly installed DOM. Its wrappers must
+    // not inherit old canvas contexts, event listeners or page-owned fields.
+    // Re-initializing the same document preserves its existing node identity.
+    _cache.clear();
+    _hostState.documentGeneration = documentGeneration;
+  }
+  const canvasEpoch = __obscuraCore.ops.op_canvas_document_epoch;
+  _canvasDocumentEpoch = typeof canvasEpoch === 'function' ? canvasEpoch(_realmFrameId) : 0;
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
-  _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  const profileSeed = __obscuraCore.ops.op_fingerprint_seed;
+  _fpSeed = typeof profileSeed === 'function'
+    ? profileSeed() | 0
+    : Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
+  _fpDocSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
@@ -17053,26 +18715,26 @@ globalThis.__obscura_init = function() {
   _reconcileWindowNamedProperties(previousWindowNames);
 
   const scr = _fp('screen');
-  const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
-    ? globalThis.__obscura_screen_w : scr[0];
-  const sh = Number.isFinite(globalThis.__obscura_screen_h) && globalThis.__obscura_screen_h > 0
-    ? globalThis.__obscura_screen_h : scr[1];
+  const sw = Number.isFinite(_hostState.screenWidth) && _hostState.screenWidth > 0
+    ? _hostState.screenWidth : scr[0];
+  const sh = Number.isFinite(_hostState.screenHeight) && _hostState.screenHeight > 0
+    ? _hostState.screenHeight : scr[1];
   // The OS screen and the page viewport are different browser concepts.
   // Keep the fingerprinted screen, but let the embedding browser provide the
   // actual CSS viewport so responsive JavaScript, layout, and screenshots all
   // observe the same dimensions.
-  const vw = Number.isFinite(globalThis.__obscura_viewport_w) && globalThis.__obscura_viewport_w > 0
-    ? globalThis.__obscura_viewport_w : sw;
-  const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
-    ? globalThis.__obscura_viewport_h : sh - 80;
-  _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
+  const vw = Number.isFinite(_hostState.viewportWidth) && _hostState.viewportWidth > 0
+    ? _hostState.viewportWidth : sw;
+  const vh = Number.isFinite(_hostState.viewportHeight) && _hostState.viewportHeight > 0
+    ? _hostState.viewportHeight : sh - 80;
+  _applyScreenSize(sw, sh, !!_hostState.screenEmulated);
   globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
   globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  _applyOuterSize();
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
   globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
@@ -17081,14 +18743,14 @@ globalThis.__obscura_init = function() {
 
   // A navigation start precedes the wall clock, so skew into the past only: an
   // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
+  const t0 = Date.now() - 1 - Math.floor(_fpDocRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
-  var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
+  var _totalHeap = 15000000 + Math.floor(_fpDocRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,
     totalJSHeapSize: _totalHeap,
-    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
+    usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpDocRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
 
@@ -17120,6 +18782,7 @@ globalThis.__obscura_init = function() {
   for (let i = 0; i < toHide.length; i++) {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
+  _workerGlobalScope.captureBuiltins();
   delete globalThis.__obscura_init;
 };
 
@@ -17133,7 +18796,8 @@ globalThis.__obscura_init = function() {
 // and leave them out of the hide list (and thus visible to the reflection-API
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
-  k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+  k !== '__obscura_host_state_handoff' &&
+  (k.startsWith('_') || k.includes('obscura') || k.includes('Obscura'))
 );
 
 /* ===== WPT conformance shims: batch 2 ===== */
@@ -17700,6 +19364,177 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   }
 })();
 
+// Chrome's navigator object has no own properties: every attribute and
+// operation lives on Navigator.prototype. Move the shim's members there (the
+// literal's data fields and the getters on its intermediate prototype), keeping
+// each value's identity, so `Object.getOwnPropertyNames(navigator)` is empty and
+// the prototype describes the interface.
+(function _hoistNavigatorMembers() {
+  const nav = globalThis.navigator;
+  if (!nav || typeof Navigator !== 'function') return;
+  const proto = Navigator.prototype;
+  const holders = [];
+  for (let p = Object.getPrototypeOf(nav); p && p !== proto && p !== Object.prototype; p = Object.getPrototypeOf(p))
+    holders.push(p);
+  const define = (key, descriptor) => {
+    if (!Object.prototype.hasOwnProperty.call(proto, key)) Object.defineProperty(proto, key, descriptor);
+  };
+  for (const key of Reflect.ownKeys(nav)) {
+    const d = Object.getOwnPropertyDescriptor(nav, key);
+    if (!d || !d.configurable) continue;
+    if ('value' in d && typeof d.value === 'function') {
+      define(key, { value: d.value, writable: true, enumerable: true, configurable: true });
+    } else if ('value' in d) {
+      const value = d.value;
+      const get = Object.getOwnPropertyDescriptor({ get [key]() { return value; } }, key).get;
+      define(key, { get, set: undefined, enumerable: true, configurable: true });
+    } else {
+      define(key, { get: d.get, set: d.set, enumerable: true, configurable: true });
+    }
+    delete nav[key];
+  }
+  for (const holder of holders)
+    for (const key of Reflect.ownKeys(holder))
+      if (key !== 'constructor') define(key, Object.getOwnPropertyDescriptor(holder, key));
+  Object.setPrototypeOf(nav, proto);
+  Object.defineProperty(proto, Symbol.toStringTag, { value: 'Navigator', configurable: true });
+})();
+
+// Browser API members are implemented natively in Chrome, so each one is a
+// non-constructible function that owns exactly `length` and `name`, and an
+// attribute getter rejects a receiver that is not an instance ("Illegal
+// invocation"), including the interface prototype object itself. Shims
+// written as `function` expressions, or as getters that simply read a field,
+// differ on each of those points, and fingerprinting scripts test them on
+// every API they read. Rewrap the members that differ; class and shorthand
+// methods already have the native shape and are left untouched.
+(function _normalizeApiSurface() {
+  const reflectApply = Reflect.apply;
+  const ownKeys = Reflect.ownKeys;
+  const getDescriptor = Object.getOwnPropertyDescriptor;
+  const defineProperty = Object.defineProperty;
+  const hasOwn = Object.prototype.hasOwnProperty;
+  const realSource = (fn) => { try { return reflectApply(_origToString, fn, []); } catch (e) { return ''; } };
+  const isEngineNative = (fn) => /\{\s*\[native code\]\s*\}\s*$/.test(realSource(fn)) && !_nativeFns.has(fn) && !_nativeStr.has(fn);
+  // Native shape: not a constructor (no own `prototype`) and own keys exactly
+  // `length` and `name`.
+  const nativeShaped = (fn) => {
+    if (reflectApply(hasOwn, fn, ['prototype'])) return false;
+    const keys = ownKeys(fn);
+    return keys.length === 2 && keys.includes('length') && keys.includes('name')
+      && !/^bound /.test(fn.name);
+  };
+  // A prototype object (or a non-object) is never a valid receiver.
+  const illegalReceiver = (receiver) => receiver === null
+    || (typeof receiver !== 'object' && typeof receiver !== 'function')
+    || reflectApply(hasOwn, receiver, ['constructor']);
+  const illegal = () => { throw new TypeError('Illegal invocation'); };
+  const nativeString = (fn, fallback) => _nativeStr.get(fn) || fallback;
+  function rewrapMethod(fn, key) {
+    const wrapper = { [key](...args) { return reflectApply(fn, this, args); } }[key];
+    defineProperty(wrapper, 'length', { value: fn.length, configurable: true });
+    if (_nativeStr.has(fn)) _nativeStr.set(wrapper, _nativeStr.get(fn));
+    else _markNative(wrapper);
+    return wrapper;
+  }
+  function rewrapGetter(fn, key, guard) {
+    const wrapper = getDescriptor({ get [key]() {
+      if (guard && illegalReceiver(this)) illegal();
+      return reflectApply(fn, this, []);
+    } }, key).get;
+    _markNativeAs(wrapper, nativeString(fn, 'function ' + wrapper.name + '() { [native code] }'));
+    return wrapper;
+  }
+  function rewrapSetter(fn, key) {
+    const wrapper = getDescriptor({ set [key](value) { reflectApply(fn, this, [value]); } }, key).set;
+    _markNativeAs(wrapper, nativeString(fn, 'function ' + wrapper.name + '() { [native code] }'));
+    return wrapper;
+  }
+  // Interfaces whose attribute getters fingerprinting scripts read directly
+  // from the prototype. Other interfaces keep their getters unwrapped so hot
+  // DOM paths pay nothing. `true` guards every getter.
+  const guarded = {
+    Navigator: true, Screen: true, HTMLCanvasElement: true, OffscreenCanvas: true,
+    TextMetrics: true, FontFace: true, DOMRect: true, DOMRectReadOnly: true, SVGRect: true,
+    IntersectionObserverEntry: true, AudioBuffer: true, AnalyserNode: true,
+    BiquadFilterNode: true, MediaDevices: true, Permissions: true, StorageManager: true,
+    WebGLRenderingContext: true, WebGL2RenderingContext: true, Plugin: true,
+    PluginArray: true, MimeType: true, MimeTypeArray: true, NetworkInformation: true,
+    NavigatorUAData: true, BatteryManager: true, SpeechSynthesis: true, ScreenOrientation: true,
+    HID: true, USB: true, Serial: true, StorageBucketManager: true,
+    Document: ['referrer'],
+    Element: ['clientHeight', 'clientWidth', 'clientTop', 'clientLeft', 'offsetHeight',
+      'offsetWidth', 'offsetTop', 'offsetLeft', 'offsetParent', 'scrollHeight', 'scrollWidth',
+      'contentDocument', 'contentWindow'],
+  };
+  const seen = new Set();
+  // `statics`: a constructor or namespace object, whose capitalized members are
+  // nested interfaces (Intl.DateTimeFormat) and must stay constructible.
+  function normalize(holder, name, statics = false) {
+    if (!holder || (typeof holder !== 'object' && typeof holder !== 'function') || seen.has(holder)) return;
+    seen.add(holder);
+    const guard = statics ? undefined : guarded[name];
+    for (const key of ownKeys(holder)) {
+      if (key === 'constructor' || (typeof key === 'string' && key.charAt(0) === '_')) continue;
+      if (statics && (typeof key !== 'string' || /^[A-Z]/.test(key)
+        || key === 'prototype' || key === 'length' || key === 'name'
+        || key === 'caller' || key === 'arguments')) continue;
+      let d;
+      try { d = getDescriptor(holder, key); } catch (e) { continue; }
+      if (!d || !d.configurable) continue;
+      const label = typeof key === 'symbol' ? key : String(key);
+      try {
+        if (typeof d.value === 'function') {
+          const fn = d.value;
+          if (isEngineNative(fn) || nativeShaped(fn)) {
+            if (!isEngineNative(fn) && !_nativeStr.has(fn)) _markNative(fn);
+            continue;
+          }
+          d.value = rewrapMethod(fn, label);
+          defineProperty(holder, key, d);
+          continue;
+        }
+        // Static and global attributes (document, location, ...) are hot and
+        // not read from a prototype; leave their accessors alone.
+        if (statics) continue;
+        let changed = false;
+        if (typeof d.get === 'function' && !isEngineNative(d.get)) {
+          const wants = guard === true || (Array.isArray(guard) && guard.includes(key));
+          if (wants || !nativeShaped(d.get)) { d.get = rewrapGetter(d.get, label, wants); changed = true; }
+        }
+        if (typeof d.set === 'function' && !isEngineNative(d.set) && !nativeShaped(d.set)) {
+          d.set = rewrapSetter(d.set, label); changed = true;
+        }
+        if (changed) defineProperty(holder, key, d);
+      } catch (e) {}
+    }
+  }
+  // Interfaces that Obscura aliases (HTMLElement and HTMLIFrameElement share
+  // Element's prototype) are reached once, through that shared prototype.
+  const interfaces = [];
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (!/^[A-Z]/.test(name)) continue;
+    let value;
+    try { value = globalThis[name]; } catch (e) { continue; }
+    if (typeof value === 'function') {
+      if (value.prototype) normalize(value.prototype, value.name || name);
+      interfaces.push(value);
+    } else if (value && typeof value === 'object') {
+      // Namespaces (Math, JSON, Reflect, Intl, CSS) and their constructors.
+      interfaces.push(value);
+      for (const key of Object.getOwnPropertyNames(value)) {
+        let member;
+        try { member = getDescriptor(value, key).value; } catch (e) { continue; }
+        if (typeof member === 'function' && /^[A-Z]/.test(key) && member.prototype)
+          normalize(member.prototype, key);
+      }
+    }
+  }
+  for (const value of interfaces) normalize(value, '', true);
+  // Window operations are own properties of the global object.
+  normalize(globalThis, 'Window', true);
+})();
+
 (function _markBuiltinsNative() {
   var seen = new Set();
   function walk(ctor) {
@@ -17728,5 +19563,9 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (typeof val === 'function') { walk(val); }
   }
 })();
+
+// The worker global scopes list the browser's own globals: capture them now
+// that the bootstrap has installed all of them, before any page script runs.
+_workerGlobalScope.captureBuiltins();
 
 })();

@@ -23,6 +23,7 @@ macro_rules! integration_tests {
 integration_tests!(
     accept_thread_survives_silent_connections,
     accessibility_names,
+    awaited_evaluation_meta_private,
     backspace_surrogate,
     binding_called_session,
     cdp_click_submit_parity,
@@ -35,6 +36,7 @@ integration_tests!(
     document_write_lifecycle,
     dynamic_script_onload_fires,
     dynamic_stylesheet_onload_fires,
+    emulation_locale_override_private,
     execution_context_ownership,
     execution_context_pruned_on_navigation,
     file_navigation_gate,

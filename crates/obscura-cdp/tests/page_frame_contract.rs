@@ -118,6 +118,8 @@ async fn redirected_document_response_is_bound_to_the_committed_loader() {
     let page_id = ctx.create_page();
     let session_id = format!("{page_id}-session");
     ctx.sessions.insert(session_id.clone(), page_id);
+    // Network events reach only sessions that enabled the Network domain.
+    cdp(&mut ctx, 0, "Network.enable", json!({}), Some(&session_id)).await;
     let base = serve().await;
     for path in ["child.html", "redirect.html", "redirect-chain.html"] {
         ctx.pending_events.clear();
@@ -125,15 +127,22 @@ async fn redirected_document_response_is_bound_to_the_committed_loader() {
             json!({"url": format!("{base}{path}"), "waitUntil": "load"}),
             Some(&session_id)).await;
         let loader = &navigation["loaderId"];
-        let request = ctx.pending_events.iter().position(|event|
+        // As in Chrome, every redirect hop is a requestWillBeSent of the same
+        // request: the first names the requested URL, the last the committed one.
+        let requests: Vec<usize> = ctx.pending_events.iter().enumerate().filter(|(_, event)|
             event.method == "Network.requestWillBeSent" && event.params["type"] == "Document"
-        ).expect("document request");
+        ).map(|(index, _)| index).collect();
+        let request = *requests.first().expect("document request");
+        let committed = *requests.last().expect("document request");
         let commit = ctx.pending_events.iter().position(|event|
             event.method == "Page.frameNavigated"
         ).expect("frame commit");
-        assert!(request < commit, "document request must precede frame commit");
-        assert_eq!(ctx.pending_events[request].params["requestId"], *loader);
-        assert_eq!(ctx.pending_events[request].params["request"]["url"], format!("{base}child.html"));
+        assert!(committed < commit, "document request must precede frame commit");
+        for &hop in &requests {
+            assert_eq!(ctx.pending_events[hop].params["requestId"], *loader);
+        }
+        assert_eq!(ctx.pending_events[request].params["request"]["url"], format!("{base}{path}"));
+        assert_eq!(ctx.pending_events[committed].params["request"]["url"], format!("{base}child.html"));
         let response = ctx.pending_events.iter().find(|event|
             event.method == "Network.responseReceived" && event.params["type"] == "Document"
         ).expect("document response");

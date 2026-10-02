@@ -81,6 +81,9 @@ enum CachedResource {
         bytes: Arc<[u8]>,
         intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
         static_raster: std::sync::OnceLock<bool>,
+        // True only for bytes whose owning transport established a readable
+        // image response. A URL or a CORS cache key alone is not evidence.
+        origin_clean: bool,
     },
     Missing(std::time::Instant),
 }
@@ -171,6 +174,9 @@ pub struct RenderResourceCache {
     content_image_intrinsics: HashMap<obscura_dom::tree::NodeId, RememberedContentImageIntrinsic>,
     content_image_intrinsic_order: VecDeque<obscura_dom::tree::NodeId>,
     max_content_image_intrinsics: usize,
+    // A transferred canvas's natural size follows its presented bitmap, not
+    // its page-owned width/height attributes. Keep this out of the DOM tree.
+    canvas_bitmap_sizes: HashMap<obscura_dom::tree::NodeId, (u32, u32)>,
     #[cfg(test)]
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
@@ -218,6 +224,7 @@ impl RenderResourceCache {
             content_image_intrinsics: HashMap::new(),
             content_image_intrinsic_order: VecDeque::new(),
             max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
+            canvas_bitmap_sizes: HashMap::new(),
             #[cfg(test)]
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
@@ -225,6 +232,34 @@ impl RenderResourceCache {
             sync_miss_keys: HashSet::new(),
             loader: Box::new(loader),
         }
+    }
+
+    /// Record the last presented placeholder bitmap without changing DOM
+    /// attributes. The caller invalidates resource geometry only on `Ok(true)`.
+    /// Refuse new entries at the document limit instead of evicting live sizes.
+    pub fn set_canvas_bitmap_size(
+        &mut self,
+        node: obscura_dom::tree::NodeId,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, &'static str> {
+        if let Some(size) = self.canvas_bitmap_sizes.get_mut(&node) {
+            let changed = *size != (width, height);
+            *size = (width, height);
+            return Ok(changed);
+        }
+        if self.canvas_bitmap_sizes.len() >= 1024 {
+            return Err("placeholder canvas limit reached");
+        }
+        self.canvas_bitmap_sizes.try_reserve(1)
+            .map_err(|_| "placeholder metadata allocation failed")?;
+        self.canvas_bitmap_sizes.insert(node, (width, height));
+        Ok(true)
+    }
+
+    /// Retiring a document or placeholder also retires its private natural size.
+    pub fn remove_canvas_bitmap_size(&mut self, node: obscura_dom::tree::NodeId) -> bool {
+        self.canvas_bitmap_sizes.remove(&node).is_some()
     }
 
     /// Temporarily control the compatibility loader used by synchronous
@@ -317,6 +352,54 @@ impl RenderResourceCache {
         bytes: Arc<[u8]>,
     ) {
         self.seed_shared(image_resource_key(&url, profile), bytes);
+    }
+
+    /// Associate readability with these exact immutable bytes, so eviction,
+    /// replacement and CORS-profile separation also retire the permission.
+    pub fn seed_image_shared_with_origin(
+        &mut self,
+        url: String,
+        profile: ImageRequestProfile,
+        bytes: Arc<[u8]>,
+        origin_clean: bool,
+    ) {
+        let key = image_resource_key(&url, profile);
+        self.seed_shared(key.clone(), Arc::clone(&bytes));
+        self.set_image_origin_for_bytes(&url, profile, &bytes, origin_clean);
+    }
+
+    /// A response may set permission only on the bytes it seeded. A later
+    /// response for the same URL cannot inherit an earlier permission.
+    pub fn set_image_origin_for_bytes(
+        &mut self, url: &str, profile: ImageRequestProfile, expected: &Arc<[u8]>, origin_clean: bool,
+    ) {
+        let key = image_resource_key(url, profile);
+        if let Some(CachedResource::Bytes { bytes, origin_clean: clean, .. }) = self.entries.get_mut(&key) {
+            if Arc::ptr_eq(bytes, expected) { *clean = origin_clean; }
+        }
+    }
+
+    /// Cache-only image source for browser pixel consumers. This must never
+    /// open a synchronous network request or infer permission from the URL.
+    pub fn cached_image_element_source(
+        &mut self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+    ) -> Option<(Arc<[u8]>, bool)> {
+        let node = tree.get_node(id)?;
+        if node.as_element()?.local.as_ref() != "img" { return None; }
+        let (src, _) = resolve_img_url(tree, id, viewport)?;
+        let url = resolve_resource_url(&src, base_url).unwrap_or(src);
+        if url.starts_with("data:") {
+            return fetch_bytes(&url, None, self).map(|bytes| (bytes, true));
+        }
+        let key = image_resource_key(&url, image_request_profile(tree, id));
+        match self.entries.get(&key)? {
+            CachedResource::Bytes { bytes, origin_clean, .. } => Some((Arc::clone(bytes), *origin_clean)),
+            CachedResource::Missing(_) => None,
+        }
     }
 
     pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
@@ -605,6 +688,7 @@ impl RenderResourceCache {
             bytes,
             intrinsic: std::sync::OnceLock::new(),
             static_raster: std::sync::OnceLock::new(),
+            origin_clean: false,
         });
     }
 
@@ -7968,7 +8052,7 @@ fn image_agent() -> &'static ureq::Agent {
             // that gate on User-Agent (Akamai/Cloudflare image endpoints on
             // cnbc, techcrunch, arstechnica), so the images Chrome loads came
             // back blank; a real browser UA loads the same bytes Chrome does.
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
             .resolver(SsrfGuardResolver)
             .build()
     })
@@ -9669,6 +9753,27 @@ fn collect_image_intrinsics(
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
+        if cache.canvas_bitmap_sizes.contains_key(&nid) {
+            let dimensions = tree.with_node(nid, |node| {
+                if !node.as_element().is_some_and(|name| name.local.as_ref() == "canvas") {
+                    return None;
+                }
+                let axis = |name, fallback| {
+                    let value = node.get_attribute(name)?.trim_start();
+                    let value = value.strip_prefix('+').unwrap_or(value);
+                    let end = value.bytes().take_while(u8::is_ascii_digit).count();
+                    value[..end].parse::<u32>().ok().or(Some(fallback))
+                };
+                Some((axis("width", 300).unwrap_or(300), axis("height", 150).unwrap_or(150)))
+            }).flatten();
+            if let Some((width, height)) = dimensions {
+                // Reflection follows published dimensions, while author
+                // attribute changes can independently resize the displayed
+                // box. Native snapshot pixels keep their own dimensions.
+                out.insert(nid, crate::ReplacedIntrinsic::from_canvas_dimensions(width, height));
+                continue;
+            }
+        }
         let source = tree.with_node(nid, |node| {
             match node.as_element()?.local.as_ref() {
                 "img" => Some(Source::Image),
@@ -10555,6 +10660,7 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
         _ => view_box_ratio,
     };
     Some(crate::ReplacedIntrinsic {
+        canvas_bitmap: false,
         width,
         height,
         ratio,
@@ -10802,7 +10908,7 @@ fn render_svg_with_font_database(
 /// with SVG-heavy navigation and would be prohibitive for future repeated
 /// frame capture. The embedded faces are the same stable browser-generic
 /// families used by the HTML text engine.
-fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
+pub(crate) fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
     static DATABASE: std::sync::OnceLock<std::sync::Arc<usvg::fontdb::Database>> =
         std::sync::OnceLock::new();
     std::sync::Arc::clone(DATABASE.get_or_init(|| {
@@ -12169,6 +12275,49 @@ mod tests {
     }
 
     #[test]
+    fn image_readability_belongs_to_exact_bytes_and_request_profile() {
+        let tree = parse_html("<img id='plain' src='https://assets.test/image.png'><img id='cors' crossorigin src='https://assets.test/image.png'>");
+        let plain = tree.query_selector("#plain").unwrap().unwrap();
+        let cors = tree.query_selector("#cors").unwrap().unwrap();
+        let url = "https://assets.test/image.png";
+        let mut cache = RenderResourceCache::with_loader(|_: &str| panic!("pixel access must not fetch"));
+        let old: Arc<[u8]> = Arc::from([1,2,3]);
+        let new: Arc<[u8]> = Arc::from([4,5,6]);
+        let readable = |cache: &mut RenderResourceCache, node| {
+            cache.cached_image_element_source(&tree,node,(800.0,600.0),None).map(|v| v.1)
+        };
+        assert_eq!(readable(&mut cache,plain),None);
+        cache.seed_image_shared_with_origin(url.into(),ImageRequestProfile::NoCorsInclude,old.clone(),true);
+        assert_eq!(readable(&mut cache,plain),Some(true));
+        assert_eq!(readable(&mut cache,cors),None);
+        cache.seed_image_shared(url.into(),ImageRequestProfile::NoCorsInclude,new.clone());
+        assert_eq!(readable(&mut cache,plain),Some(false));
+        cache.set_image_origin_for_bytes(url,ImageRequestProfile::NoCorsInclude,&old,true);
+        assert_eq!(readable(&mut cache,plain),Some(false));
+        cache.seed_image_shared_with_origin(url.into(),ImageRequestProfile::CorsSameOrigin,old,true);
+        assert_eq!(readable(&mut cache,cors),Some(true));
+        assert_eq!(readable(&mut cache,plain),Some(false));
+        cache.seed_image_missing(url.into(),ImageRequestProfile::CorsSameOrigin);
+        assert_eq!(readable(&mut cache,cors),None);
+    }
+
+    #[test]
+    fn image_readability_is_retired_on_eviction_and_data_uris_are_local() {
+        let tree = parse_html("<img id='network' src='https://assets.test/image.png'><img id='data' src='data:image/png;base64,AQID'><div id='other'></div>");
+        let node = |selector| tree.query_selector(selector).unwrap().unwrap();
+        let mut cache = RenderResourceCache::with_loader_and_limits(|_: &str| panic!("no network"),1,16);
+        let url = "https://assets.test/image.png";
+        cache.seed_image_shared_with_origin(url.into(),ImageRequestProfile::NoCorsInclude,Arc::from([1,2,3]),true);
+        cache.seed("https://assets.test/other".into(),vec![7]);
+        assert!(cache.cached_image_element_source(&tree,node("#network"),(800.0,600.0),None).is_none());
+        cache.seed_image(url.into(),ImageRequestProfile::NoCorsInclude,vec![1,2,3]);
+        assert!(!cache.cached_image_element_source(&tree,node("#network"),(800.0,600.0),None).unwrap().1);
+        let data = cache.cached_image_element_source(&tree,node("#data"),(800.0,600.0),None).unwrap();
+        assert_eq!(&*data.0,[1,2,3]); assert!(data.1);
+        assert!(cache.cached_image_element_source(&tree,node("#other"),(800.0,600.0),None).is_none());
+    }
+
+    #[test]
     fn image_intrinsic_cache_tracks_replacements_failures_and_request_profiles() {
         let url = "https://assets.test/swap.svg";
         let profile = ImageRequestProfile::NoCorsInclude;
@@ -12242,7 +12391,7 @@ mod tests {
         let profile = ImageRequestProfile::NoCorsInclude;
         let url = "https://assets.test/ratio.svg";
         cache.seed_image(url.into(), profile, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'/>".to_vec());
-        let expected = crate::ReplacedIntrinsic { width: None, height: None, ratio: Some(1.0) };
+        let expected = crate::ReplacedIntrinsic { canvas_bitmap: false, width: None, height: None, ratio: Some(1.0) };
         for _ in 0..2 {
             assert_eq!(cache.profiled_image_intrinsic(url, profile), Some(expected));
             assert_eq!(cache.cached_image_metadata(url, None), Some(Some((url.into(), 150.0, 150.0))));
@@ -16509,6 +16658,243 @@ mod tests {
             content.blue() > 220 && content.red() < 40,
             "translated cover image must remain visible inside padding box: {content:?}"
         );
+    }
+
+    fn reflect_placeholder_size(tree: &DomTree, node: obscura_dom::NodeId, width: u32, height: u32) {
+        tree.with_node_mut(node, |node| {
+            node.set_attribute("width", width.to_string());
+            node.set_attribute("height", height.to_string());
+        });
+    }
+
+    #[test]
+    fn placeholder_canvas_published_dimensions_preserve_author_css() {
+        for (css, expected) in [
+            ("", (40.0, 20.0)),
+            ("width:80px", (80.0, 40.0)),
+            ("height:30px", (60.0, 30.0)),
+            ("width:90px;height:25px", (90.0, 25.0)),
+            ("max-width:20px", (20.0, 10.0)),
+            ("width:40px;aspect-ratio:4", (40.0, 10.0)),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                body {{ margin:0 }} canvas {{ display:block }}
+                #target {{ {css} }}
+            </style><canvas id=target width=13 height=7></canvas>
+                <canvas id=ordinary width=13 height=7></canvas>"#));
+            let target = tree.get_element_by_id("target").unwrap();
+            let ordinary = tree.get_element_by_id("ordinary").unwrap();
+            let mut resources = RenderResourceCache::default();
+            assert_eq!(resources.set_canvas_bitmap_size(target, 40, 20), Ok(true));
+            assert_eq!(resources.set_canvas_bitmap_size(target, 40, 20), Ok(false));
+            reflect_placeholder_size(&tree, target, 40, 20);
+            let prepared = prepare_dom(&tree, (300.0, 150.0), None, &mut resources).unwrap();
+            let rect = prepared.document_rect(target).unwrap();
+            assert_eq!((rect.width, rect.height), expected, "{css}");
+            let rect = prepared.document_rect(ordinary).unwrap();
+            assert_eq!((rect.width, rect.height), (13.0, 7.0), "ordinary canvas");
+            let node = tree.get_node(target).unwrap();
+            assert_eq!(node.get_attribute("width"), Some("40"));
+            assert_eq!(node.get_attribute("height"), Some("20"));
+        }
+    }
+
+    #[test]
+    fn placeholder_canvas_zero_dimensions_never_use_image_fallback_size() {
+        for (width, height, css, expected) in [
+            (0, 0, "", (0.0, 0.0)),
+            (0, 12, "", (0.0, 12.0)),
+            (20, 0, "", (20.0, 0.0)),
+            (0, 12, "width:40px", (40.0, 12.0)),
+            (20, 0, "height:30px", (20.0, 30.0)),
+            (20, 0, "height:30px;min-width:25px", (25.0, 30.0)),
+            (20, 0, "height:30px;max-width:15px", (15.0, 30.0)),
+            (20, 0, "height:30px;aspect-ratio:2", (60.0, 30.0)),
+            (0, 12, "min-width:8px;max-height:10px", (8.0, 10.0)),
+            (0, 12, "width:40px;aspect-ratio:4", (40.0, 10.0)),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><canvas id=target
+                width=13 height=7 style="display:block;{css}"></canvas>"#));
+            let target = tree.get_element_by_id("target").unwrap();
+            let mut resources = RenderResourceCache::default();
+            resources.set_canvas_bitmap_size(target, width, height).unwrap();
+            reflect_placeholder_size(&tree, target, width, height);
+            let prepared = prepare_dom(&tree, (300.0, 150.0), None, &mut resources).unwrap();
+            let rect = prepared.document_rect(target).unwrap();
+            assert_eq!((rect.width, rect.height), expected, "{width}x{height} {css}");
+        }
+    }
+
+    #[test]
+    fn placeholder_canvas_resource_updates_match_fresh_layout_and_retain_peers() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { margin:0 } canvas { display:block } #peer { --checkpoint:1;width:21px;height:9px }
+        </style><canvas id=target width=13 height=7></canvas><div id=peer></div>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let mut case = QuerySeedCase::new(RenderResourceCache::default(), RenderResourceCache::default());
+        case.flush(&tree, &[], 0.0);
+        let peer = tree.get_element_by_id("peer").unwrap();
+        let peer_properties = case.previous.as_ref().unwrap().layout.custom_properties[&peer].clone();
+        // Cover first transfer, changed ratio, unchanged size, zero axes,
+        // retirement, and a second registration after native cleanup.
+        for size in [Some((40, 20)), Some((30, 10)), Some((30, 10)),
+            Some((0, 12)), Some((20, 0)), None, Some((8, 4))]
+        {
+            for resources in [&mut case.resources, &mut case.oracle_resources] {
+                if let Some((width, height)) = size {
+                    resources.set_canvas_bitmap_size(target, width, height).unwrap();
+                } else {
+                    assert!(resources.remove_canvas_bitmap_size(target));
+                    assert!(!resources.remove_canvas_bitmap_size(target));
+                }
+            }
+            let (width, height) = size.unwrap_or((13, 7));
+            reflect_placeholder_size(&tree, target, width, height);
+            case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
+            let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
+            assert_eq!((rect.width, rect.height), (width as f32, height as f32));
+            assert!(std::rc::Rc::ptr_eq(&peer_properties,
+                &case.previous.as_ref().unwrap().layout.custom_properties[&peer]), "clean peer recascaded");
+        }
+        // Author attributes change displayed geometry without changing the
+        // retained snapshot dimensions or native pixels.
+        case.set_attribute(&tree, target, "width", "90", 0.0);
+        let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
+        assert_eq!((rect.width, rect.height), (90.0, 4.0));
+        assert_eq!(case.resources.canvas_bitmap_sizes[&target], (8, 4));
+    }
+
+    #[test]
+    fn placeholder_canvas_resize_preserves_container_queries_and_hidden_reveal() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { margin:0 } section { width:200px;container-type:inline-size }
+            canvas { display:block;max-width:100% }
+            @container (min-width:150px) { canvas { width:50% } }
+            canvas[hidden] { display:none }
+        </style><section><canvas id=target width=13 height=7></canvas></section>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let mut case = QuerySeedCase::new(RenderResourceCache::default(), RenderResourceCache::default());
+        case.flush(&tree, &[], 0.0);
+        for (width, height) in [(40, 20), (30, 10), (30, 0), (40, 20)] {
+            for resources in [&mut case.resources, &mut case.oracle_resources] {
+                resources.set_canvas_bitmap_size(target, width, height).unwrap();
+            }
+            reflect_placeholder_size(&tree, target, width, height);
+            case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
+            let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
+            assert_eq!(rect.width, 100.0);
+            // document_rect returns Taffy's rounded paint layout. Chromium's
+            // fractional CSSOM result is a separate compatibility surface.
+            assert_eq!(rect.height, (100.0 * height as f32 / width as f32).round(),
+                "bitmap {width}x{height} produced {}x{}", rect.width, rect.height);
+        }
+        case.set_attribute(&tree, target, "hidden", "", 0.0);
+        for resources in [&mut case.resources, &mut case.oracle_resources] {
+            resources.set_canvas_bitmap_size(target, 50, 40).unwrap();
+        }
+        reflect_placeholder_size(&tree, target, 50, 40);
+        case.flush(&tree, &[crate::dom::RetainedStyleMutation::Resource], 0.0);
+        tree.with_node_mut(target, |node| node.remove_attribute_ns("", "hidden"));
+        case.flush(&tree, &[crate::dom::AttributeStyleMutation { node: target,
+            name: "hidden".into(), old_value: Some("".into()), new_value: None }.into()], 0.0);
+        let rect = case.previous.as_ref().unwrap().document_rect(target).unwrap();
+        assert_eq!((rect.width, rect.height), (100.0, 80.0));
+    }
+
+    #[test]
+    fn placeholder_canvas_capture_uses_presented_natural_size_and_object_fit() {
+        struct Surface { node: obscura_dom::NodeId, bytes: Vec<u8> }
+        impl CanvasSurfaceSource for Surface {
+            fn surface(&self, node: obscura_dom::NodeId) -> Option<CanvasSurface<'_>> {
+                (node == self.node).then(|| CanvasSurface::from_rgba8(4, 2, &self.bytes)).flatten()
+            }
+        }
+        for (css, red_pixel, white_pixel) in [
+            ("", (2, 1), (5, 1)),
+            ("width:8px;height:8px;object-fit:contain", (4, 4), (4, 0)),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><body style="margin:0;background:white">
+                <canvas id=target width=30 height=30 style="display:block;{css}"></canvas></body>"#));
+            let target = tree.get_element_by_id("target").unwrap();
+            let surface = Surface { node: target, bytes: [255, 0, 0, 255].repeat(8) };
+            let mut resources = RenderResourceCache::default();
+            resources.set_canvas_bitmap_size(target, 4, 2).unwrap();
+            reflect_placeholder_size(&tree, target, 4, 2);
+            let mut prepared = prepare_dom(&tree, (12.0, 12.0), None, &mut resources).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let pixels = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+                &tree, &mut prepared, &mut resources, &scroll, [255; 4], &surface,
+            ).unwrap();
+            let red = pixels.pixel(red_pixel.0, red_pixel.1).unwrap();
+            assert_eq!((red.red(), red.green(), red.blue(), red.alpha()), (255, 0, 0, 255), "{css}");
+            let white = pixels.pixel(white_pixel.0, white_pixel.1).unwrap();
+            assert_eq!((white.red(), white.green(), white.blue(), white.alpha()), (255, 255, 255, 255), "{css}");
+        }
+    }
+
+    #[test]
+    fn placeholder_author_dimensions_preserve_snapshot_pixels_and_object_fit() {
+        struct Surface { node: obscura_dom::NodeId, bytes: Vec<u8> }
+        impl CanvasSurfaceSource for Surface {
+            fn surface(&self, node: obscura_dom::NodeId) -> Option<CanvasSurface<'_>> {
+                (node == self.node).then(|| CanvasSurface::from_rgba8(4, 2, &self.bytes)).flatten()
+            }
+        }
+        let tree = parse_html(r#"<!doctype html><body style="margin:0;background:white">
+            <canvas id=target width=4 height=2 style="display:block;object-fit:contain"></canvas></body>"#);
+        let target = tree.get_element_by_id("target").unwrap();
+        let surface = Surface { node: target, bytes: [255, 0, 0, 255].repeat(8) };
+        let mut resources = RenderResourceCache::default();
+        resources.set_canvas_bitmap_size(target, 4, 2).unwrap();
+        for (attribute, expected) in [
+            (Some("8"), 8.0), (None, 300.0), (Some("invalid"), 300.0),
+            (Some(""), 300.0), (Some("0"), 0.0), (Some("  +8tail"), 8.0),
+        ] {
+            tree.with_node_mut(target, |node| {
+                if let Some(value) = attribute { node.set_attribute("width", value.into()); }
+                else { node.remove_attribute_ns("", "width"); }
+            });
+            let prepared = prepare_dom(&tree, (320.0, 10.0), None, &mut resources).unwrap();
+            let rect = prepared.document_rect(target).unwrap();
+            assert_eq!((rect.width, rect.height), (expected, 2.0), "{attribute:?}");
+            assert_eq!(resources.canvas_bitmap_sizes[&target], (4, 2));
+            assert_eq!(surface.bytes, [255, 0, 0, 255].repeat(8));
+        }
+        // A wider author box contains the original 4x2 surface without
+        // stretching its object-fit ratio or changing its readback pixels.
+        tree.with_node_mut(target, |node| node.set_attribute("width", "8".into()));
+        let mut prepared = prepare_dom(&tree, (12.0, 4.0), None, &mut resources).unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0,0.0), &HashMap::new());
+        let pixels = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree, &mut prepared, &mut resources, &scroll, [255;4], &surface,
+        ).unwrap();
+        let red = pixels.pixel(3,1).unwrap();
+        let white = pixels.pixel(0,1).unwrap();
+        assert_eq!((red.red(),red.green(),red.blue(),red.alpha()),(255,0,0,255));
+        assert_eq!((white.red(),white.green(),white.blue(),white.alpha()),(255,255,255,255));
+    }
+
+    #[test]
+    fn placeholder_canvas_metadata_is_bounded_and_document_scoped() {
+        let mut resources = RenderResourceCache::default();
+        for id in 0..1024 {
+            assert_eq!(resources.set_canvas_bitmap_size(obscura_dom::NodeId::new(id), 10, 5), Ok(true));
+        }
+        let overflow = obscura_dom::NodeId::new(1024);
+        assert!(resources.set_canvas_bitmap_size(overflow, 1, 1).is_err());
+        let existing = obscura_dom::NodeId::new(0);
+        assert_eq!(resources.set_canvas_bitmap_size(existing, 20, 10), Ok(true));
+        assert!(resources.remove_canvas_bitmap_size(existing));
+        assert_eq!(resources.set_canvas_bitmap_size(overflow, 1, 1), Ok(true));
+        assert_eq!(resources.canvas_bitmap_sizes.len(), 1024);
+        // A new document cannot inherit an earlier node ID's metadata.
+        resources = RenderResourceCache::default();
+        assert!(resources.canvas_bitmap_sizes.is_empty());
+        let tree = parse_html("<div id=ordinary></div><canvas id=canvas></canvas>");
+        let ordinary = tree.get_element_by_id("ordinary").unwrap();
+        resources.set_canvas_bitmap_size(ordinary, 7, 9).unwrap();
+        let (intrinsics, _) = collect_image_intrinsics(&tree, (100.0, 100.0), None, &mut resources);
+        assert!(intrinsics.is_empty(), "non-canvas nodes never use placeholder metadata");
     }
 
     #[test]
