@@ -26,6 +26,8 @@ use crate::client::{
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
 #[cfg(feature = "stealth")]
+use crate::client_hints::{ClientHintStore, HintEnvironment};
+#[cfg(feature = "stealth")]
 use crate::http_cache::{CacheLookup, HttpCache};
 
 /// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
@@ -300,6 +302,10 @@ pub struct StealthHttpClient {
     http_cache: Option<Arc<HttpCache>>,
     profile: ProfileHeaders,
     proxy_url: Option<String>,
+    /// Hints origins accepted with `Accept-CH`, shared by the context's pages.
+    client_hints: Arc<ClientHintStore>,
+    /// Viewport, scale factor and memory the page reports, for the hints.
+    hint_environment: Arc<std::sync::RwLock<HintEnvironment>>,
 }
 
 /// Scripted fetch exposes these headers before consuming the bounded body.
@@ -388,6 +394,8 @@ impl StealthHttpClient {
             http_cache: None,
             profile: stealth_profile_headers(),
             proxy_url: proxy_url.map(str::to_string),
+            client_hints: ClientHintStore::new(),
+            hint_environment: Arc::new(std::sync::RwLock::new(HintEnvironment::default())),
         }
     }
 
@@ -402,6 +410,8 @@ impl StealthHttpClient {
             self.allow_private_network,
         )
         .with_http_cache(self.http_cache.clone());
+        client.client_hints = self.client_hints.clone();
+        client.hint_environment = self.hint_environment.clone();
         client.block_trackers = self.block_trackers;
         *client.extra_headers.get_mut() = self.extra_headers.read().await.clone();
         *client.user_agent_override.get_mut() = self.user_agent_override.read().await.clone();
@@ -416,6 +426,44 @@ impl StealthHttpClient {
 
     pub fn http_cache(&self) -> Option<&Arc<HttpCache>> {
         self.http_cache.as_ref()
+    }
+
+    /// Share the browser context's client hint preferences.
+    pub fn with_client_hints(mut self, store: Arc<ClientHintStore>) -> Self {
+        self.client_hints = store;
+        self
+    }
+
+    /// The viewport, scale factor and device memory the hints report.
+    pub fn hint_environment(&self) -> HintEnvironment {
+        self.hint_environment.read().unwrap().clone()
+    }
+
+    /// The page's current viewport, scale factor and device memory.
+    pub fn set_hint_environment(&self, environment: HintEnvironment) {
+        *self.hint_environment.write().unwrap() = environment;
+    }
+
+    /// Accepted hints sent on this request, with values. A top-level
+    /// navigation uses its target origin's preferences; anything else gets
+    /// them only when it is same-origin with the top-level document, since
+    /// the default Permissions Policy delegates hints to `self`.
+    fn request_client_hints(&self, request: &ResourceRequest, url: &Url) -> Vec<(&'static str, String)> {
+        let top_level = request.mode == RequestMode::Navigate && request.destination() == "document";
+        let hints = if top_level {
+            self.client_hints.hints_for(url)
+        } else {
+            // `top_frame` is unset when the initiator is the top-level document.
+            match request.top_frame.as_ref().or(request.initiator.as_ref()) {
+                Some(top) if !request.worker_context && top.origin() == url.origin() => self.client_hints.hints_for(top),
+                _ => Vec::new(),
+            }
+        };
+        if hints.is_empty() {
+            return Vec::new();
+        }
+        let environment = self.hint_environment.read().unwrap().clone();
+        crate::client_hints::hint_values(&hints, &self.profile.sec_ch_ua, STEALTH_UA_PLATFORM_VERSION, &environment)
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -589,7 +637,11 @@ impl StealthHttpClient {
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         let mut chain_site: &'static str = "none";
+        // A Critical-CH restart re-sends the same request once with the hints.
+        let mut restart_pending = false;
+        let mut restarted_once = false;
         for _ in 0..=20 {
+            let restarted_navigation = std::mem::take(&mut restart_pending);
             validate_request_mode(&request, &current_url)?;
             let hop_site = request_fetch_site(&request, &current_url);
             chain_site = if redirects.is_empty() { hop_site } else { combine_fetch_site(chain_site, hop_site) };
@@ -617,6 +669,7 @@ impl StealthHttpClient {
             extra.retain(|(name, _)| name != "origin");
             let redirected_navigation = request.mode == RequestMode::Navigate
                 && redirects.last().is_some_and(|previous: &Url| previous.origin() != current_url.origin());
+            let client_hints = self.request_client_hints(&request, &current_url);
             let wire = chrome_wire_headers(
                 &WireRequest {
                     method: method.as_str(),
@@ -630,6 +683,8 @@ impl StealthHttpClient {
                     extra: &extra,
                     redirected_navigation,
                     preflight: None,
+                    client_hints: &client_hints,
+                    restarted_navigation,
                     conditional: if revalidating { &conditional } else { &[] },
                 },
                 &self.profile,
@@ -694,6 +749,33 @@ impl StealthHttpClient {
                 for val in resp.headers().get_all("set-cookie") {
                     if let Ok(s) = val.to_str() {
                         self.cookie_jar.set_cookie(s, &current_url);
+                    }
+                }
+            }
+
+            // A top-level navigation response sets the origin's hint
+            // preferences. If it marks an accepted hint critical that this
+            // request lacked, Chrome restarts the navigation once with it.
+            if request.mode == RequestMode::Navigate && request.destination() == "document" {
+                // Every field line counts: Google sends one Accept-CH line per hint.
+                let header = |name: &str| {
+                    let values: Vec<&str> = resp.headers().get_all(name).iter().filter_map(|value| value.to_str().ok()).collect();
+                    (!values.is_empty()).then(|| values.join(", "))
+                };
+                self.client_hints.accept(&current_url, header("accept-ch").as_deref());
+                if !status.is_redirection() && !restarted_once {
+                    if let Some(critical) = header("critical-ch") {
+                        let accepted = self.client_hints.hints_for(&current_url);
+                        let missing = crate::client_hints::parse_hint_list(&critical).into_iter().any(|hint| {
+                            accepted.contains(&hint) && !client_hints.iter().any(|(sent, _)| *sent == hint)
+                        });
+                        if missing {
+                            restarted_once = true;
+                            restart_pending = true;
+                            drop(resp);
+                            drop(in_flight);
+                            continue;
+                        }
                     }
                 }
             }
@@ -1032,6 +1114,7 @@ impl StealthHttpClient {
             extra.retain(|(name, _)| matches!(name.as_str(), "user-agent" | "accept-language"));
         }
         let referer = request_referrer(request, url);
+        let client_hints = if preflight.is_some() { Vec::new() } else { self.request_client_hints(request, url) };
         let wire = chrome_wire_headers(
             &WireRequest {
                 method,
@@ -1045,6 +1128,8 @@ impl StealthHttpClient {
                 extra: &extra,
                 redirected_navigation: false,
                 preflight,
+                client_hints: &client_hints,
+                restarted_navigation: false,
                 conditional: &[],
             },
             &self.profile,
@@ -1393,6 +1478,8 @@ mod tests {
             http_cache: None,
             profile: super::stealth_profile_headers(),
             proxy_url: None,
+            client_hints: crate::client_hints::ClientHintStore::new(),
+            hint_environment: Arc::new(std::sync::RwLock::new(crate::client_hints::HintEnvironment::default())),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client
