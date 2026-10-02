@@ -5,6 +5,8 @@ pub mod http_cache;
 pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
+mod blink_header_order;
+pub mod client_hints;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
@@ -20,6 +22,7 @@ pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,
 };
+pub use client_hints::{ClientHintStore, HintEnvironment};
 pub use http_cache::{cache_key, CacheLimits, CacheLookup, HttpCache};
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
@@ -33,3 +36,5 @@ pub use wreq_client::{
 mod http_identity_tests;
 #[cfg(all(test, feature = "stealth"))]
 mod http_cache_wire_tests;
+#[cfg(all(test, feature = "stealth"))]
+mod client_hints_wire_tests;

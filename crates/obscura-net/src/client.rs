@@ -661,23 +661,30 @@ pub struct WireRequest<'a> {
     pub redirected_navigation: bool,
     /// CORS preflight: (Access-Control-Request-Method, -Headers).
     pub preflight: Option<(&'a str, Option<&'a str>)>,
+    /// Hints the origin accepted (`Accept-CH`), with their values, beyond the
+    /// low entropy UA hints that are always sent.
+    pub client_hints: &'a [(&'static str, String)],
+    /// A navigation restarted for `Critical-CH`: Chrome writes the client
+    /// hints after `Accept` on the retried request.
+    pub restarted_navigation: bool,
     /// Cache validators, sent last.
     pub conditional: &'a [(&'static str, String)],
 }
 
 fn chrome_case(name: &str) -> String {
-    match name {
-        "sec-ch-ua" | "sec-ch-ua-mobile" | "sec-ch-ua-platform" | "priority" => name.to_string(),
-        _ => {
-            let mut out = String::with_capacity(name.len());
-            let mut upper = true;
-            for ch in name.chars() {
-                if upper { out.extend(ch.to_uppercase()); } else { out.push(ch); }
-                upper = ch == '-';
-            }
-            out
-        }
+    if name.starts_with("sec-ch-")
+        || crate::client_hints::BLINK_HINT_ORDER.contains(&name)
+        || name == "priority"
+    {
+        return name.to_string();
     }
+    let mut out = String::with_capacity(name.len());
+    let mut upper = true;
+    for ch in name.chars() {
+        if upper { out.extend(ch.to_uppercase()); } else { out.push(ch); }
+        upper = ch == '-';
+    }
+    out
 }
 
 /// Whether Chrome sends `Origin` on this request (Fetch "append a request
@@ -737,10 +744,22 @@ pub fn chrome_wire_headers(wire: &WireRequest<'_>, profile: &ProfileHeaders) -> 
             out.push((chrome_case(name), value));
         }
     };
+    // The value of one client hint header on this request: the low entropy
+    // UA hints always, the others when the origin accepted them.
+    let hint_value = |name: &str| -> Option<String> {
+        match name {
+            "sec-ch-ua" => Some(sec_ch_ua.clone()),
+            "sec-ch-ua-mobile" => Some(sec_ch_ua_mobile.clone()),
+            "sec-ch-ua-platform" => Some(sec_ch_ua_platform.clone()),
+            _ => wire.client_hints.iter().find(|(hint, _)| *hint == name).map(|(_, value)| value.clone()),
+        }
+    };
     let hints = |out: &mut Vec<(String, String)>| {
-        out.push(("sec-ch-ua".into(), sec_ch_ua.clone()));
-        out.push(("sec-ch-ua-mobile".into(), sec_ch_ua_mobile.clone()));
-        out.push(("sec-ch-ua-platform".into(), sec_ch_ua_platform.clone()));
+        for name in crate::client_hints::NAVIGATION_HINT_ORDER {
+            if let Some(value) = hint_value(name) {
+                out.push((name.to_string(), value));
+            }
+        }
     };
     let storage_access = wire.site == "cross-site"
         && request.mode != RequestMode::Navigate
@@ -801,7 +820,10 @@ pub fn chrome_wire_headers(wire: &WireRequest<'_>, profile: &ProfileHeaders) -> 
         for (name, value) in &custom {
             push(&mut out, name, value.clone());
         }
-        if !wire.redirected_navigation {
+        // Measured with Chromium 151: hints lead an ordinary navigation, follow
+        // Sec-Fetch-Dest after a cross-origin redirect and follow Accept on a
+        // Critical-CH restart.
+        if !wire.redirected_navigation && !wire.restarted_navigation {
             hints(&mut out);
         }
         push(&mut out, "upgrade-insecure-requests", "1".into());
@@ -813,13 +835,16 @@ pub fn chrome_wire_headers(wire: &WireRequest<'_>, profile: &ProfileHeaders) -> 
             push(&mut out, "origin", origin.to_string());
         }
         push(&mut out, "accept", accept);
+        if wire.restarted_navigation {
+            hints(&mut out);
+        }
         push(&mut out, "sec-fetch-site", wire.site.into());
         push(&mut out, "sec-fetch-mode", "navigate".into());
         if request.user_activated && destination == "document" {
             push(&mut out, "sec-fetch-user", "?1".into());
         }
         push(&mut out, "sec-fetch-dest", destination.into());
-        if wire.redirected_navigation {
+        if wire.redirected_navigation && !wire.restarted_navigation {
             hints(&mut out);
         }
         if storage_access {
@@ -831,10 +856,12 @@ pub fn chrome_wire_headers(wire: &WireRequest<'_>, profile: &ProfileHeaders) -> 
     }
 
     let leads = origin_leads(request);
-    for (name, value) in &custom {
-        push(&mut out, name, value.clone());
-    }
     let worker_script = matches!(destination, "worker" | "sharedworker" | "serviceworker") && !request.worker_context;
+    if worker_script || request.worker_context {
+        for (name, value) in &custom {
+            push(&mut out, name, value.clone());
+        }
+    }
     if worker_script {
         // A worker script fetched by its document: no client hints, and the
         // User-Agent follows the Fetch metadata.
@@ -865,18 +892,32 @@ pub fn chrome_wire_headers(wire: &WireRequest<'_>, profile: &ProfileHeaders) -> 
         }
         push(&mut out, "accept", accept);
     } else {
+        // A document's subresource: Blink keeps the headers it sets in a hash
+        // map and the network service writes them in the map's order. They
+        // are inserted as the request is created (page headers, Content-Type,
+        // an element-initiated Origin), then by AddClientHintsIfNecessary,
+        // then by PrepareRequest (User-Agent). Accept follows the map.
+        let mut entries: Vec<(String, String)> = custom.clone();
+        if let Some(content_type) = content_type {
+            entries.push(("content-type".into(), content_type));
+        }
         if leads {
             if let Some(origin) = wire.origin {
-                push(&mut out, "origin", origin.to_string());
+                entries.push(("origin".into(), origin.to_string()));
             }
         }
-        out.push(("sec-ch-ua-platform".into(), sec_ch_ua_platform.clone()));
-        push(&mut out, "user-agent", user_agent);
-        out.push(("sec-ch-ua".into(), sec_ch_ua.clone()));
-        if let Some(content_type) = content_type {
-            push(&mut out, "content-type", content_type);
+        for name in crate::client_hints::BLINK_HINT_ORDER {
+            if let Some(value) = hint_value(name) {
+                entries.push((name.to_string(), value));
+            }
         }
-        out.push(("sec-ch-ua-mobile".into(), sec_ch_ua_mobile.clone()));
+        entries.push(("user-agent".into(), user_agent));
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+        for name in crate::blink_header_order::header_map_order(&names) {
+            if let Some((_, value)) = entries.iter().find(|(entry, _)| entry == name) {
+                push(&mut out, name, value.clone());
+            }
+        }
         push(&mut out, "accept", accept);
     }
     if !leads {
@@ -3420,7 +3461,8 @@ mod chrome_wire_tests {
                 method: "OPTIONS", url: &target, request: &request, site: "cross-site",
                 origin: Some("https://a.example"), referer: Some("https://a.example/"), cookie: Some("k=v"),
                 content_type: None, extra: &[], redirected_navigation: false,
-                preflight: Some(("POST", Some("x-test"))), conditional: &[],
+                preflight: Some(("POST", Some("x-test"))), client_hints: &[], restarted_navigation: false,
+                conditional: &[],
             },
             &profile,
         );
@@ -3435,7 +3477,7 @@ mod chrome_wire_tests {
             &WireRequest {
                 method: "GET", url: &target, request: &navigation, site: "none", origin: None, referer: None,
                 cookie: None, content_type: None, extra: &[], redirected_navigation: false, preflight: None,
-                conditional: &[],
+                client_hints: &[], restarted_navigation: false, conditional: &[],
             },
             &profile,
         );
