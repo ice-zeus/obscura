@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use obscura_net::{CookieJar, HttpCache, ObscuraHttpClient, RobotsCache};
+use obscura_net::{ClientHintStore, CookieJar, HttpCache, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
@@ -42,6 +42,9 @@ pub struct BrowserContext {
     /// and never by another profile (`OBSCURA_HTTP_CACHE`, see
     /// `obscura_net::http_cache`). `None` without stealth or when disabled.
     pub http_cache: Option<Arc<HttpCache>>,
+    /// Hints origins of this profile asked for with `Accept-CH`, shared by
+    /// its pages like the cookie jar (see `obscura_net::client_hints`).
+    pub client_hints: Arc<ClientHintStore>,
 }
 
 impl BrowserContext {
@@ -152,6 +155,7 @@ impl BrowserContext {
             fingerprint_seed,
             fingerprint_seed_base,
             http_cache,
+            client_hints: ClientHintStore::new(),
         }
     }
 
@@ -240,6 +244,8 @@ impl BrowserContext {
             } else {
                 None
             },
+            // Hint preferences belong to the profile, like its cookies.
+            client_hints: if persistent { self.client_hints.clone() } else { ClientHintStore::new() },
         }
     }
 

@@ -1135,7 +1135,8 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            ).with_http_cache(context.http_cache.clone())))
+            ).with_http_cache(context.http_cache.clone())
+                .with_client_hints(context.client_hints.clone())))
         } else {
             None
         };
@@ -1646,6 +1647,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_viewport(viewport.0 as f64, viewport.1 as f64);
         }
+        self.sync_client_hint_environment();
     }
 
     /// Set or clear the CDP physical-screen override independently of layout.
@@ -1744,6 +1746,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_device_pixel_ratio(self.device_scale_factor as f64);
         }
+        self.sync_client_hint_environment();
     }
 
     pub fn set_default_background_color_override(&mut self, color: Option<[u8; 4]>) {
@@ -1956,7 +1959,34 @@ impl Page {
         rt.run_page_init();
         rt.set_device_pixel_ratio(self.device_scale_factor as f64);
 
+        // Read before any page script runs: the value derives from the
+        // profile's fingerprint seed, so it stays the same for later runtimes.
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            if let Some(memory) = rt.evaluate("navigator.deviceMemory").ok().and_then(|value| value.as_f64()) {
+                client.set_hint_environment(obscura_net::HintEnvironment {
+                    device_memory: memory,
+                    ..client.hint_environment()
+                });
+            }
+        }
+
         self.js = Some(rt);
+        self.sync_client_hint_environment();
+    }
+
+    /// Give the transport the viewport and scale factor the page reports, so
+    /// accepted client hints agree with JavaScript.
+    fn sync_client_hint_environment(&self) {
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            client.set_hint_environment(obscura_net::HintEnvironment {
+                viewport_width: self.viewport.0.round() as u32,
+                viewport_height: self.viewport.1.round() as u32,
+                device_pixel_ratio: self.device_scale_factor as f64,
+                ..client.hint_environment()
+            });
+        }
     }
 
     /// Resolve the document base URL per HTML spec:
