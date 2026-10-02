@@ -5213,10 +5213,17 @@ fn layout_dom_once(
     grow_trailing_auto_cells(tree, &mut styles);
 
     let descendants = tree.descendants(tree.document());
+    // Only text a box can shape matters. Text under an element without a box
+    // (script and style bodies by default, or any `display: none` parent) is
+    // skipped: result pages carry hundreds of kilobytes of non-ASCII inline
+    // script that every layout would otherwise scan character by character.
     let needs_emoji_font = descendants.iter().any(|id| {
         tree.with_node(*id, |node| match &node.data {
             obscura_dom::tree::NodeData::Text { contents } => {
-                crate::inline::text_may_need_emoji_font(contents)
+                let shaped = node.parent.is_none_or(|parent| {
+                    styles.get(&parent).is_none_or(|style| style.display != crate::Display::None)
+                });
+                shaped && crate::inline::text_may_need_emoji_font(contents)
             }
             _ => false,
         }).unwrap_or(false)
