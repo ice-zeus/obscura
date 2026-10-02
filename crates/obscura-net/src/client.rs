@@ -116,6 +116,32 @@ impl Response {
     }
 }
 
+/// Merge field names case-insensitively. Request-local values take precedence.
+/// Callers snapshot settings once so redirects cannot re-add removed secrets.
+pub fn merge_request_headers(
+    headers: &mut HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+) {
+    for (name, value) in overrides {
+        headers.retain(|known, _| !known.eq_ignore_ascii_case(name));
+        headers.insert(name.to_ascii_lowercase(), value.clone());
+    }
+}
+
+pub(crate) fn strip_navigation_redirect_headers(
+    headers: &mut HashMap<String, String>,
+    from: &Url,
+    to: &Url,
+    discard_body: bool,
+) {
+    let cross_origin = from.origin() != to.origin();
+    headers.retain(|name, _| {
+        let name = name.to_ascii_lowercase();
+        !(cross_origin && matches!(name.as_str(), "authorization" | "proxy-authorization" | "cookie" | "host"))
+            && !(discard_body && matches!(name.as_str(), "content-encoding" | "content-language" | "content-location" | "content-type" | "content-length"))
+    });
+}
+
 /// Fold one response header line into the collected header map.
 ///
 /// A plain `HashMap` insert keeps only the *last* value when a response repeats
@@ -144,6 +170,31 @@ pub struct RequestInfo {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub resource_type: ResourceType,
+}
+
+/// Internal navigation/CDP observation captured at the transport boundary.
+/// Existing RequestInfo/Response and logical callback contracts are unchanged.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct NavigationExchange {
+    pub request: RequestInfo,
+    pub post_data: Option<String>,
+    pub has_post_data: bool,
+    pub status: Option<u16>,
+    pub response_headers: HashMap<String, String>,
+    pub response_body_size: Option<usize>,
+    pub failed: bool,
+    pub timestamp: f64,
+}
+impl NavigationExchange {
+    pub(crate) fn started(request: &RequestInfo, body: Option<&[u8]>, timestamp: f64) -> Self {
+        // Large/binary bodies remain explicitly unavailable, never reconstructed
+        // from the document. The redirect loop bounds the number of observations.
+        let post_data=body.filter(|bytes| bytes.len()<=64*1024)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::to_string);
+        Self { request:request.clone(),post_data,has_post_data:body.is_some(),status:None,
+            response_headers:HashMap::new(),response_body_size:None,failed:false,timestamp }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -177,7 +228,7 @@ pub enum RequestCredentials {
 }
 
 impl RequestMode {
-    pub(crate) fn header_value(self) -> &'static str {
+    pub fn header_value(self) -> &'static str {
         match self {
             Self::Navigate => "navigate",
             Self::NoCors => "no-cors",
@@ -203,6 +254,26 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    /// URL of the top-level document when the request comes from a nested
+    /// frame. `None` means the initiator is the top-level document. Together
+    /// with `initiator` this is the HTTP cache partition (Chrome's network
+    /// isolation key).
+    pub top_frame: Option<Url>,
+    /// Sec-Fetch-Dest when it is not implied by `resource_type`: "iframe",
+    /// "worker", "sharedworker", "serviceworker" or "empty".
+    pub destination: Option<&'static str>,
+    /// The Priority request header Chrome sends for this request over HTTP/2
+    /// and HTTP/3. `None` omits it, as Chrome does for its default urgency
+    /// (async, deferred and script-inserted scripts).
+    pub priority: Option<&'static str>,
+    /// The request comes from a worker global scope. Chrome sends no client
+    /// hints from workers and orders the remaining headers differently.
+    pub worker_context: bool,
+    /// Navigation started by a user activation (typed URL, link click, form
+    /// submission): Sec-Fetch-User: ?1.
+    pub user_activated: bool,
+    /// A reload: Chrome adds Cache-Control: max-age=0.
+    pub reload: bool,
 }
 
 impl ResourceRequest {
@@ -214,6 +285,12 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            top_frame: None,
+            destination: None,
+            priority: Some("u=0, i"),
+            worker_context: false,
+            user_activated: true,
+            reload: false,
         }
     }
 
@@ -250,6 +327,12 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            top_frame: None,
+            destination: None,
+            priority: default_priority(resource_type),
+            worker_context: false,
+            user_activated: false,
+            reload: false,
         }
     }
 
@@ -271,7 +354,40 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            top_frame: None,
+            destination: None,
+            priority: Some("u=1"),
+            worker_context: false,
+            user_activated: false,
+            reload: false,
         }
+    }
+
+    /// A browser-owned load requested by the page runtime (iframe document,
+    /// worker script, importScripts, script-inserted script, linked
+    /// stylesheet). `destination` is the Fetch destination string.
+    pub fn browser_load(destination: &str, initiator: &Url, referrer: &Url) -> Self {
+        let (resource_type, mode, credentials, dest) = match destination {
+            "iframe" | "frame" => (ResourceType::Document, RequestMode::Navigate, RequestCredentials::Include, Some("iframe")),
+            "worker" => (ResourceType::Script, RequestMode::SameOrigin, RequestCredentials::SameOrigin, Some("worker")),
+            "sharedworker" => (ResourceType::Script, RequestMode::SameOrigin, RequestCredentials::SameOrigin, Some("sharedworker")),
+            "style" => (ResourceType::Stylesheet, RequestMode::NoCors, RequestCredentials::Include, None),
+            "image" => (ResourceType::Image, RequestMode::NoCors, RequestCredentials::Include, None),
+            "font" => (ResourceType::Font, RequestMode::Cors, RequestCredentials::SameOrigin, None),
+            _ => (ResourceType::Script, RequestMode::NoCors, RequestCredentials::Include, None),
+        };
+        let mut request = Self::subresource(resource_type, initiator);
+        request.referrer = Some(referrer.clone());
+        request.mode = mode;
+        request.credentials = credentials;
+        request.destination = dest;
+        request.priority = match dest {
+            Some("iframe") => Some("u=0, i"),
+            Some("worker" | "sharedworker") => Some("u=4, i"),
+            _ => default_priority(resource_type),
+        };
+        request.user_activated = false;
+        request
     }
 
     pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
@@ -279,7 +395,10 @@ impl ResourceRequest {
         self
     }
 
-    pub(crate) fn destination(&self) -> &'static str {
+    pub fn destination(&self) -> &'static str {
+        if let Some(destination) = self.destination {
+            return destination;
+        }
         match self.resource_type {
             ResourceType::Document => "document",
             ResourceType::Script => "script",
@@ -290,7 +409,10 @@ impl ResourceRequest {
         }
     }
 
-    pub(crate) fn accept(&self) -> &'static str {
+    pub fn accept(&self) -> &'static str {
+        if matches!(self.destination, Some("worker" | "sharedworker" | "serviceworker" | "empty")) {
+            return "*/*";
+        }
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
@@ -435,18 +557,57 @@ pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
     }
 }
 
-pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+pub fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
     };
+    fetch_site_between(initiator, target)
+}
+
+/// Sec-Fetch-Site for a request from `initiator` to `target` (Fetch Metadata
+/// section 2.1): same-origin, same-site (schemeful, public-suffix aware) or
+/// cross-site.
+pub fn fetch_site_between(initiator: &Url, target: &Url) -> &'static str {
     if initiator.origin() == target.origin() {
         "same-origin"
+    } else if same_site(initiator, target) {
+        "same-site"
     } else {
-        // A public-suffix-aware `same-site` classification will be added with
-        // the page resource scheduler. Until then, cross-site is the safe
-        // conservative value; it never overstates ambient trust.
         "cross-site"
     }
+}
+
+/// Sec-Fetch-Site across a redirect chain is the least trusted value seen.
+pub fn combine_fetch_site(previous: &'static str, current: &'static str) -> &'static str {
+    let rank = |site: &str| match site {
+        "same-origin" => 0,
+        "same-site" => 1,
+        "none" => 0,
+        _ => 2,
+    };
+    if previous == "none" {
+        return current;
+    }
+    if rank(current) >= rank(previous) { current } else { previous }
+}
+
+/// Chrome's Priority header for a resource type loaded by the document.
+pub(crate) fn default_priority(resource_type: ResourceType) -> Option<&'static str> {
+    match resource_type {
+        ResourceType::Document => Some("u=0, i"),
+        ResourceType::Stylesheet | ResourceType::Font => Some("u=0"),
+        ResourceType::Script => Some("u=1"),
+        ResourceType::Image => Some("u=2, i"),
+        ResourceType::Xhr | ResourceType::Fetch | ResourceType::Other => Some("u=1, i"),
+    }
+}
+
+/// Map a Priority value from the page runtime onto the fixed set Chrome uses.
+pub fn priority_from_str(value: &str) -> Option<&'static str> {
+    const KNOWN: [&str; 12] = [
+        "u=0, i", "u=0", "u=1, i", "u=1", "u=2, i", "u=2", "i", "u=4, i", "u=4", "u=5, i", "u=5", "u=3",
+    ];
+    KNOWN.iter().copied().find(|known| *known == value).filter(|value| *value != "u=3")
 }
 
 pub(crate) fn same_site_context(
@@ -459,14 +620,282 @@ pub(crate) fn same_site_context(
     };
     if same_site(initiator, target) {
         SameSiteContext::SameSite
-    } else if request.mode == RequestMode::Navigate && method_is_safe {
+    } else if request.mode == RequestMode::Navigate
+        && method_is_safe
+        && request.destination != Some("iframe")
+    {
         SameSiteContext::CrossSiteTopLevelSafe
     } else {
         SameSiteContext::CrossSite
     }
 }
 
-pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
+/// Profile-wide request header values: the browser identity every request
+/// carries (or, for workers, the subset Chrome sends from a worker).
+#[derive(Debug, Clone)]
+pub struct ProfileHeaders {
+    pub user_agent: String,
+    pub sec_ch_ua: String,
+    pub sec_ch_ua_mobile: String,
+    pub sec_ch_ua_platform: String,
+    pub accept_encoding: String,
+    pub accept_language: String,
+}
+
+/// Everything that decides one request's header set, besides the profile.
+pub struct WireRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a Url,
+    pub request: &'a ResourceRequest,
+    /// Sec-Fetch-Site for this hop (already combined across redirects).
+    pub site: &'static str,
+    pub origin: Option<&'a str>,
+    pub referer: Option<&'a str>,
+    pub cookie: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    /// Caller-supplied headers (page script headers, CDP extra headers),
+    /// lowercase names. A name Chrome itself sends keeps Chrome's position.
+    pub extra: &'a [(String, String)],
+    /// A navigation hop after a cross-origin redirect: Chrome re-adds the
+    /// client hints after Sec-Fetch-Dest.
+    pub redirected_navigation: bool,
+    /// CORS preflight: (Access-Control-Request-Method, -Headers).
+    pub preflight: Option<(&'a str, Option<&'a str>)>,
+    /// Cache validators, sent last.
+    pub conditional: &'a [(&'static str, String)],
+}
+
+fn chrome_case(name: &str) -> String {
+    match name {
+        "sec-ch-ua" | "sec-ch-ua-mobile" | "sec-ch-ua-platform" | "priority" => name.to_string(),
+        _ => {
+            let mut out = String::with_capacity(name.len());
+            let mut upper = true;
+            for ch in name.chars() {
+                if upper { out.extend(ch.to_uppercase()); } else { out.push(ch); }
+                upper = ch == '-';
+            }
+            out
+        }
+    }
+}
+
+/// Whether Chrome sends `Origin` on this request (Fetch "append a request
+/// Origin header", as Chromium applies it): CORS requests that are cross-origin
+/// or element-initiated (fonts, module scripts), and every non-GET/HEAD
+/// request except a GET-like navigation.
+pub fn chrome_sends_origin(request: &ResourceRequest, method: &str, target: &Url) -> bool {
+    let unsafe_method = !matches!(method, "GET" | "HEAD");
+    match request.mode {
+        RequestMode::Navigate => unsafe_method,
+        RequestMode::Cors => !same_origin(request, target) || unsafe_method || origin_leads(request),
+        RequestMode::NoCors | RequestMode::SameOrigin => unsafe_method,
+    }
+}
+
+/// Element-initiated CORS loads (fonts, module scripts and their imports):
+/// Chrome sends `Origin` for them even same-origin, ahead of the other headers.
+fn origin_leads(request: &ResourceRequest) -> bool {
+    request.mode == RequestMode::Cors
+        && !matches!(request.resource_type, ResourceType::Fetch | ResourceType::Xhr | ResourceType::Other)
+}
+
+/// Chrome's request header list for one request, in Chrome's wire order and
+/// HTTP/1.1 spelling. Measured against Chromium 151 over HTTP/2 and HTTP/1.1
+/// (navigation, iframe, subresources, fetch/XHR, preflight, workers, beacon).
+/// Priority is an HTTP/2+ header, so it is left out for http:// URLs, which
+/// Chrome always fetches over HTTP/1.1.
+pub fn chrome_wire_headers(wire: &WireRequest<'_>, profile: &ProfileHeaders) -> Vec<(String, String)> {
+    let request = wire.request;
+    let mut out: Vec<(String, String)> = Vec::with_capacity(20);
+    let extra_value = |name: &str| {
+        wire.extra.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.clone())
+    };
+    const POSITIONED: [&str; 17] = [
+        "user-agent", "accept", "accept-language", "accept-encoding", "sec-ch-ua", "sec-ch-ua-mobile",
+        "sec-ch-ua-platform", "origin", "referer", "cookie", "content-type", "priority", "sec-fetch-site",
+        "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user", "upgrade-insecure-requests",
+    ];
+    let user_agent = extra_value("user-agent").unwrap_or_else(|| profile.user_agent.clone());
+    let accept_language = extra_value("accept-language").unwrap_or_else(|| profile.accept_language.clone());
+    let accept = extra_value("accept").unwrap_or_else(|| request.accept().to_string());
+    // A form navigation's encoding wins over a caller Content-Type; scripted
+    // requests carry the script's own Content-Type in `extra`.
+    let content_type = wire.content_type.map(str::to_string).or_else(|| extra_value("content-type"));
+    // An explicit Cookie header (CDP extra headers) replaces the jar's value,
+    // as before; the redirect logic strips it when the origin changes.
+    let cookie = extra_value("cookie").or_else(|| wire.cookie.map(str::to_string));
+    let priority = if wire.url.scheme() == "http" { None } else { request.priority };
+    // CDP/caller overrides of the client hints replace the profile value in
+    // place, as Network.setExtraHTTPHeaders does in Chrome.
+    let sec_ch_ua = extra_value("sec-ch-ua").unwrap_or_else(|| profile.sec_ch_ua.clone());
+    let sec_ch_ua_mobile = extra_value("sec-ch-ua-mobile").unwrap_or_else(|| profile.sec_ch_ua_mobile.clone());
+    let sec_ch_ua_platform = extra_value("sec-ch-ua-platform").unwrap_or_else(|| profile.sec_ch_ua_platform.clone());
+    let destination = request.destination();
+    let push = |out: &mut Vec<(String, String)>, name: &str, value: String| {
+        if !value.is_empty() {
+            out.push((chrome_case(name), value));
+        }
+    };
+    let hints = |out: &mut Vec<(String, String)>| {
+        out.push(("sec-ch-ua".into(), sec_ch_ua.clone()));
+        out.push(("sec-ch-ua-mobile".into(), sec_ch_ua_mobile.clone()));
+        out.push(("sec-ch-ua-platform".into(), sec_ch_ua_platform.clone()));
+    };
+    let storage_access = wire.site == "cross-site"
+        && request.mode != RequestMode::Navigate
+        && request.credentials == RequestCredentials::Include
+        || (wire.site == "cross-site" && destination == "iframe");
+    let tail = |out: &mut Vec<(String, String)>| {
+        if let Some(referer) = wire.referer {
+            out.push(("Referer".into(), referer.to_string()));
+        }
+        out.push(("Accept-Encoding".into(), profile.accept_encoding.clone()));
+        if !accept_language.is_empty() {
+            out.push(("Accept-Language".into(), accept_language.clone()));
+        }
+    };
+    let finish = |out: &mut Vec<(String, String)>| {
+        if let Some(priority) = priority {
+            out.push(("priority".into(), priority.to_string()));
+        }
+        if let Some(cookie) = cookie.as_ref().filter(|cookie| !cookie.is_empty()) {
+            out.push(("Cookie".into(), cookie.clone()));
+        }
+        for (name, value) in wire.conditional {
+            out.push((chrome_case(name), value.clone()));
+        }
+    };
+
+    if let Some((method, headers)) = wire.preflight {
+        push(&mut out, "accept", "*/*".into());
+        push(&mut out, "access-control-request-method", method.to_string());
+        if let Some(headers) = headers {
+            push(&mut out, "access-control-request-headers", headers.to_string());
+        }
+        if let Some(origin) = wire.origin {
+            push(&mut out, "origin", origin.to_string());
+        }
+        push(&mut out, "user-agent", user_agent);
+        push(&mut out, "sec-fetch-mode", "cors".into());
+        push(&mut out, "sec-fetch-site", wire.site.into());
+        push(&mut out, "sec-fetch-dest", "empty".into());
+        tail(&mut out);
+        if let Some(priority) = priority {
+            out.push(("priority".into(), priority.to_string()));
+        }
+        return out;
+    }
+
+    let custom: Vec<(String, String)> = wire
+        .extra
+        .iter()
+        .filter(|(name, _)| !POSITIONED.iter().any(|known| name.eq_ignore_ascii_case(known)))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+
+    if request.mode == RequestMode::Navigate {
+        if request.reload || wire.method != "GET" {
+            push(&mut out, "cache-control", "max-age=0".into());
+        }
+        for (name, value) in &custom {
+            push(&mut out, name, value.clone());
+        }
+        if !wire.redirected_navigation {
+            hints(&mut out);
+        }
+        push(&mut out, "upgrade-insecure-requests", "1".into());
+        if let Some(content_type) = content_type {
+            push(&mut out, "content-type", content_type);
+        }
+        push(&mut out, "user-agent", user_agent);
+        if let Some(origin) = wire.origin {
+            push(&mut out, "origin", origin.to_string());
+        }
+        push(&mut out, "accept", accept);
+        push(&mut out, "sec-fetch-site", wire.site.into());
+        push(&mut out, "sec-fetch-mode", "navigate".into());
+        if request.user_activated && destination == "document" {
+            push(&mut out, "sec-fetch-user", "?1".into());
+        }
+        push(&mut out, "sec-fetch-dest", destination.into());
+        if wire.redirected_navigation {
+            hints(&mut out);
+        }
+        if storage_access {
+            push(&mut out, "sec-fetch-storage-access", "active".into());
+        }
+        tail(&mut out);
+        finish(&mut out);
+        return out;
+    }
+
+    let leads = origin_leads(request);
+    for (name, value) in &custom {
+        push(&mut out, name, value.clone());
+    }
+    let worker_script = matches!(destination, "worker" | "sharedworker" | "serviceworker") && !request.worker_context;
+    if worker_script {
+        // A worker script fetched by its document: no client hints, and the
+        // User-Agent follows the Fetch metadata.
+        push(&mut out, "accept", accept);
+        push(&mut out, "sec-fetch-site", wire.site.into());
+        push(&mut out, "sec-fetch-mode", request.mode.header_value().into());
+        push(&mut out, "sec-fetch-dest", destination.into());
+        if let Some(referer) = wire.referer {
+            out.push(("Referer".into(), referer.to_string()));
+        }
+        push(&mut out, "user-agent", user_agent);
+        out.push(("Accept-Encoding".into(), profile.accept_encoding.clone()));
+        if !accept_language.is_empty() {
+            out.push(("Accept-Language".into(), accept_language.clone()));
+        }
+        finish(&mut out);
+        return out;
+    }
+    if request.worker_context {
+        push(&mut out, "user-agent", user_agent);
+        if let Some(content_type) = content_type {
+            push(&mut out, "content-type", content_type);
+        }
+        if leads {
+            if let Some(origin) = wire.origin {
+                push(&mut out, "origin", origin.to_string());
+            }
+        }
+        push(&mut out, "accept", accept);
+    } else {
+        if leads {
+            if let Some(origin) = wire.origin {
+                push(&mut out, "origin", origin.to_string());
+            }
+        }
+        out.push(("sec-ch-ua-platform".into(), sec_ch_ua_platform.clone()));
+        push(&mut out, "user-agent", user_agent);
+        out.push(("sec-ch-ua".into(), sec_ch_ua.clone()));
+        if let Some(content_type) = content_type {
+            push(&mut out, "content-type", content_type);
+        }
+        out.push(("sec-ch-ua-mobile".into(), sec_ch_ua_mobile.clone()));
+        push(&mut out, "accept", accept);
+    }
+    if !leads {
+        if let Some(origin) = wire.origin {
+            push(&mut out, "origin", origin.to_string());
+        }
+    }
+    push(&mut out, "sec-fetch-site", wire.site.into());
+    push(&mut out, "sec-fetch-mode", request.mode.header_value().into());
+    push(&mut out, "sec-fetch-dest", destination.into());
+    if storage_access {
+        push(&mut out, "sec-fetch-storage-access", "active".into());
+    }
+    tail(&mut out);
+    finish(&mut out);
+    out
+}
+
+pub fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
     let source = request
         .referrer
         .as_ref()
@@ -835,17 +1264,18 @@ async fn read_reqwest_body_limited(
 }
 
 pub struct ObscuraHttpClient {
-    client: tokio::sync::OnceCell<Client>,
+    client: Arc<tokio::sync::OnceCell<Client>>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
     pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    interceptor_parent: Option<Arc<ObscuraHttpClient>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -864,6 +1294,7 @@ struct ResourceCacheKey {
     initiator: Option<String>,
     referrer: Option<String>,
     user_agent: String,
+    accept_language: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
 }
@@ -992,13 +1423,13 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
 /// the non-stealth HTTP path agrees with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
+pub fn chrome_client_hints(ua: &str) -> (String, String) {
     let major: usize = ua
         .split("Chrome/")
         .nth(1)
         .and_then(|s| s.split('.').next())
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(145);
+        .unwrap_or(148);
     const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
     const GREASE_VER: [&str; 3] = ["8", "99", "24"];
     const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
@@ -1012,8 +1443,16 @@ fn chrome_client_hints(ua: &str) -> (String, String) {
         ("Chromium".to_string(), major.to_string()),
         ("Google Chrome".to_string(), major.to_string()),
     ];
-    let p = PERMS[major % 6];
-    let sec_ch_ua = p
+    // Chromium places brand i at position order[i] (ShuffleBrandList), which
+    // is not the same as reading brand order[i] into position i: the two only
+    // agree for the self-inverse orders, so a gather reports the wrong order
+    // for every major version with major % 6 of 3 or 4 (147, 148, ...).
+    let order = PERMS[major % 6];
+    let mut shuffled = [0usize; 3];
+    for (brand, &position) in order.iter().enumerate() {
+        shuffled[position] = brand;
+    }
+    let sec_ch_ua = shuffled
         .iter()
         .map(|&i| format!("\"{}\";v=\"{}\"", brands[i].0, brands[i].1))
         .collect::<Vec<_>>()
@@ -1047,19 +1486,20 @@ impl ObscuraHttpClient {
         allow_private_network: bool,
     ) -> Self {
         ObscuraHttpClient {
-            client: tokio::sync::OnceCell::new(),
+            client: Arc::new(tokio::sync::OnceCell::new()),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".to_string(),
             ),
             accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
+            interceptor_parent: None,
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
         }
     }
@@ -1090,6 +1530,65 @@ impl ObscuraHttpClient {
 
             builder.build().expect("failed to build HTTP client")
         }).await
+    }
+
+    /// Fork mutable page identity while retaining context-owned transport,
+    /// cookies, interception, resource cache and in-flight accounting.
+    pub async fn fork_request_settings(self: &Arc<Self>) -> Self {
+        Self {
+            client: self.client.clone(),
+            proxy_url: self.proxy_url.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            user_agent: RwLock::new(self.user_agent.read().await.clone()),
+            accept_language: RwLock::new(self.accept_language.read().await.clone()),
+            extra_headers: RwLock::new(self.extra_headers.read().await.clone()),
+            interceptor: RwLock::new(None),
+            interceptor_parent: Some(self.clone()),
+            timeout: self.timeout,
+            in_flight: self.in_flight.clone(),
+            block_trackers: self.block_trackers,
+            resource_loader: self.resource_loader.clone(),
+            allow_private_network: self.allow_private_network,
+        }
+    }
+
+    async fn has_interceptor(&self) -> bool {
+        let mut client = self;
+        loop {
+            if client.interceptor.read().await.is_some() {
+                return true;
+            }
+            match client.interceptor_parent.as_deref() {
+                Some(parent) => client = parent,
+                None => return false,
+            }
+        }
+    }
+
+    async fn intercept_request(&self, request: &RequestInfo) -> InterceptAction {
+        let mut client = self;
+        loop {
+            if let Some(interceptor) = client.interceptor.read().await.as_ref() {
+                return interceptor.intercept(request).await;
+            }
+            match client.interceptor_parent.as_deref() {
+                Some(parent) => client = parent,
+                None => return InterceptAction::Continue,
+            }
+        }
+    }
+
+    /// Explicit browser settings, merged once before request-local headers.
+    pub async fn request_headers(&self) -> HashMap<String, String> {
+        let mut headers = HashMap::from([
+            ("user-agent".to_string(), self.user_agent.read().await.clone()),
+        ]);
+        let language = self.accept_language.read().await.clone();
+        if !language.is_empty() {
+            headers.insert("accept-language".to_string(), language);
+        }
+        merge_request_headers(&mut headers, &*self.extra_headers.read().await);
+        headers
     }
 
     /// Clone the request client owned by this browser context.
@@ -1181,7 +1680,7 @@ impl ObscuraHttpClient {
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
-            || self.interceptor.read().await.is_some()
+            || self.has_interceptor().await
         {
             return None;
         }
@@ -1218,6 +1717,7 @@ impl ObscuraHttpClient {
             initiator: request.initiator.as_ref().map(ToString::to_string),
             referrer: request.referrer.as_ref().map(ToString::to_string),
             user_agent: self.user_agent.read().await.clone(),
+            accept_language: self.accept_language.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
         })
@@ -1360,7 +1860,7 @@ impl ObscuraHttpClient {
         let request_info = RequestInfo {
             url: url.clone(),
             method: Method::GET.to_string(),
-            headers: self.extra_headers.read().await.clone(),
+            headers: self.request_headers().await,
             resource_type: request.resource_type,
         };
         callbacks.fire_request(&request_info).await;
@@ -1374,6 +1874,43 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile_uncached_traced(initial_method,url,initial_body,callbacks,request,None).await
+    }
+
+    /// Navigation-only transport observations, separate from logical callbacks.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_with_trace(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        self.fetch_navigation_from(url, form, callbacks, None, false).await
+    }
+
+    /// A navigation the document started (link, form, location): Chrome
+    /// derives Sec-Fetch-Site, Referer and a POST's Origin from that document.
+    #[doc(hidden)]
+    pub async fn fetch_navigation_from(&self, url: &Url, form: Option<&str>, callbacks: Option<&CallbackRegistry>, initiator: Option<&Url>, reload: bool)
+        -> (Result<Response,ObscuraNetError>,Vec<NavigationExchange>) {
+        let mut trace=Vec::new();
+        let method=if form.is_some() {Method::POST} else {Method::GET};
+        let mut request = ResourceRequest::navigation();
+        request.initiator = initiator.cloned();
+        request.referrer = initiator.cloned();
+        request.reload = reload;
+        let result=self.fetch_with_profile_uncached_traced(method,url,form.map(|body|body.as_bytes().to_vec()),callbacks,request,Some(&mut trace)).await;
+        if result.is_err() {
+            if let Some(last)=trace.last_mut() { last.failed=true; }
+        }
+        (result,trace)
+    }
+
+    async fn fetch_with_profile_uncached_traced(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        request: ResourceRequest,
+        mut trace: Option<&mut Vec<NavigationExchange>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -1400,6 +1937,9 @@ impl ObscuraHttpClient {
         }
 
         let mut current_url = url.clone();
+        let mut request_headers = self.request_headers().await;
+        let ua = request_headers.get("user-agent").cloned().unwrap_or_default();
+        let accept_language = request_headers.get("accept-language").cloned().unwrap_or_default();
         let mut redirects = Vec::new();
         // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
         // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
@@ -1412,15 +1952,15 @@ impl ObscuraHttpClient {
 
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
-            let request_info = RequestInfo {
+            let mut request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: request_headers.clone(),
                 resource_type: request.resource_type.clone(),
             };
 
-            if let Some(interceptor) = self.interceptor.read().await.as_ref() {
-                match interceptor.intercept(&request_info).await {
+            {
+                match self.intercept_request(&request_info).await {
                     InterceptAction::Continue => {}
                     InterceptAction::Block => {
                         return Err(ObscuraNetError::Blocked(current_url.to_string()));
@@ -1430,19 +1970,12 @@ impl ObscuraHttpClient {
                     }
                     InterceptAction::ModifyHeaders(headers) => {
                         let mut extra = self.extra_headers.write().await;
-                        extra.extend(headers);
+                        extra.extend(headers.clone());
+                        merge_request_headers(&mut request_headers, &headers);
                     }
                 }
             }
 
-            if !request_callback_fired {
-                if let Some(cbs) = callbacks {
-                    cbs.fire_request(&request_info).await;
-                }
-                request_callback_fired = true;
-            }
-
-            let ua = self.user_agent.read().await.clone();
             let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
@@ -1451,7 +1984,7 @@ impl ObscuraHttpClient {
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
                 HeaderValue::from_str(&sec_ch_ua)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
+                    .unwrap_or_else(|_| HeaderValue::from_static("\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"")),
             );
             headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
             headers.insert(
@@ -1463,7 +1996,7 @@ impl ObscuraHttpClient {
                 headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
             }
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
@@ -1477,7 +2010,10 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-mode"),
                 HeaderValue::from_static(request.mode.header_value()),
             );
-            if request.mode == RequestMode::Navigate {
+            if request.mode == RequestMode::Navigate
+                && request.user_activated
+                && request.destination() == "document"
+            {
                 headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
             }
             headers.insert(
@@ -1490,7 +2026,6 @@ impl ObscuraHttpClient {
                 }
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-            let accept_language = self.accept_language.read().await.clone();
             if let Ok(value) = HeaderValue::from_str(&accept_language) {
                 if !accept_language.is_empty() {
                     headers.insert(reqwest::header::ACCEPT_LANGUAGE, value);
@@ -1539,7 +2074,7 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            for (k, v) in &request_headers {
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -1557,19 +2092,30 @@ impl ObscuraHttpClient {
                 headers.remove(reqwest::header::ORIGIN);
             }
 
+            if body.is_some() && method == Method::POST {
+                headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+            }
+            request_info.headers = headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str().to_string(), value.to_string()))
+            }).collect();
+            if !request_callback_fired {
+                if let Some(cbs) = callbacks {
+                    cbs.fire_request(&request_info).await;
+                }
+                request_callback_fired = true;
+            }
+
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
-                if method == Method::POST {
-                    req_builder = req_builder.header(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    );
-                }
                 req_builder = req_builder.body(b.clone());
             }
 
+            let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            if let Some(trace)=trace.as_mut() {
+                trace.push(NavigationExchange::started(&request_info,body.as_deref(),timestamp));
+            }
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
@@ -1600,6 +2146,11 @@ impl ObscuraHttpClient {
                 );
             }
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) {
+                last.status=Some(status.as_u16());
+                last.response_headers=response_headers.clone();
+            }
+
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
                     let location_str = location.to_str().map_err(|_| {
@@ -1612,12 +2163,13 @@ impl ObscuraHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    let discard_body = status == reqwest::StatusCode::MOVED_PERMANENTLY
+                        || status == reqwest::StatusCode::FOUND
+                        || status == reqwest::StatusCode::SEE_OTHER;
+                    strip_navigation_redirect_headers(&mut request_headers, &current_url, &next_url, discard_body);
                     redirects.push(current_url.clone());
                     current_url = next_url;
-                    if status == reqwest::StatusCode::MOVED_PERMANENTLY
-                        || status == reqwest::StatusCode::FOUND
-                        || status == reqwest::StatusCode::SEE_OTHER
-                    {
+                    if discard_body {
                         method = Method::GET;
                         body = None;
                     }
@@ -1633,6 +2185,7 @@ impl ObscuraHttpClient {
             .await?;
             drop(in_flight);
 
+            if let Some(last)=trace.as_mut().and_then(|trace|trace.last_mut()) { last.response_body_size=Some(body_bytes.len()); }
             let response = Response {
                 url: current_url,
                 status: status.as_u16(),
@@ -2837,5 +3390,61 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod chrome_wire_tests {
+    /// The HTTP/1.1 header list for an https URL keeps the Priority header (it is
+    /// sent over HTTP/2, which Chrome negotiates for https), and a CORS preflight
+    /// carries Chrome's preflight header set: no client hints, no cookies.
+    #[test]
+    fn chrome_wire_headers_for_preflight_and_https_priority() {
+        use super::{chrome_wire_headers, ProfileHeaders, ResourceRequest, ResourceType, WireRequest};
+        use url::Url;
+        let profile = ProfileHeaders {
+            user_agent: "UA".into(),
+            sec_ch_ua: "brands".into(),
+            sec_ch_ua_mobile: "?0".into(),
+            sec_ch_ua_platform: "\"Windows\"".into(),
+            accept_encoding: "gzip, deflate, br, zstd".into(),
+            accept_language: "en-US,en;q=0.9".into(),
+        };
+        let page = Url::parse("https://a.example/page").unwrap();
+        let target = Url::parse("https://b.test/data").unwrap();
+        let mut request = ResourceRequest::subresource(ResourceType::Fetch, &page);
+        request.destination = Some("empty");
+        let names = |list: Vec<(String, String)>| list.into_iter().map(|(n, v)| format!("{n}: {v}")).collect::<Vec<_>>();
+        let preflight = chrome_wire_headers(
+            &WireRequest {
+                method: "OPTIONS", url: &target, request: &request, site: "cross-site",
+                origin: Some("https://a.example"), referer: Some("https://a.example/"), cookie: Some("k=v"),
+                content_type: None, extra: &[], redirected_navigation: false,
+                preflight: Some(("POST", Some("x-test"))), conditional: &[],
+            },
+            &profile,
+        );
+        assert_eq!(names(preflight), [
+            "Accept: */*", "Access-Control-Request-Method: POST", "Access-Control-Request-Headers: x-test",
+            "Origin: https://a.example", "User-Agent: UA", "Sec-Fetch-Mode: cors", "Sec-Fetch-Site: cross-site",
+            "Sec-Fetch-Dest: empty", "Referer: https://a.example/", "Accept-Encoding: gzip, deflate, br, zstd",
+            "Accept-Language: en-US,en;q=0.9", "priority: u=1, i",
+        ]);
+        let navigation = ResourceRequest::navigation();
+        let typed = chrome_wire_headers(
+            &WireRequest {
+                method: "GET", url: &target, request: &navigation, site: "none", origin: None, referer: None,
+                cookie: None, content_type: None, extra: &[], redirected_navigation: false, preflight: None,
+                conditional: &[],
+            },
+            &profile,
+        );
+        assert_eq!(names(typed), [
+            "sec-ch-ua: brands", "sec-ch-ua-mobile: ?0", "sec-ch-ua-platform: \"Windows\"",
+            "Upgrade-Insecure-Requests: 1", "User-Agent: UA",
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Sec-Fetch-Site: none", "Sec-Fetch-Mode: navigate", "Sec-Fetch-User: ?1", "Sec-Fetch-Dest: document",
+            "Accept-Encoding: gzip, deflate, br, zstd", "Accept-Language: en-US,en;q=0.9", "priority: u=0, i",
+        ]);
     }
 }

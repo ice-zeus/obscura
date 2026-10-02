@@ -2396,7 +2396,7 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
 
 /// Apply HTML presentational attributes at their cascade origin: above the UA
 /// defaults, but below every author stylesheet and style attribute.
-fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle, placeholder: bool) {
     if let Some(direction) = node.get_attribute("dir") {
         style.direction = match direction.trim().to_ascii_lowercase().as_str() {
             "ltr" => Some(taffy::Direction::Ltr),
@@ -2410,7 +2410,7 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
     if let Some(bgcolor) = node.get_attribute("bgcolor") {
         crate::style::apply_inline(style, &format!("background-color: {}", bgcolor));
     }
-    if let Some(width) = node.get_attribute("width") {
+    if let Some(width) = node.get_attribute("width").filter(|_| !placeholder) {
         if width.chars().all(|c| c.is_ascii_digit()) {
             crate::style::apply_inline(style, &format!("width: {}px", width));
         } else {
@@ -2428,14 +2428,14 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
             crate::style::apply_inline(style, &format!("border-spacing: {}px", cellspacing));
         }
     }
-    if let Some(height) = node.get_attribute("height") {
+    if let Some(height) = node.get_attribute("height").filter(|_| !placeholder) {
         if height.chars().all(|c| c.is_ascii_digit()) {
             crate::style::apply_inline(style, &format!("height: {}px", height));
         } else {
             crate::style::apply_inline(style, &format!("height: {}", height));
         }
     }
-    if style.aspect_ratio.is_none() {
+    if style.aspect_ratio.is_none() && !placeholder {
         let aw = node
             .get_attribute("width")
             .and_then(|w| w.parse::<f32>().ok());
@@ -2578,6 +2578,7 @@ fn apply_picture_source_hints(
 /// instead of one native frame per DOM level.
 fn cascade_node_style(
     tree: &DomTree,
+    intrinsic: &ReplacedIntrinsicMap,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
     _document_sheet: &crate::css::Stylesheet,
@@ -2742,7 +2743,8 @@ fn cascade_node_style(
                 style.display = crate::Display::None;
             }
         }
-        apply_presentational_hints(&node, &mut style);
+        apply_presentational_hints(&node, &mut style,
+            intrinsic.get(&id).is_some_and(|value| value.canvas_bitmap));
         apply_picture_source_hints(tree, id, viewport, &mut style);
         let node_id = node.get_attribute("id");
         let classes: Vec<String> = node
@@ -2846,6 +2848,7 @@ fn cascade_node_style(
 /// Stack usage is now independent of DOM depth.
 fn cascade_walk(
     tree: &DomTree,
+    intrinsic: &ReplacedIntrinsicMap,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
     document_sheet: &crate::css::Stylesheet,
@@ -2949,6 +2952,7 @@ fn cascade_walk(
                     is_element,
                 )) = cascade_node_style(
                     tree,
+                    intrinsic,
                     visit.id,
                     visit.sheet,
                     document_sheet,
@@ -4524,9 +4528,12 @@ pub fn computed_style_without_layout(
     let shadow_sheets = HashMap::new();
     let mut timeline = crate::AnimationTimelineState::default();
     let mut ancestor_display_none = false;
+    // Placeholder canvas bitmaps only replace mapped width/height hints, and
+    // none of the properties answered here depends on them.
+    let intrinsic = ReplacedIntrinsicMap::new();
     for &node in &path {
         let (next_props, next_padding, next_dark, element) = cascade_node_style(
-            tree, node, &sheet, &sheet, &shadow_sheets, &mut matcher,
+            tree, &intrinsic, node, &sheet, &sheet, &shadow_sheets, &mut matcher,
             &mut styles, &mut custom_properties, &props, &mut None, quirks,
             viewport, crate::AnimationSample::default(), &mut timeline,
             cell_padding, dark, None, ancestor_display_none,
@@ -4714,10 +4721,21 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         if !stylesheet_cache_hit {
             return None;
         }
+        let mut changed_canvases = Vec::new();
         let active_containers = retained
             .styles
             .iter()
             .filter_map(|(node, style)| {
+                // Fold bitmap damage into the existing style walk. A new,
+                // resized or retired placeholder must recascade mapped size
+                // hints; unchanged canvases and unrelated peers stay reusable.
+                if style.has_replaced_sizing {
+                    let current = intrinsic.get(node).filter(|value| value.canvas_bitmap);
+                    let previous = style.replaced_intrinsic.as_ref().filter(|value| value.canvas_bitmap);
+                    if current != previous {
+                        changed_canvases.push(*node);
+                    }
+                }
                 (style.container_type != crate::ContainerType::Normal).then_some(*node)
             })
             .collect::<HashSet<_>>();
@@ -4762,6 +4780,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
                     }
                     return None;
                 }
+                dirty.extend(changed_canvases);
                 Some((retained, dirty))
             }
             RetainedStylePlan::Full => None,
@@ -5079,6 +5098,7 @@ fn layout_dom_once(
     });
     cascade_walk(
         tree,
+        intrinsic,
         tree.document(),
         &sheet,
         &sheet,
@@ -6703,12 +6723,16 @@ fn layout_dom_once(
                 s.intrinsic_size = metadata.natural_size();
                 s.replaced_intrinsic = Some(metadata);
                 s.ratio_only_available_width = ratio_only_available_widths.get(&nid).copied();
-                if (s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped)
-                    && metadata.ratio.is_some()
+                let refresh_canvas_ratio = metadata.canvas_bitmap && s.aspect_ratio_is_intrinsic;
+                if (s.aspect_ratio.is_none() || s.aspect_ratio_is_mapped || refresh_canvas_ratio)
+                    && (metadata.ratio.is_some() || metadata.canvas_bitmap)
                 {
+                    // Retained container-query styles can carry the previous
+                    // bitmap's intrinsic ratio. Replace or clear that ratio
+                    // when the bitmap changes; preserve an authored ratio.
                     s.aspect_ratio = metadata.ratio;
                     s.aspect_ratio_is_mapped = false;
-                    s.aspect_ratio_is_intrinsic = true;
+                    s.aspect_ratio_is_intrinsic = metadata.ratio.is_some();
                 }
             }
         }
@@ -12917,7 +12941,7 @@ fn build(
     // A loaded poster supplies `<video>`'s replaced-content dimensions before
     // decoded video metadata exists. Only use HTML's 300x150 fallback when no
     // poster intrinsic is available.
-    if !(_name.local.as_ref() == "video" && style.replaced_intrinsic.is_some()) {
+    if !(matches!(_name.local.as_ref(), "video" | "canvas") && style.replaced_intrinsic.is_some()) {
         if let Some((width, height)) = crate::inline::default_replaced_intrinsic_size(
             _name.local.as_ref(),
             style.font_size.unwrap_or(16.0),
@@ -12937,13 +12961,13 @@ fn build(
     // width. Its intrinsic dimensions participate in an auto-sized ancestor's
     // max-content measurement; once the percentage axis becomes definite, the
     // measure callback derives the other axis through the intrinsic ratio.
-    if matches!(_name.local.as_ref(), "img" | "video") {
+    if matches!(_name.local.as_ref(), "img" | "video" | "canvas") {
         if let Some(intrinsic) = style.replaced_intrinsic.or_else(|| {
             style
                 .intrinsic_size
                 .map(|(width, height)| crate::ReplacedIntrinsic::from_dimensions(width, height))
         }) {
-            let (width, height) = intrinsic.natural_size().unwrap_or((300.0, 150.0));
+            let width = intrinsic.natural_size().unwrap_or((300.0, 150.0)).0;
             let intrinsic_ratio = intrinsic.ratio.unwrap_or(2.0);
             let preferred_ratio = style
                 .aspect_ratio
@@ -12963,9 +12987,11 @@ fn build(
                 let preferred_width = match style.width {
                     crate::Dimension::Px(width) => Some(width),
                     crate::Dimension::Auto => match style.height {
+                        crate::Dimension::Px(_) if intrinsic.canvas_bitmap && intrinsic.ratio.is_none()
+                            && style.aspect_ratio.is_none() => Some(width),
                         crate::Dimension::Px(height) => Some(height * preferred_ratio),
                         _ => Some(
-                            crate::inline::constrained_auto_replaced_size(width, height, style)
+                            crate::inline::constrained_intrinsic_replaced_size(intrinsic, style)
                                 .width,
                         ),
                     },
@@ -13009,14 +13035,18 @@ fn build(
             let ratio_only = intrinsic.width.is_none()
                 && intrinsic.height.is_none()
                 && intrinsic.ratio.is_some();
+            // A zero-axis canvas has independent intrinsic dimensions. A
+            // definite CSS height cannot turn its auto width into block fill.
+            let independent_canvas_width = intrinsic.canvas_bitmap
+                && intrinsic.ratio.is_none() && style.aspect_ratio.is_none();
             if matches!(style.width, crate::Dimension::Auto)
-                && matches!(style.height, crate::Dimension::Auto)
+                && (matches!(style.height, crate::Dimension::Auto) || independent_canvas_width)
                 && !has_percentage_constraint
                 && !ratio_only
                 && !is_in_flow_grid_item(tree, id, style, styles)
             {
                 let constrained =
-                    crate::inline::constrained_auto_replaced_size(width, height, style);
+                    crate::inline::constrained_intrinsic_replaced_size(intrinsic, style);
                 taffy_style.size.width = taffy::Dimension::length(constrained.width);
                 if has_definite_constraint {
                     taffy_style.size.height = taffy::Dimension::length(constrained.height);

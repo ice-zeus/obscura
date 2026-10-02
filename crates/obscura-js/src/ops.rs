@@ -18,7 +18,6 @@ use obscura_net::{
     CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
     SameSiteContext, same_site,
 };
-#[cfg(feature = "render")]
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 use tokio::sync::Mutex;
 
@@ -82,10 +81,11 @@ pub struct StoredNetworkResponseBody {
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
-    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Matches the `fetch-{N}` id allocated before interception, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
-    /// The interception consumer already received the request start.
+    /// A CDP-owned interception pause already announced the request start to
+    /// its owner session. Embedder interception channels leave this false.
     pub intercepted: bool,
     pub url: String,
     pub method: String,
@@ -93,6 +93,50 @@ pub struct JsNetworkEvent {
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
+}
+
+// Transport work returns owned data only; OpState stays on its isolate thread.
+struct ScriptNetworkCompletion {
+    event: JsNetworkEvent,
+    body: Option<StoredNetworkResponseBody>,
+}
+
+fn script_network_completion(
+    request_id: String, intercepted: bool, url: String, method: String,
+    status: u16, headers: HashMap<String, String>, bytes: &[u8], text: &str,
+) -> ScriptNetworkCompletion {
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    let body = (max_entries > 0 && max_bytes > 0 && bytes.len() <= max_bytes)
+        .then(|| StoredNetworkResponseBody { body: text.to_string(), base64_encoded: false });
+    ScriptNetworkCompletion {
+        event: JsNetworkEvent {
+            request_id, intercepted, url, method, status, response_headers: headers,
+            body_size: bytes.len(), timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+        },
+        body,
+    }
+}
+
+fn retain_script_network_completion(state: &mut ObscuraState, completion: ScriptNetworkCompletion) {
+    if let Some(body) = completion.body {
+        let request_id = completion.event.request_id.clone();
+        state.network_response_bodies.insert(request_id.clone(), body);
+        state.network_response_body_order.push_back(request_id);
+        let max_entries = response_body_entry_limit();
+        while state.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = state.network_response_body_order.pop_front() {
+                state.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    state.js_network_events.push(completion.event);
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if state.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = state.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        state.js_network_events.drain(0..overflow);
+    }
 }
 
 #[cfg(feature = "render")]
@@ -136,6 +180,9 @@ pub struct ObscuraState {
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+    /// URL of the top-level document for a frame realm (`None` for the page
+    /// itself). Subresource requests carry it as their cache partition.
+    pub top_frame_url: Option<String>,
     pub pending_navigation: Option<(String, String, String)>,
     /// The tab's session history as the owning page sees it: entry URLs, the
     /// index of this document's first entry, and the current index. Empty
@@ -147,6 +194,7 @@ pub struct ObscuraState {
     /// the page can move its cursor instead of appending an entry.
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub cdp_intercept_channel: bool,
     pub intercept_enabled: bool,
     /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
     /// sent to the interception channel; empty means every request.
@@ -204,6 +252,8 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    #[cfg(feature = "render")]
+    pub(crate) canvas_epoch: u32,
     /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
     /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
     /// Interior mutability so the read path keeps its shared borrow.
@@ -294,6 +344,10 @@ pub struct ObscuraState {
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
+    #[cfg(feature = "webgl")]
+    pub(crate) webgl: crate::webgl_ops::Contexts,
+    #[cfg(feature = "webgl")]
+    pub(crate) webgl_surfaces: HashMap<NodeId, (u32, u32, Vec<u8>)>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -365,11 +419,13 @@ impl ObscuraState {
         self.encoding = parent.encoding.clone();
         self.blocked_urls = parent.blocked_urls.clone();
         self.intercept_enabled = parent.intercept_enabled;
+        self.cdp_intercept_channel = parent.cdp_intercept_channel;
         self.page_in_flight = parent.page_in_flight.clone();
         #[cfg(feature = "stealth")]
         {
             self.stealth_client = parent.stealth_client.clone();
         }
+        self.top_frame_url = Some(parent.top_frame_url.clone().unwrap_or_else(|| parent.url.clone()));
         #[cfg(feature = "render")]
         if has_page_transport(parent) {
             self.render_resources.set_sync_loading_enabled(false);
@@ -393,10 +449,12 @@ impl ObscuraState {
             callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
+            top_frame_url: None,
             pending_navigation: None,
             session_history: SessionHistory::default(),
             pending_history_traversal: None,
             intercept_tx: None,
+            cdp_intercept_channel: false,
             intercept_enabled: false,
             intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
@@ -419,6 +477,8 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            #[cfg(feature = "render")]
+            canvas_epoch: next_canvas_epoch(),
             base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
             prepared_render: None,
@@ -465,6 +525,10 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            #[cfg(feature = "webgl")]
+            webgl: crate::webgl_ops::Contexts::default(),
+            #[cfg(feature = "webgl")]
+            webgl_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -626,28 +690,13 @@ fn record_js_network_completion(
     body: &str,
     base64_encoded: bool,
 ) {
-    let state_borrow = state.borrow();
-    let gs = state_borrow.borrow::<SharedState>().clone();
-    let mut gs = gs.borrow_mut();
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
-    if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
-            body: body.to_string(), base64_encoded,
-        });
-        gs.network_response_body_order.push_back(event.request_id.clone());
-        while gs.network_response_body_order.len() > max_entries {
-            if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                gs.network_response_bodies.remove(&oldest);
-            }
-        }
-    }
-    gs.js_network_events.push(event);
-    const MAX_JS_NETWORK_EVENTS: usize = 4096;
-    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-        gs.js_network_events.drain(0..overflow);
-    }
+    let body = (max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes)
+        .then(|| StoredNetworkResponseBody { body: body.to_string(), base64_encoded });
+    let state_borrow = state.borrow();
+    let shared = state_borrow.borrow::<SharedState>().clone();
+    retain_script_network_completion(&mut shared.borrow_mut(), ScriptNetworkCompletion { event, body });
 }
 
 /// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
@@ -789,6 +838,7 @@ impl RealmStates {
         self.entries.len()
     }
 
+    /// The context of the live realm for `frame_id`, if it still exists.
     pub(crate) fn context(&self, frame_id: u32) -> Option<v8::Global<v8::Context>> {
         self.entries.iter().find(|(_, id, _)| *id == frame_id)
             .map(|(context, _, _)| context.clone())
@@ -797,6 +847,18 @@ impl RealmStates {
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
         self.entries.retain(|(_, id, _)| *id != frame_id);
     }
+
+    pub(crate) fn set_http_client(&self, client: Arc<ObscuraHttpClient>) {
+        for (_, _, state) in &self.entries {
+            state.borrow_mut().http_client = Some(client.clone());
+        }
+    }
+
+    /// The contexts of every live frame realm, in registration order.
+    pub(crate) fn contexts(&self) -> Vec<v8::Global<v8::Context>> {
+        self.entries.iter().map(|(context, _, _)| context.clone()).collect()
+    }
+
     pub fn register(
         &mut self,
         context: v8::Global<v8::Context>,
@@ -807,6 +869,23 @@ impl RealmStates {
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        for (_, _, state) in self.entries.iter().filter(|(known, _, _)| known == context) {
+            // Pending native work can retain this state after its realm closes.
+            // Retire its posted callbacks as well as its graphics resources.
+            let mut state = state.borrow_mut();
+            state.document_generation = state.document_generation.wrapping_add(1);
+            #[cfg(feature = "render")]
+            {
+                state.canvas_epoch = 0;
+                state.canvas_surfaces.clear();
+            }
+            #[cfg(feature = "webgl")]
+            {
+                crate::webgl_ops::canvas_placeholder::clear(&mut state);
+                state.webgl.entries.clear();
+                state.webgl_surfaces.clear();
+            }
+        }
         self.entries.retain(|(known, _, _)| known != context);
     }
 
@@ -1294,6 +1373,8 @@ pub struct RenderResourceResponse {
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
     pub body: Arc<[u8]>,
+    #[cfg(feature = "webgl")]
+    pub image_origin_clean: bool,
 }
 
 /// A transport response the runtime applied; the page turns it into the
@@ -1905,6 +1986,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             "null".to_string()
         }
         "document_node_id" => dom.document().index().to_string(),
+        // Keep this as an exact string: JS wrapper caches must not conflate
+        // document identities when the host installs a replacement DOM.
+        "document_generation" => gs.document_generation.to_string(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script
             // changes through title.textContent must be reflected by
@@ -2870,6 +2954,67 @@ enum FetchCredentials {
     Include,
 }
 
+/// Request metadata the page runtime passes with each op_fetch_url call.
+#[derive(Debug, Default, serde::Deserialize)]
+struct FetchMeta {
+    #[serde(default)]
+    dest: String,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    referrer: String,
+    #[serde(default)]
+    worker: bool,
+    #[serde(default)]
+    internal: bool,
+}
+
+impl FetchMeta {
+    fn parse(json: &str) -> Self {
+        serde_json::from_str(json).unwrap_or_default()
+    }
+
+    fn cacheable_load(&self) -> bool {
+        matches!(self.dest.as_str(), "worker" | "sharedworker" | "script" | "style")
+    }
+}
+
+/// The browser request a scripted fetch or a browser-owned load stands for:
+/// Fetch destination, mode, credentials, referrer, priority and realm. The
+/// transports derive Chrome's headers from it.
+fn scripted_request(meta: &FetchMeta, page_origin: &str, mode: &str, credentials: FetchCredentials) -> ResourceRequest {
+    let initiator = url::Url::parse(page_origin).ok().filter(|url| matches!(url.scheme(), "http" | "https"));
+    let fallback = initiator.clone().unwrap_or_else(|| url::Url::parse("about:blank").unwrap());
+    let referrer = url::Url::parse(&meta.referrer).ok().filter(|url| matches!(url.scheme(), "http" | "https"));
+    let mut request = match meta.dest.as_str() {
+        "" | "empty" => {
+            let mut request = ResourceRequest::subresource(ResourceType::Fetch, &fallback);
+            request.mode = match mode {
+                "no-cors" => RequestMode::NoCors,
+                "same-origin" => RequestMode::SameOrigin,
+                "navigate" => RequestMode::Navigate,
+                _ => RequestMode::Cors,
+            };
+            request.credentials = match credentials {
+                FetchCredentials::Omit => RequestCredentials::Omit,
+                FetchCredentials::SameOrigin => RequestCredentials::SameOrigin,
+                FetchCredentials::Include => RequestCredentials::Include,
+            };
+            request.destination = Some("empty");
+            request
+        }
+        dest => ResourceRequest::browser_load(dest, &fallback, referrer.as_ref().unwrap_or(&fallback)),
+    };
+    request.initiator = initiator.clone();
+    request.referrer = referrer.or(initiator);
+    if let Some(priority) = &meta.priority {
+        request.priority = obscura_net::client::priority_from_str(priority);
+    }
+    request.worker_context = meta.worker;
+    request.max_response_bytes = fetch_max_body_bytes();
+    request
+}
+
 impl FetchCredentials {
     fn parse(value: &str) -> Self {
         match value {
@@ -2917,7 +3062,7 @@ fn sanitize_redirect_headers(
         headers.retain(|name, _| {
             !matches!(
                 name.to_ascii_lowercase().as_str(),
-                "authorization" | "proxy-authorization" | "cookie"
+                "authorization" | "proxy-authorization" | "cookie" | "host"
             )
         });
     }
@@ -3245,6 +3390,195 @@ fn intercept_fulfill_response(
     })
 }
 
+/// Fetches a classic script synchronously, for a worker's `importScripts`.
+///
+/// `importScripts` blocks the worker until each script has loaded and run.
+/// Workers share the page's thread here, so the request runs to completion on
+/// a helper thread with its own event loop while this one waits, through the
+/// page's transport (the stealth client when there is one), cookies, blocked
+/// URL patterns and SSRF policy, following redirects with the same checks as
+/// `op_fetch_url`. Like a script element, the body is not made opaque for a
+/// cross-origin URL. Returns the `op_fetch_url` result shape.
+#[op2]
+#[string]
+fn op_fetch_script_sync(
+    state: &OpState,
+    #[string] url: String,
+    #[string] origin: String,
+    #[string] referrer: String,
+) -> String {
+    let failed = |url: &str, error: String| {
+        serde_json::json!({ "status": 0, "body": "", "url": url, "headers": {}, "blocked": true, "error": error })
+            .to_string()
+    };
+    let gs = state.borrow::<SharedState>().clone();
+    let (cookie_jar, http_client, proxy_url, blocked) = {
+        let mut gs = gs.borrow_mut();
+        let blocked = gs
+            .blocked_urls
+            .iter()
+            .any(|pattern| pattern == "*" || url.contains(pattern.as_str()) || glob_match(pattern, &url));
+        if !blocked {
+            push_capped(&mut gs.fetched_urls, url.clone(), MAX_FETCHED_URLS);
+        }
+        let proxy_url = gs
+            .http_client
+            .as_ref()
+            .and_then(|c| c.proxy_url().map(|s| s.to_string()));
+        (gs.cookie_jar.clone(), gs.http_client.clone(), proxy_url, blocked)
+    };
+    if blocked {
+        return failed(&url, "blocked".to_string());
+    }
+    #[cfg(feature = "stealth")]
+    let stealth = gs.borrow().stealth_client.clone();
+    let allow_private_network = http_client
+        .as_ref()
+        .is_some_and(|client| client.allow_private_network);
+    match url::Url::parse(&url) {
+        Ok(parsed) => {
+            if let Err(error) = validate_fetch_url(&parsed, allow_private_network) {
+                return failed(&url, error);
+            }
+        }
+        Err(error) => return failed(&url, error.to_string()),
+    }
+    let page_origin = if origin.is_empty() { request_origin(&url).unwrap_or_default() } else { origin };
+    let request_url = url.clone();
+    let top_frame = gs.borrow().top_frame_url.as_deref().and_then(|url| url::Url::parse(url).ok());
+    let worker = std::thread::Builder::new()
+        .name("obscura-import-scripts".to_string())
+        .spawn(move || -> Result<String, String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async move {
+                // importScripts: a classic script fetched from the worker
+                // (Sec-Fetch-Dest: script, no-cors, Priority u=0, i, the worker
+                // script as referrer, no client hints), through the context's
+                // HTTP cache like any other script.
+                let meta = FetchMeta {
+                    dest: "script".to_string(),
+                    priority: Some("u=0, i".to_string()),
+                    referrer: referrer.clone(),
+                    worker: true,
+                    internal: true,
+                };
+                let mut request = scripted_request(&meta, &page_origin, "no-cors", FetchCredentials::Include);
+                request.top_frame = top_frame;
+                let parsed_url = url::Url::parse(&request_url).map_err(|e| e.to_string())?;
+                #[cfg(feature = "stealth")]
+                let cached = match stealth {
+                    Some(stealth) => Some(stealth.detached().await.fetch_resource_with_callbacks(&parsed_url, request, None).await),
+                    None => None,
+                };
+                #[cfg(not(feature = "stealth"))]
+                let cached: Option<Result<Response, obscura_net::ObscuraNetError>> = {
+                    let _ = (&request, &parsed_url);
+                    None
+                };
+                if let Some(result) = cached {
+                    let response = result.map_err(|e| e.to_string())?;
+                    return Ok(serde_json::json!({
+                        "status": response.status,
+                        "body": String::from_utf8_lossy(&response.body),
+                        "url": response.url.to_string(),
+                        "headers": {},
+                    })
+                    .to_string());
+                }
+                let client = match &http_client {
+                    Some(client) => client.request_client().await,
+                    None => cached_request_client(proxy_url.as_deref())?,
+                };
+                let headers = match &http_client {
+                    Some(client) => client.request_headers().await,
+                    None => HashMap::new(),
+                };
+                let cookie_initiator = url::Url::parse(&page_origin).ok();
+                let mut current = request_url;
+                let mut redirects = 0usize;
+                loop {
+                    let parsed = url::Url::parse(&current).map_err(|e| e.to_string())?;
+                    let mut request = client.get(&current).timeout(fetch_timeout());
+                    for (name, value) in &headers {
+                        request = request.header(name.as_str(), value.as_str());
+                    }
+                    let site = cookie_initiator
+                        .as_ref()
+                        .map(|initiator| obscura_net::client::fetch_site_between(initiator, &parsed))
+                        .unwrap_or("cross-site");
+                    request = request
+                        .header("accept", "*/*")
+                        .header("sec-fetch-site", site)
+                        .header("sec-fetch-mode", "no-cors")
+                        .header("sec-fetch-dest", "script");
+                    if let Some(referer) = url::Url::parse(&referrer).ok().and_then(|source| {
+                        let mut probe = ResourceRequest::subresource(ResourceType::Script, &source);
+                        probe.referrer = Some(source);
+                        obscura_net::client::request_referrer(&probe, &parsed)
+                    }) {
+                        request = request.header("referer", referer);
+                    }
+                    let credentials = FetchCredentials::SameOrigin.allows(&page_origin, &current);
+                    if credentials {
+                        if let Some(jar) = &cookie_jar {
+                            let context = if cookie_initiator.as_ref().is_some_and(|source| same_site(source, &parsed)) {
+                                SameSiteContext::SameSite
+                            } else {
+                                SameSiteContext::CrossSite
+                            };
+                            let cookie = jar.get_cookie_header_in_context(&parsed, context);
+                            if !cookie.is_empty() {
+                                request = request.header("Cookie", cookie);
+                            }
+                        }
+                    }
+                    let response = request.send().await.map_err(|e| e.to_string())?;
+                    if credentials {
+                        if let Some(jar) = &cookie_jar {
+                            for value in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                                if let Ok(value) = value.to_str() {
+                                    jar.set_cookie(value, &parsed);
+                                }
+                            }
+                        }
+                    }
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|location| parsed.join(location).ok());
+                    if let (true, Some(next)) = (response.status().is_redirection(), location) {
+                        validate_fetch_url(&next, allow_private_network)?;
+                        redirects += 1;
+                        if redirects > FETCH_REDIRECT_LIMIT {
+                            return Err(format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT));
+                        }
+                        current = next.to_string();
+                        continue;
+                    }
+                    let status = response.status().as_u16();
+                    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+                    return Ok(serde_json::json!({
+                        "status": status,
+                        "body": String::from_utf8_lossy(&bytes),
+                        "url": current,
+                        "headers": {},
+                    })
+                    .to_string());
+                }
+            })
+        });
+    match worker.map_err(|e| e.to_string()).and_then(|handle| {
+        handle.join().unwrap_or_else(|_| Err("importScripts fetch thread panicked".to_string()))
+    }) {
+        Ok(result) => result,
+        Err(error) => failed(&url, error),
+    }
+}
+
 #[op2]
 #[string]
 async fn op_fetch_url(
@@ -3256,9 +3590,13 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
-    internal_load: bool,
+    #[string] meta: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let body = body.to_vec();
+    let meta = FetchMeta::parse(&meta);
+    // A browser-owned load (script, stylesheet, iframe, worker script): its
+    // response is never opaque to the runtime.
+    let internal_load = meta.internal;
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -3271,6 +3609,7 @@ async fn op_fetch_url(
         let mut gs = gs.borrow_mut();
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
+                tracing::debug!("blocked by URL pattern {}: {}", pattern, url);
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
@@ -3305,7 +3644,9 @@ async fn op_fetch_url(
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
-            gs.intercept_tx.clone()
+            gs.intercept_tx
+                .clone()
+                .map(|tx| (tx, gs.cdp_intercept_channel))
         } else {
             None
         };
@@ -3355,9 +3696,10 @@ async fn op_fetch_url(
     let mut override_method: Option<String> = None;
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
+    // Only a CDP-owned pause announced the request start to a CDP session.
+    let mut continued_by_cdp = false;
 
-    let mut was_intercepted = false;
-    if let Some(tx) = intercept_tx {
+    if let Some((tx, cdp_channel)) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
@@ -3371,7 +3713,6 @@ async fn op_fetch_url(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            was_intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
                     status,
@@ -3383,8 +3724,9 @@ async fn op_fetch_url(
                     // responses, including exact binary bodies and bounded retention.
                     let encoded = !bb.is_empty();
                     let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
+                    // Only a CDP-owned pause announced this request to a CDP session.
                     record_js_network_completion(&state, JsNetworkEvent {
-                        request_id: request_id.clone(), intercepted: true,
+                        request_id: request_id.clone(), intercepted: cdp_channel,
                         url: url.clone(), method: method.clone(), status,
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -3421,6 +3763,7 @@ async fn op_fetch_url(
                     headers,
                     body,
                 }) => {
+                    continued_by_cdp = cdp_channel;
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
@@ -3496,6 +3839,95 @@ async fn op_fetch_url(
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
 
+    // Resolve browser/CDP settings once. Only script-provided headers below
+    // participate in the CORS unsafe-header calculation.
+    #[cfg(feature = "stealth")]
+    let stealth = {
+        let st = state.borrow();
+        let gs = st.borrow::<SharedState>().clone();
+        let client = gs.borrow().stealth_client.clone();
+        client
+    };
+    let mut effective_headers = match &http_client {
+        Some(client) => client.request_headers().await,
+        None => HashMap::from([("user-agent".to_string(),
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".to_string())]),
+    };
+    #[cfg(feature = "stealth")]
+    if let Some(client) = &stealth {
+        effective_headers = client.request_headers().await;
+    }
+    obscura_net::client::merge_request_headers(&mut effective_headers, &custom_headers);
+    effective_headers.remove("origin");
+    let browser_request = scripted_request(&meta, &page_origin, &mode, credentials);
+
+    // Browser-owned script, stylesheet and worker-script loads go through the
+    // context's HTTP cache like every other subresource, as in Chrome: a
+    // worker script or importScripts dependency the cache holds is not
+    // downloaded again.
+    if internal_load && method == "GET" && custom_headers.is_empty() && meta.cacheable_load() {
+        if let Ok(parsed_url) = url::Url::parse(&url) {
+            let mut request = browser_request.clone();
+            request.top_frame = {
+                let st = state.borrow();
+                let gs = st.borrow::<SharedState>().clone();
+                let top = gs.borrow().top_frame_url.clone();
+                top.and_then(|url| url::Url::parse(&url).ok())
+            };
+            #[cfg(feature = "stealth")]
+            let result = match (&stealth, &http_client) {
+                (Some(stealth), _) => Some(stealth.fetch_resource_with_callbacks(&parsed_url, request, callbacks.as_deref()).await),
+                (None, Some(client)) => Some(client.fetch_resource_with_callbacks(&parsed_url, request, callbacks.as_deref()).await),
+                (None, None) => None,
+            };
+            #[cfg(not(feature = "stealth"))]
+            let result = match &http_client {
+                Some(client) => Some(client.fetch_resource_with_callbacks(&parsed_url, request, callbacks.as_deref()).await),
+                None => None,
+            };
+            if let Some(result) = result {
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::debug!("browser-owned {} load failed: {}: {}", meta.dest, url, error);
+                        return Ok(serde_json::json!({
+                            "status": 0, "body": "", "url": url, "headers": {},
+                            "blocked": true, "error": error.to_string(),
+                        })
+                        .to_string());
+                    }
+                };
+                if response.status == 0 {
+                    tracing::debug!("browser-owned {} load blocked: {}", meta.dest, url);
+                }
+                let final_url = response.url.to_string();
+                let final_is_cross_origin = request_origin(&final_url)
+                    .map(|request_origin| request_origin != page_origin)
+                    .unwrap_or(false);
+                let text = String::from_utf8_lossy(&response.body).to_string();
+                let completion = script_network_completion(
+                    request_id.clone(), continued_by_cdp, final_url.clone(), "GET".to_string(),
+                    response.status, response.headers.clone(), &response.body, &text,
+                );
+                {
+                    let state_borrow = state.borrow();
+                    let shared = state_borrow.borrow::<SharedState>().clone();
+                    retain_script_network_completion(&mut shared.borrow_mut(), completion);
+                }
+                return Ok(serde_json::json!({
+                    "status": response.status,
+                    "body": text,
+                    "bodyBase64": BASE64.encode(&response.body),
+                    "url": final_url,
+                    "redirected": !response.redirected_from.is_empty(),
+                    "opaque": false,
+                    "headers": visible_response_headers(&response.headers, final_is_cross_origin, credentials),
+                })
+                .to_string());
+            }
+        }
+    }
+
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
     // circuit earlier). on_request/on_response previously fired only for
@@ -3506,7 +3938,7 @@ async fn op_fetch_url(
                 let info = RequestInfo {
                     url: parsed,
                     method: method.clone(),
-                    headers: custom_headers.clone(),
+                    headers: effective_headers.clone(),
                     resource_type: ResourceType::Fetch,
                 };
                 cbs.fire_request(&info).await;
@@ -3524,20 +3956,63 @@ async fn op_fetch_url(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        let mut preflight_request = client
-            .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str());
-        if !unsafe_header_names.is_empty() {
-            preflight_request = preflight_request.header(
-                "Access-Control-Request-Headers",
-                unsafe_header_names.join(","),
-            );
+        let request_headers_value = (!unsafe_header_names.is_empty()).then(|| unsafe_header_names.join(","));
+        #[cfg(feature = "stealth")]
+        let stealth_preflight = match (&stealth, url::Url::parse(&url)) {
+            (Some(stealth), Ok(parsed_url)) => {
+                // The preflight leaves over the same Chrome transport as the
+                // request it guards, with Chrome's preflight header set.
+                let site = browser_request
+                    .initiator
+                    .as_ref()
+                    .map(|initiator| obscura_net::client::fetch_site_between(initiator, &parsed_url))
+                    .unwrap_or("cross-site");
+                let response = stealth
+                    .send_browser_hop(
+                        "OPTIONS", &parsed_url, &browser_request, site, Some(page_origin.as_str()),
+                        &effective_headers, &[], None, false,
+                        Some((method.as_str(), request_headers_value.as_deref())),
+                    )
+                    .await
+                    .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+                let mut headers = reqwest::header::HeaderMap::new();
+                for (name, value) in &response.headers {
+                    if let (Ok(name), Ok(value)) = (
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(value),
+                    ) {
+                        headers.append(name, value);
+                    }
+                }
+                Some((reqwest::StatusCode::from_u16(response.status).unwrap_or(reqwest::StatusCode::BAD_GATEWAY), headers))
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "stealth"))]
+        let stealth_preflight: Option<(reqwest::StatusCode, reqwest::header::HeaderMap)> = None;
+        let (preflight_status, preflight_headers) = match stealth_preflight {
+            Some(result) => result,
+            None => {
+                let mut preflight_request = client
+                    .request(reqwest::Method::OPTIONS, &url)
+                    .timeout(fetch_timeout())
+                    .header("Origin", &page_origin)
+                    .header("Access-Control-Request-Method", method.as_str());
+                if let Some(value) = &request_headers_value {
+                    preflight_request = preflight_request.header("Access-Control-Request-Headers", value.as_str());
+                }
+                let preflight = preflight_request.send().await.map_err(|e| {
+                        deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
+                    })?;
+                (preflight.status(), preflight.headers().clone())
+            }
+        };
+        struct Preflight { status: reqwest::StatusCode, headers: reqwest::header::HeaderMap }
+        impl Preflight {
+            fn status(&self) -> reqwest::StatusCode { self.status }
+            fn headers(&self) -> &reqwest::header::HeaderMap { &self.headers }
         }
-        let preflight = preflight_request.send().await.map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
+        let preflight = Preflight { status: preflight_status, headers: preflight_headers };
 
         // Fetch spec: the preflight response's status must be an ok status
         // before its CORS headers are consulted (#973).
@@ -3598,25 +4073,24 @@ async fn op_fetch_url(
         }
     }
 
+    // The identity allocated before interception names the completion and
+    // the retained body, so a continued request keeps its announced id.
+    let response_request_id = request_id.clone();
+
     // Stealth mode: route scripted requests through wreq after the CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
     {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
                 state.clone(),
                 _page_in_flight,
                 stealth,
+                browser_request.clone(),
                 url.clone(),
                 req_method.as_str().to_string(),
-                custom_headers.clone(),
+                effective_headers.clone(),
                 body.clone(),
                 page_origin.clone(),
                 mode.clone(),
@@ -3624,6 +4098,8 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                response_request_id,
+                continued_by_cdp,
             )
             .await;
         }
@@ -3638,11 +4114,12 @@ async fn op_fetch_url(
     let mut current_body = body;
     // A mutable copy applied per hop: credential headers are dropped when a
     // redirect crosses origin, and body headers when the method downgrades.
-    let mut current_headers = custom_headers.clone();
+    let mut current_headers = effective_headers;
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
+    let mut chain_site: &'static str = "none";
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -3676,21 +4153,41 @@ async fn op_fetch_url(
             }
         }
 
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
-        if !current_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("user-agent"))
-        {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
-        }
-
         for (k, v) in &current_headers {
             req = req.header(k.as_str(), v.as_str());
+        }
+        // Fetch metadata, Accept, Referer and client hints for this request
+        // type, as Chrome sends them (the stealth transport also orders them).
+        if let Ok(parsed_hop) = url::Url::parse(&current_url) {
+            let hop_site = browser_request
+                .initiator
+                .as_ref()
+                .map(|initiator| obscura_net::client::fetch_site_between(initiator, &parsed_hop))
+                .unwrap_or("cross-site");
+            chain_site = if redirects_followed == 0 {
+                hop_site
+            } else {
+                obscura_net::client::combine_fetch_site(chain_site, hop_site)
+            };
+            let has = |name: &str| current_headers.keys().any(|key| key.eq_ignore_ascii_case(name));
+            if !browser_request.worker_context && !has("sec-ch-ua") {
+                let ua = current_headers.get("user-agent").cloned().unwrap_or_default();
+                let (sec_ch_ua, platform) = obscura_net::client::chrome_client_hints(&ua);
+                req = req
+                    .header("sec-ch-ua", sec_ch_ua)
+                    .header("sec-ch-ua-mobile", "?0")
+                    .header("sec-ch-ua-platform", platform);
+            }
+            if !has("accept") {
+                req = req.header("accept", browser_request.accept());
+            }
+            req = req
+                .header("sec-fetch-site", chain_site)
+                .header("sec-fetch-mode", browser_request.mode.header_value())
+                .header("sec-fetch-dest", browser_request.destination());
+            if let Some(referer) = obscura_net::client::request_referrer(&browser_request, &parsed_hop) {
+                req = req.header("referer", referer);
+            }
         }
 
         if !current_body.is_empty() {
@@ -3869,7 +4366,7 @@ async fn op_fetch_url(
 
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
-        "requestId": request_id,
+        "requestId": response_request_id,
         "url": current_url,
         "redirected": redirected,
         "opaque": opaque,
@@ -3880,6 +4377,7 @@ async fn op_fetch_url(
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_body = String::from_utf8_lossy(&resp_bytes);
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -3888,19 +4386,19 @@ async fn op_fetch_url(
                 );
                 let info = RequestInfo {
                     url: resp.url.clone(), method: current_method.as_str().to_string(),
-                    headers: resp_headers.clone(), resource_type: ResourceType::Fetch,
+                    headers: current_headers, resource_type: ResourceType::Fetch,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
         }
         if let Some(state) = body_state.upgrade() {
-            record_js_network_completion(&state, JsNetworkEvent {
-                request_id, intercepted: was_intercepted,
-                url: current_url, method: current_method.as_str().to_string(), status,
-                response_headers: resp_headers, body_size: resp_bytes.len(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            let completion = script_network_completion(
+                response_request_id, continued_by_cdp, current_url,
+                current_method.as_str().to_string(), status, resp_headers, &resp_bytes, &resp_body,
+            );
+            let state_borrow = state.borrow();
+            let shared = state_borrow.borrow::<SharedState>().clone();
+            retain_script_network_completion(&mut shared.borrow_mut(), completion);
         }
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
         Ok(resp_bytes)
@@ -3931,13 +4429,14 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar. Owned completion metadata crosses the transport boundary so
+/// the isolate can retain the same bounded CDP body/events as ordinary fetches.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     state: Rc<RefCell<OpState>>,
     page_in_flight: PageInFlightGuard,
     stealth: Arc<StealthHttpClient>,
+    browser_request: ResourceRequest,
     url: String,
     method: String,
     custom_headers: HashMap<String, String>,
@@ -3948,6 +4447,8 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
+    response_request_id: String,
+    intercepted: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -3961,6 +4462,7 @@ async fn stealth_fetch_all(
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
     let cookie_initiator = url::Url::parse(&page_origin).ok();
+    let mut chain_site: &'static str = "none";
 
     let response = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -3969,19 +4471,23 @@ async fn stealth_fetch_all(
                 return Ok(serde_json::json!({
                     "status": 0, "body": "", "url": current_url, "headers": {},
                 })
-                .to_string());
+                .to_string().into());
             }
         };
 
-        let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        if sends_origin_header(&current_method, current_is_cross_origin) {
-            req_headers.insert("origin".to_string(), page_origin.clone());
-        }
-        for (k, v) in &current_headers {
-            req_headers.insert(k.to_lowercase(), v.clone());
-        }
+        let hop_site = browser_request
+            .initiator
+            .as_ref()
+            .map(|initiator| obscura_net::client::fetch_site_between(initiator, &parsed_current))
+            .unwrap_or("cross-site");
+        chain_site = if redirects_followed == 0 {
+            hop_site
+        } else {
+            obscura_net::client::combine_fetch_site(chain_site, hop_site)
+        };
+        let sends_origin = obscura_net::client::chrome_sends_origin(&browser_request, &current_method, &parsed_current);
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let cookie_context = credentials_allowed.then(|| {
@@ -3995,14 +4501,17 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_headers_with_context(
+            .send_browser_hop_headers(
                 &current_method,
                 &parsed_current,
-                &req_headers,
+                &browser_request,
+                chain_site,
+                sends_origin.then_some(page_origin.as_str()),
+                &current_headers,
                 &current_body,
                 cookie_context,
                 credentials_allowed,
-                fetch_max_body_bytes().min(64 * 1024 * 1024),
+                None,
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
@@ -4032,7 +4541,7 @@ async fn stealth_fetch_all(
                         current_url, allowed
                     ),
                 })
-                .to_string());
+                .to_string().into());
             }
         }
         let Some(location) = r.headers.get("location").cloned() else {
@@ -4050,7 +4559,7 @@ async fn stealth_fetch_all(
                 "blocked": true,
                 "error": format!("Redirect to forbidden URL blocked: {}", reason),
             })
-            .to_string());
+            .to_string().into());
         }
         redirects_followed += 1;
         if redirects_followed > FETCH_REDIRECT_LIMIT {
@@ -4059,7 +4568,7 @@ async fn stealth_fetch_all(
                 "blocked": true,
                 "error": format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT),
             })
-            .to_string());
+            .to_string().into());
         }
         // Browser semantics: 301/302/303 downgrade to GET with no body.
         let downgraded_to_get = r.status == 301 || r.status == 302 || r.status == 303;
@@ -4104,7 +4613,7 @@ async fn stealth_fetch_all(
                     )
                 },
             })
-            .to_string());
+            .to_string().into());
         }
     }
 
@@ -4115,6 +4624,8 @@ async fn stealth_fetch_all(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
+    // The request identity stays in the retained completion for CDP. Unlike
+    // the inherited ordinary path, stealth responses expose no engine property.
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
         "url": current_url,
@@ -4122,10 +4633,13 @@ async fn stealth_fetch_all(
         "opaque": opaque,
         "headers": script_headers,
     });
+    // A resource must not form an ownership cycle with its OpState table.
+    let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
         let _page_in_flight = page_in_flight;
         let resp_bytes = response.body.await
             .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        let resp_body = String::from_utf8_lossy(&resp_bytes);
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -4133,11 +4647,20 @@ async fn stealth_fetch_all(
                     resp_bytes.clone(), redirected_from,
                 );
                 let info = RequestInfo {
-                    url: resp.url.clone(), method: current_method,
-                    headers: resp_headers, resource_type: ResourceType::Fetch,
+                    url: resp.url.clone(), method: current_method.clone(),
+                    headers: current_headers, resource_type: ResourceType::Fetch,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
+        }
+        if let Some(state) = body_state.upgrade() {
+            let completion = script_network_completion(
+                response_request_id, intercepted, current_url, current_method,
+                status, resp_headers, &resp_bytes, &resp_body,
+            );
+            let state_borrow = state.borrow();
+            let shared = state_borrow.borrow::<SharedState>().clone();
+            retain_script_network_completion(&mut shared.borrow_mut(), completion);
         }
         Ok(resp_bytes)
     });
@@ -4173,6 +4696,94 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn script_response_retention_preserves_configured_body_and_event_bounds() {
+        struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Environment {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    unsafe { if let Some(value) = value { std::env::set_var(name, value); }
+                        else { std::env::remove_var(name); } }
+                }
+            }
+        }
+        let _restore = Environment(["OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "OBSCURA_NETWORK_BODY_BUFFER_BYTES"]
+            .into_iter().map(|name| (name, std::env::var_os(name))).collect());
+        // nextest runs this configuration test in its own process.
+        unsafe {
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "6");
+        }
+        // Completion telemetry is owned data, independent of the transport.
+        { fn requires_send<T: Send>() {} requires_send::<super::ScriptNetworkCompletion>(); }
+        // Eligibility uses raw bytes, as before; lossy UTF-8 can expand storage.
+        let raw = [0xff_u8; 6];
+        let lossy = String::from_utf8_lossy(&raw);
+        let expanded = super::script_network_completion(
+            "lossy".into(), false, "https://fixture.test/body".into(), "GET".into(),
+            200, Default::default(), &raw, &lossy,
+        );
+        assert_eq!(expanded.event.body_size, 6);
+        assert_eq!(expanded.body.unwrap().body.len(), 18);
+        let mut state = super::ObscuraState::new();
+        let completion = |id: &str, body: &str| super::script_network_completion(
+            id.into(), true, "https://fixture.test/body".into(), "GET".into(), 200,
+            std::collections::HashMap::from([("cache-control".into(), "public, max-age=900".into())]),
+            body.as_bytes(), body,
+        );
+        for (id, body) in [("first", "one"), ("second", "雪雪"), ("third", "three"), ("large", "1234567")] {
+            super::retain_script_network_completion(&mut state, completion(id, body));
+        }
+        assert_eq!(state.network_response_bodies.len(), 2);
+        assert!(!state.network_response_bodies.contains_key("first"));
+        assert!(!state.network_response_bodies.contains_key("large"));
+        assert_eq!(state.network_response_bodies["second"].body, "雪雪");
+        assert_eq!(state.js_network_events[1].body_size, 6);
+        assert_eq!(state.js_network_events[3].body_size, 7);
+        assert!(state.js_network_events.iter().all(|event| event.intercepted && event.status == 200));
+        unsafe { std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "0"); }
+        let disabled = completion("disabled", "");
+        assert!(disabled.body.is_none());
+        super::retain_script_network_completion(&mut state, disabled);
+        unsafe {
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
+            std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "0");
+        }
+        assert!(completion("zero-bytes", "").body.is_none());
+        for index in 0..4097 {
+            super::retain_script_network_completion(&mut state, completion(&format!("bounded-{index}"), "x"));
+        }
+        assert_eq!(state.js_network_events.len(), 4096);
+        assert_eq!(state.js_network_events.first().unwrap().request_id, "bounded-1");
+        assert_eq!(state.js_network_events.last().unwrap().request_id, "bounded-4096");
+        assert_eq!(state.network_response_bodies.len(), 2);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn exhausted_canvas_epochs_never_wrap_to_an_old_owner() {
+        let next = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
+        assert_eq!(super::allocate_canvas_epoch(&next),u32::MAX - 1);
+        assert_eq!(super::allocate_canvas_epoch(&next),0);
+        assert_eq!(super::allocate_canvas_epoch(&next),0);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn canvas_epochs_distinguish_reused_frames_and_reject_retired_documents() {
+        let mut first = super::ObscuraState::new();
+        let mut second = super::ObscuraState::new();
+        first.frame_id = 7;
+        second.frame_id = 7;
+        assert_eq!(first.document_generation, second.document_generation);
+        assert_ne!(first.canvas_epoch, second.canvas_epoch);
+        assert!(super::canvas_owner_matches(&first, 7, first.canvas_epoch));
+        assert!(!super::canvas_owner_matches(&second, 7, first.canvas_epoch));
+        assert!(!super::canvas_owner_matches(&first, 0, first.canvas_epoch));
+        first.canvas_epoch = 0;
+        assert!(!super::canvas_owner_matches(&first, 7, 0));
+    }
+
     use super::{
         FetchCredentials, ObscuraState, cors_response_allows, cors_unsafe_request_header_names,
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
@@ -5593,6 +6204,8 @@ fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
     parent_frame_id: u32,
+    viewport_width: u32,
+    viewport_height: u32,
     initialize: v8::Local<v8::Function>,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5621,9 +6234,20 @@ fn op_initial_frame(
             }
         }
         context.set_security_token(parent_context.get_security_token(scope));
+        // Like a fetched frame realm, move the host-state handoff behind the
+        // private key before any script of the frame can read the global.
+        {
+            let scope = &mut v8::ContextScope::new(scope, context);
+            if !crate::host_state::seal(scope) {
+                return 0;
+            }
+        }
+        // The frame's viewport is the iframe's content box, as for a fetched frame.
+        let viewport_width = if viewport_width == 0 { 300 } else { viewport_width };
+        let viewport_height = if viewport_height == 0 { 150 } else { viewport_height };
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
-        child.set_viewport(300.0, 150.0);
+        child.set_viewport(viewport_width as f64, viewport_height as f64);
         {
             let parent = parent_state.borrow();
             child.dom = Some(obscura_dom::parse_html(
@@ -5638,6 +6262,12 @@ fn op_initial_frame(
         }
         let handle = v8::Global::new(scope, context);
         registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
+        // Like a fetched frame realm, the frame presents its page's identity:
+        // the shared native-function registries and the page's (possibly
+        // emulated) screen, window and devicePixelRatio. Copied before init
+        // reads them, applied after init resets devicePixelRatio.
+        crate::runtime::copy_identity_globals_between(scope, parent_context, context);
+        crate::runtime::copy_page_screen_between(scope, parent_context, context);
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         let receiver = v8::undefined(scope);
@@ -5645,6 +6275,7 @@ fn op_initial_frame(
             registry.borrow_mut().forget(&handle);
             return 0;
         }
+        crate::runtime::apply_page_screen_in_context(scope, context);
         let mut page = page.borrow_mut();
         page.pending_frame_bytes = page.pending_frame_bytes.saturating_add("about:blank".len());
         page.pending_frames.push(PendingFrame {
@@ -5652,8 +6283,8 @@ fn op_initial_frame(
             parent_frame_id,
             url: "about:blank".to_string(),
             html: String::new(),
-            viewport_width: 300,
-            viewport_height: 150,
+            viewport_width: viewport_width.into(),
+            viewport_height: viewport_height.into(),
         });
         frame_id
     })).unwrap_or(0)
@@ -5697,8 +6328,15 @@ fn op_posted_task(
             }
             PostedTaskOwnerStatus::Generation(generation) => generation as f64,
         };
-        v8::tc_scope!(let scope, scope);
         let callback = v8::Local::new(scope, callback);
+        // Run the task in its owner's realm, as a browser task runs in the
+        // realm that queued it. The sender of a postMessage is the entered
+        // realm (`realm_state`), so a frame's task must not enter the page's.
+        let Some(context) = callback.get_creation_context(scope) else {
+            return;
+        };
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(let scope, scope);
         let receiver = v8::undefined(scope).into();
         let current_generation = v8::Number::new(scope, current_generation);
         if callback
@@ -6442,6 +7080,44 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
     true
 }
 
+// Frame IDs and per-state document generations may recur after frame teardown.
+// Canvas epochs are process-unique and never wrap to a previously issued owner.
+#[cfg(feature = "render")]
+pub(crate) fn next_canvas_epoch() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    allocate_canvas_epoch(&NEXT)
+}
+
+#[cfg(feature = "render")]
+fn allocate_canvas_epoch(next: &std::sync::atomic::AtomicU32) -> u32 {
+    next.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed,
+        |value| value.checked_add(1)).unwrap_or(0)
+}
+
+/// The stealth fingerprint seed of the browser profile that owns this runtime.
+/// Every document, frame realm and worker of the profile reads the same value
+/// (see `crate::fingerprint`).
+#[op2(fast)]
+fn op_fingerprint_seed(state: &OpState) -> u32 {
+    state
+        .try_borrow::<crate::fingerprint::FingerprintSeed>()
+        .map(|seed| seed.0)
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn canvas_owner_matches(state: &ObscuraState, frame: u32, epoch: u32) -> bool {
+    epoch != 0 && state.frame_id == frame && state.canvas_epoch == epoch
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_canvas_document_epoch(state: &OpState, frame: u32) -> u32 {
+    let owner = frame_state(state, frame);
+    let Ok(owner) = owner.try_borrow() else { return 0 };
+    if owner.frame_id == frame { owner.canvas_epoch } else { 0 }
+}
+
 /// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
 /// canvas resize supplies a new fixed backing store and atomically replaces
 /// the previous surface for the same DOM node.
@@ -6449,6 +7125,8 @@ fn op_set_dynamic_fonts(state: &OpState, #[string] registrations: &str) -> bool 
 #[op2]
 fn op_canvas_register_surface(
     state: &OpState,
+    frame: u32,
+    epoch: u32,
     nid: u32,
     width: u32,
     height: u32,
@@ -6471,8 +7149,9 @@ fn op_canvas_register_surface(
         return false;
     }
 
-    let shared = state.borrow::<SharedState>().clone();
-    let mut state = shared.borrow_mut();
+    let shared = frame_state(state, frame);
+    let Ok(mut state) = shared.try_borrow_mut() else { return false };
+    if !canvas_owner_matches(&state, frame, epoch) { return false; }
     let node = NodeId::new(nid);
     let is_canvas = state
         .dom
@@ -6485,6 +7164,8 @@ fn op_canvas_register_surface(
     if !is_canvas {
         return false;
     }
+    #[cfg(feature = "webgl")]
+    if state.webgl.placeholders.owns_node(node) { return false; }
     let replacing = state
         .canvas_surfaces
         .get(&node)
@@ -6516,9 +7197,10 @@ fn op_canvas_register_surface(
 /// screencast/readiness without throwing away otherwise-valid layout.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
-    let mut state = shared.borrow_mut();
+fn op_canvas_paint_damage(state: &OpState, frame: u32, epoch: u32, nid: u32) -> bool {
+    let shared = frame_state(state, frame);
+    let Ok(mut state) = shared.try_borrow_mut() else { return false };
+    if !canvas_owner_matches(&state, frame, epoch) { return false; }
     let node = NodeId::new(nid);
     if !state.canvas_surfaces.contains_key(&node) {
         return false;
@@ -6551,6 +7233,7 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_fetch_url(),
         op_fetch_body(),
+        op_fetch_script_sync(),
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
@@ -6583,12 +7266,14 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
         op_begin_render_task(),
+        op_fingerprint_seed(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     {
         ops.push(op_set_dynamic_fonts());
+        ops.push(op_canvas_document_epoch());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
@@ -6609,6 +7294,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    #[cfg(feature = "webgl")]
+    ops.extend(crate::webgl_ops::declarations());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
@@ -7355,6 +8042,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.top_frame = gs.top_frame_url.as_deref().and_then(|url| url::Url::parse(url).ok());
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;
@@ -7464,6 +8152,13 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .ok()
         }
     };
+    #[cfg(feature = "webgl")]
+    let origin_clean = response.as_ref().is_some_and(|response| {
+        let gs = shared.borrow();
+        url::Url::parse(&gs.url).ok().zip(parsed_url.as_ref()).is_some_and(|(owner, requested)| {
+            crate::image_security::response_origin_clean(&owner, requested, request_profile, response)
+        })
+    });
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -7475,6 +8170,11 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
+                        #[cfg(feature = "webgl")]
+                        gs.render_resources.seed_image_shared_with_origin(
+                            selected_url.clone(), request_profile, Arc::from(bytes), origin_clean,
+                        );
+                        #[cfg(not(feature = "webgl"))]
                         gs.render_resources.seed_image(
                             selected_url.clone(),
                             request_profile,

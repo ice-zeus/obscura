@@ -31,34 +31,43 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            if let Some(session) = session_id.as_ref().filter(|sid| ctx.sessions.contains_key(*sid)) {
+                ctx.network_enabled_sessions.insert(session.clone());
+            }
+            Ok(json!({}))
+        }
         "disable" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.clear_response_bodies();
-            } else {
-                for page in &mut ctx.pages {
-                    page.clear_response_bodies();
+            if let Some(session) = session_id {
+                ctx.network_enabled_sessions.remove(session);
+                if let Some(page_id) = ctx.sessions.get(session).cloned() {
+                    if ctx.network_sessions_for_page(&page_id).is_empty() {
+                        if let Some(page) = ctx.get_page_mut(&page_id) { page.clear_response_bodies(); }
+                    }
                 }
+            } else {
+                // Preserve the browser-level response-body cache clearing API.
+                for page in &mut ctx.pages { page.clear_response_bodies(); }
             }
             Ok(json!({}))
         }
         "setExtraHTTPHeaders" => {
             let headers = params.get("headers").and_then(|v| v.as_object());
-            if let Some(page) = ctx.get_session_page(session_id) {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
                 if let Some(headers) = headers {
                     let header_map: std::collections::HashMap<String, String> = headers
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map).await;
+                    page.set_http_extra_headers(header_map).await;
                 }
             }
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
             let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page(session_id) {
-                page.http_client.set_user_agent(ua).await;
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_http_user_agent_override(ua).await;
             }
             Ok(json!({}))
         }

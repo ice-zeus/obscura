@@ -6,6 +6,16 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+#[cfg(all(test, feature = "webgl"))]
+#[path = "webgl_tests.rs"]
+mod webgl_tests;
+#[cfg(all(test, feature = "webgl"))]
+#[path = "stealth_variance_tests.rs"]
+mod stealth_variance_tests;
+#[cfg(all(test, feature = "webgl"))]
+#[path = "webgl_lazy_init_tests.rs"]
+mod webgl_lazy_init_tests;
+
 use deno_core::{JsRuntime, RuntimeOptions, v8};
 use obscura_dom::{DomTree, NodeId};
 #[cfg(feature = "render")]
@@ -29,12 +39,20 @@ use crate::ops::{
 };
 
 #[cfg(feature = "render")]
-struct RuntimeCanvasSurfaceSource<'a>(&'a HashMap<NodeId, crate::ops::CanvasBackingSurface>);
+struct RuntimeCanvasSurfaceSource<'a> {
+    canvas: &'a HashMap<NodeId, crate::ops::CanvasBackingSurface>,
+    #[cfg(feature = "webgl")]
+    webgl: &'a HashMap<NodeId, (u32, u32, Vec<u8>)>,
+}
 
 #[cfg(feature = "render")]
 impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
     fn surface(&self, node: NodeId) -> Option<obscura_render::CanvasSurface<'_>> {
-        let surface = self.0.get(&node)?;
+        #[cfg(feature = "webgl")]
+        if let Some((width, height, pixels)) = self.webgl.get(&node) {
+            return obscura_render::CanvasSurface::from_rgba8(*width, *height, pixels);
+        }
+        let surface = self.canvas.get(&node)?;
         obscura_render::CanvasSurface::from_rgba8(
             surface.width,
             surface.height,
@@ -44,6 +62,190 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
 }
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
+
+/// Host-state slots holding the page's screen metrics: the CDP screen override,
+/// the emulated window size and the device pixel ratio. Chrome applies device
+/// metrics to the whole page, so every frame realm carries the top document's
+/// values for these.
+const PAGE_SCREEN_SLOTS: [&str; 6] = [
+    "screenWidth",
+    "screenHeight",
+    "screenEmulated",
+    "devicePixelRatio",
+    "windowWidth",
+    "windowHeight",
+];
+
+/// The current realm's list of native-function registries (see
+/// `_hostState.nativeRegistries` in bootstrap.js).
+fn native_registries<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Array>> {
+    let state = crate::host_state::get(scope)?.to_object(scope)?;
+    let key = v8::String::new(scope, "nativeRegistries")?;
+    state.get(scope, key.into())?.try_cast::<v8::Array>().ok()
+}
+
+/// The browser-identity globals a frame realm takes from its page.
+const IDENTITY_GLOBALS: [&str; 7] = [
+    "__obscura_ua",
+    "__obscura_platform",
+    "__obscura_ua_platform",
+    "__obscura_ua_platform_version",
+    "__obscura_stealth",
+    "__obscura_geo_lat",
+    "__obscura_geo_lon",
+];
+
+/// Copies the identity globals of realm `from` into realm `to`, and adds
+/// `to`'s native-function registry to the page's shared registry list, so
+/// every realm's `Function.prototype.toString` recognizes every realm's
+/// members. Runs before `to`'s init.
+pub(crate) fn copy_identity_globals_between<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    from: v8::Local<'s, v8::Context>,
+    to: v8::Local<'s, v8::Context>,
+) {
+    let mut carried = Vec::new();
+    let registries;
+    {
+        let scope = &mut v8::ContextScope::new(scope, from);
+        registries = native_registries(scope).map(|list| v8::Global::new(scope, list));
+        let global = from.global(scope);
+        for name in IDENTITY_GLOBALS {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            match global.get(scope, key.into()) {
+                Some(value) if !value.is_undefined() => {
+                    carried.push((name, v8::Global::new(scope, value)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let scope = &mut v8::ContextScope::new(scope, to);
+    let global = to.global(scope);
+    for (name, value) in carried {
+        let Some(key) = v8::String::new(scope, name) else {
+            continue;
+        };
+        let value = v8::Local::new(scope, value);
+        global.set(scope, key.into(), value);
+    }
+    // One list of native-function registries per page: the frame adds its
+    // own registry to the page's list and uses that list, so every realm's
+    // Function.prototype.toString recognizes every realm's members.
+    if let (Some(shared), Some(own)) = (registries, native_registries(scope)) {
+        let shared = v8::Local::new(scope, shared);
+        if let Some(registry) = own.get_index(scope, 0) {
+            shared.set_index(scope, shared.length(), registry);
+        }
+        if let (Some(state), Some(key)) = (
+            crate::host_state::get(scope).and_then(|value| value.to_object(scope)),
+            v8::String::new(scope, "nativeRegistries"),
+        ) {
+            state.set(scope, key.into(), shared.into());
+        }
+    }
+}
+
+/// Copies the page's screen slots from `from`'s host state into `to`'s,
+/// removing any the page does not have.
+pub(crate) fn copy_page_screen_between<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    from: v8::Local<'s, v8::Context>,
+    to: v8::Local<'s, v8::Context>,
+) {
+    let mut carried = Vec::new();
+    {
+        let scope = &mut v8::ContextScope::new(scope, from);
+        let Some(state) = crate::host_state::get(scope).and_then(|value| value.to_object(scope)) else {
+            return;
+        };
+        for name in PAGE_SCREEN_SLOTS {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            let value = state.get(scope, key.into()).filter(|value| !value.is_undefined());
+            carried.push((name, value.map(|value| v8::Global::new(scope, value))));
+        }
+    }
+
+    let scope = &mut v8::ContextScope::new(scope, to);
+    let Some(state) = crate::host_state::get(scope).and_then(|value| value.to_object(scope)) else {
+        return;
+    };
+    for (name, value) in carried {
+        let Some(key) = v8::String::new(scope, name) else {
+            continue;
+        };
+        match value {
+            Some(value) => {
+                let value = v8::Local::new(scope, value);
+                state.set(scope, key.into(), value);
+            }
+            None => {
+                state.delete(scope, key.into());
+            }
+        }
+    }
+}
+
+/// Applies `context`'s screen slots to its live `screen` and
+/// `devicePixelRatio`, exactly as the main realm applies its own.
+pub(crate) fn apply_page_screen_in_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: v8::Local<'s, v8::Context>,
+) {
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(let scope, scope);
+    let Some(state) = crate::host_state::get(scope).and_then(|value| value.to_object(scope)) else {
+        return;
+    };
+    let mut slots = Vec::with_capacity(8);
+    for name in [
+        "screenWidth",
+        "screenHeight",
+        "screenEmulated",
+        "setScreenOverride",
+        "devicePixelRatio",
+        "windowWidth",
+        "windowHeight",
+        "setWindowOverride",
+    ] {
+        slots.push(match v8::String::new(scope, name) {
+            Some(key) => state.get(scope, key.into()),
+            None => None,
+        });
+    }
+    let null: v8::Local<v8::Value> = v8::null(scope).into();
+    let width = slots[0].filter(|value| value.is_number()).unwrap_or(null);
+    let height = slots[1].filter(|value| value.is_number()).unwrap_or(null);
+    let emulated = slots[2].is_some_and(|value| value.boolean_value(scope));
+    let emulated: v8::Local<v8::Value> = v8::Boolean::new(scope, emulated).into();
+    if let Some(apply) = slots[3].and_then(|value| v8::Local::<v8::Function>::try_from(value).ok()) {
+        let receiver: v8::Local<v8::Value> = state.into();
+        if apply.call(scope, receiver, &[width, height, emulated]).is_none() {
+            tracing::debug!("frame screen override failed: {}", exception_text(scope));
+            return;
+        }
+    }
+    let window_width = slots[5].filter(|value| value.is_number()).unwrap_or(null);
+    let window_height = slots[6].filter(|value| value.is_number()).unwrap_or(null);
+    if let Some(apply) = slots[7].and_then(|value| v8::Local::<v8::Function>::try_from(value).ok()) {
+        let receiver: v8::Local<v8::Value> = state.into();
+        if apply.call(scope, receiver, &[window_width, window_height]).is_none() {
+            tracing::debug!("frame window override failed: {}", exception_text(scope));
+            return;
+        }
+    }
+    if let Some(ratio) = slots[4].filter(|value| value.is_number()) {
+        let global = context.global(scope);
+        if let Some(key) = v8::String::new(scope, "devicePixelRatio") {
+            global.set(scope, key.into(), ratio);
+        }
+    }
+}
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
@@ -258,6 +460,9 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Lets a navigation command terminate the document's running autonomous
+    /// task (see [`TurnPreemption`]).
+    turn_preemption: std::sync::Arc<TurnPreemption>,
     /// Signals that V8 approached its configured heap limit. The callback
     /// terminates the current script and temporarily raises the limit just
     /// enough for V8 to unwind instead of aborting the worker process.
@@ -346,6 +551,93 @@ pub struct WatchdogToken {
     armed: Option<crate::cdp_watchdog::Armed>,
 }
 
+/// Lets a protocol client's navigation preempt the document's own background
+/// task.
+///
+/// The CDP connection runs a page's timers, network completions and scripts
+/// while its client is silent (`run_autonomous_event_loop_turn`), on the same
+/// thread that dispatches protocol commands. A command that arrives during a
+/// long task waits for it. For most commands that matches Chrome, which runs
+/// DevTools commands between renderer tasks. A navigation differs: Chrome
+/// starts it in the browser process at once and the old document's task only
+/// overlaps the new document's network fetch. Here the old document's task
+/// would delay the start of the navigation instead, so a navigation that
+/// replaces the document terminates the task it is waiting for. The document
+/// is discarded anyway; nothing else is interrupted.
+///
+/// Only a task running inside an autonomous turn can be preempted: the turn
+/// marks itself running, and on exit (including cancellation) clears V8's
+/// termination flag if a preemption landed, so the flag can never reach the
+/// command that follows.
+pub struct TurnPreemption {
+    handle: IsolateHandle,
+    state: std::sync::Mutex<TurnPreemptionState>,
+}
+
+#[derive(Default)]
+struct TurnPreemptionState {
+    running: bool,
+    requested: bool,
+}
+
+impl TurnPreemption {
+    fn new(handle: IsolateHandle) -> Self {
+        TurnPreemption { handle, state: std::sync::Mutex::new(TurnPreemptionState::default()) }
+    }
+
+    /// Terminate the autonomous task running now, if any. Returns whether a
+    /// running turn was preempted. Thread-safe; called from the connection's
+    /// I/O thread when it receives a navigation for this page.
+    pub fn preempt(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.running || state.requested {
+            return false;
+        }
+        state.requested = true;
+        self.handle.terminate_execution();
+        true
+    }
+
+    fn begin(self: &std::sync::Arc<Self>) -> TurnPreemptionGuard {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.running = true;
+        state.requested = false;
+        TurnPreemptionGuard { preemption: self.clone() }
+    }
+}
+
+/// Ends an autonomous turn's preemption window, also when the turn future is
+/// dropped by the connection's command select.
+struct TurnPreemptionGuard {
+    preemption: std::sync::Arc<TurnPreemption>,
+}
+
+impl TurnPreemptionGuard {
+    /// Close the window; true if a navigation preempted the turn.
+    fn finish(self) -> bool {
+        self.close()
+    }
+
+    fn close(&self) -> bool {
+        let mut state = self.preemption.state.lock().unwrap_or_else(|error| error.into_inner());
+        let requested = state.requested;
+        if state.running {
+            state.running = false;
+            state.requested = false;
+            if requested {
+                self.preemption.handle.cancel_terminate_execution();
+            }
+        }
+        requested
+    }
+}
+
+impl Drop for TurnPreemptionGuard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Arm a V8 termination watchdog directly from an isolate handle, with no
 /// runtime borrow. The CDP dispatcher uses this to bound every command so a
 /// hung page cannot hold this connection's V8 lock forever. Pair with
@@ -413,6 +705,8 @@ struct EnteredRuntime<'a>(&'a mut JsRuntime);
 struct EnteredRuntimeFuture<F> {
     isolate: *mut deno_core::v8::Isolate,
     future: Option<Pin<Box<F>>>,
+    #[cfg(feature = "webgl")]
+    graphics_cleanup: Option<crate::webgl_ops::DeferredCleanup>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -439,11 +733,14 @@ impl<F: Future> Future for EnteredRuntimeFuture<F> {
         // borrowed JsRuntime, which cannot move or drop while this exists.
         let this = unsafe { self.get_unchecked_mut() };
         let _entry = unsafe { IsolateEntry::new(this.isolate) };
-        this.future
+        let result = this.future
             .as_mut()
             .expect("entered runtime future polled after drop")
             .as_mut()
-            .poll(cx)
+            .poll(cx);
+        #[cfg(feature = "webgl")]
+        if let Some(cleanup) = &this.graphics_cleanup { cleanup.drain(); }
+        result
     }
 }
 
@@ -453,6 +750,8 @@ impl<F> Drop for EnteredRuntimeFuture<F> {
         // isolate is current too.
         let _entry = unsafe { IsolateEntry::new(self.isolate) };
         drop(self.future.take());
+        #[cfg(feature = "webgl")]
+        if let Some(cleanup) = &self.graphics_cleanup { cleanup.drain(); }
     }
 }
 
@@ -463,6 +762,8 @@ fn entered_runtime_future<'a, F>(
 where
     F: Future,
 {
+    #[cfg(feature = "webgl")]
+    let graphics_cleanup = crate::webgl_ops::deferred_cleanup(runtime);
     let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
     let entry = unsafe { IsolateEntry::new(isolate) };
     let future = Box::pin(make_future(runtime));
@@ -470,6 +771,8 @@ where
     EnteredRuntimeFuture {
         isolate,
         future: Some(future),
+        #[cfg(feature = "webgl")]
+        graphics_cleanup,
         _not_send: PhantomData,
     }
 }
@@ -490,6 +793,8 @@ impl std::ops::DerefMut for EnteredRuntime<'_> {
 
 impl Drop for EnteredRuntime<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "webgl")]
+        if let Some(cleanup) = crate::webgl_ops::deferred_cleanup(self.0) { cleanup.drain(); }
         // SAFETY: this isolate was entered by the matching `runtime()` call
         // and, entries being a per-thread stack, is the current one: any
         // isolate entered since belongs to a nested operation that has already
@@ -616,7 +921,18 @@ impl ObscuraJsRuntime {
                 // Empty until a frame realm exists, which is what keeps the
                 // lookup free for pages that have no frames.
                 op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+                // A runtime without a browser context is its own profile. A page
+                // replaces this with its context's seed before the first document.
+                op_state.put(crate::fingerprint::FingerprintSeed(
+                    crate::fingerprint::random_seed(),
+                ));
+                #[cfg(feature = "webgl")]
+                op_state.put(crate::webgl_ops::DeferredCleanup::default());
             }
+
+            // V8's own frame serialization instead of deno_core's formatter,
+            // so `error.stack` reads exactly as in Chrome.
+            crate::stack_trace::install(runtime.v8_isolate());
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
             let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
@@ -643,6 +959,7 @@ impl ObscuraJsRuntime {
             object_counter: 0,
             import_map,
             module_load_activity,
+            turn_preemption: std::sync::Arc::new(TurnPreemption::new(isolate_handle.clone())),
             isolate_handle,
             heap_limit_state,
             module_evaluations: HashMap::new(),
@@ -733,6 +1050,9 @@ impl ObscuraJsRuntime {
             return None;
         }
         let ops = v8::Global::new(scope, ops);
+        if !crate::host_state::seal(scope) {
+            return None;
+        }
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
         Some(ops)
@@ -864,6 +1184,9 @@ impl ObscuraJsRuntime {
             }
         }
         // The child realm must not expose the handoff to frame script either.
+        if !crate::host_state::seal(scope) {
+            return false;
+        }
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
         copied > 0
@@ -902,56 +1225,81 @@ impl ObscuraJsRuntime {
     /// fingerprints inside the frame and compares it with the top document.
     /// Copying the values the parent already has makes that true by
     /// construction, instead of relying on a caller to reapply the same
-    /// settings to both.
+    /// settings to both. The page's screen metrics are part of that identity.
     pub(crate) fn copy_identity_to_realm(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
-        use deno_core::v8;
+        self.copy_identity_globals_to_realm(realm);
+        // Before the frame's init reads them, so the frame document starts on
+        // the page's screen instead of the profile's native one.
+        self.copy_page_screen_to_realm(realm);
+    }
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
-            "__obscura_ua",
-            "__obscura_platform",
-            "__obscura_ua_platform",
-            "__obscura_ua_platform_version",
-            "__obscura_stealth",
-            "__obscura_geo_lat",
-            "__obscura_geo_lon",
-        ];
-
+    fn copy_identity_globals_to_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         v8::scope!(let scope, isolate);
+        let from = v8::Local::new(scope, main);
+        let to = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, from);
+        copy_identity_globals_between(scope, from, to);
+    }
 
-        let main_context = v8::Local::new(scope, main);
-        let mut carried = Vec::new();
-        {
-            let scope = &mut v8::ContextScope::new(scope, main_context);
-            let global = main_context.global(scope);
-            for name in IDENTITY_GLOBALS {
-                let Some(key) = v8::String::new(scope, name) else {
-                    continue;
-                };
-                match global.get(scope, key.into()) {
-                    Some(value) if !value.is_undefined() => {
-                        carried.push((name, v8::Global::new(scope, value)));
-                    }
-                    _ => {}
-                }
-            }
-        }
+    /// Copies the page's screen slots from the main realm's host state into
+    /// `realm`'s, removing any the page does not have.
+    fn copy_page_screen_to_realm(&mut self, realm: &deno_core::v8::Global<deno_core::v8::Context>) {
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let from = v8::Local::new(scope, main);
+        let to = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, from);
+        copy_page_screen_between(scope, from, to);
+    }
 
-        let realm_context = v8::Local::new(scope, realm);
-        let scope = &mut v8::ContextScope::new(scope, realm_context);
-        let global = realm_context.global(scope);
-        for (name, value) in carried {
-            let Some(key) = v8::String::new(scope, name) else {
-                continue;
-            };
-            let value = v8::Local::new(scope, value);
-            global.set(scope, key.into(), value);
+    /// Applies `realm`'s screen slots to its live `screen` and
+    /// `devicePixelRatio`, exactly as the main realm applies its own.
+    fn apply_page_screen_in_realm(&mut self, realm: &deno_core::v8::Global<deno_core::v8::Context>) {
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        apply_page_screen_in_context(scope, context);
+    }
+
+    /// Makes every frame realm report the page's current screen metrics.
+    fn sync_page_screen_to_realms(&mut self) {
+        let realms = self.realm_states().borrow().contexts();
+        for realm in &realms {
+            self.copy_page_screen_to_realm(realm);
+            self.apply_page_screen_in_realm(realm);
         }
+    }
+
+    /// Finishes a new frame realm's screen after its init, which resets
+    /// `devicePixelRatio` to the standalone default.
+    pub(crate) fn finish_realm_screen(&mut self, realm: &deno_core::v8::Global<deno_core::v8::Context>) {
+        self.apply_page_screen_in_realm(realm);
+    }
+
+    /// Sets the page's device pixel ratio in the main realm and every frame
+    /// realm. Frame realms created later copy it from the page.
+    pub fn set_device_pixel_ratio(&mut self, ratio: f64) {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return;
+        }
+        let _ = self.execute_host_expression(
+            "<device-metrics>",
+            format!("(__hostState.devicePixelRatio={ratio}, globalThis.devicePixelRatio={ratio})"),
+        );
+        self.sync_page_screen_to_realms();
     }
 
     /// Gives a frame's state the resources the page owns: cookie jar, HTTP
@@ -1102,6 +1450,125 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut state.pending_frame_messages)
     }
 
+    /// Hands each queued cross-realm `postMessage` to the realm it names.
+    ///
+    /// Every realm lives in this isolate, so the runtime can deliver without
+    /// the page. That matters while the runtime waits on a promise for CDP:
+    /// a page that posts into its frame and awaits the reply would otherwise
+    /// wait for a delivery that only the page's frame pump performs, and never
+    /// see the answer. Reports whether anything was taken from the queue.
+    pub fn deliver_pending_frame_messages(&mut self) -> bool {
+        let pending = self.take_pending_frame_messages();
+        if pending.is_empty() {
+            return false;
+        }
+        for message in pending {
+            let context = if message.target_frame_id == 0 {
+                Some(self.runtime().main_context())
+            } else {
+                self.realm_states()
+                    .borrow()
+                    .context(message.target_frame_id)
+            };
+            // The frame was torn down between the send and the delivery.
+            let Some(context) = context else {
+                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                continue;
+            };
+            if let Err(error) = self.deliver_message_in_realm(&context, &message) {
+                tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
+            }
+        }
+        true
+    }
+
+    /// Calls the receiving realm's `__obscura_deliverMessage` for one message.
+    ///
+    /// A structured-clone payload (`{"sc": base64}`) is deserialized here,
+    /// inside the receiving realm's context. V8 creates the values in the
+    /// context it is running in, and an op called from a frame runs in the
+    /// page's context, so deserializing in script would hand the frame Dates,
+    /// Maps and objects of the page's realm (`instanceof Date` false).
+    fn deliver_message_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        message: &crate::ops::PendingFrameMessage,
+    ) -> Result<(), String> {
+        use base64::Engine as _;
+        use deno_core::v8;
+        use deno_core::v8::ValueDeserializerHelper as _;
+
+        struct PlainDeserializer;
+        impl v8::ValueDeserializerImpl for PlainDeserializer {}
+
+        let serialized = message
+            .data_json
+            .strip_prefix("{\"sc\":\"")
+            .and_then(|rest| rest.strip_suffix("\"}"))
+            .map(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap_or_default()
+            });
+
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(let tc_scope, scope);
+
+        let global = context.global(tc_scope);
+        let key = v8::String::new(tc_scope, "__obscura_deliverMessage").ok_or("key")?;
+        let deliver = global
+            .get(tc_scope, key.into())
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or("the realm has no message delivery")?;
+
+        let (data_json, value, has_value): (v8::Local<v8::Value>, v8::Local<v8::Value>, bool) =
+            match &serialized {
+                Some(bytes) => {
+                    let deserializer =
+                        v8::ValueDeserializer::new(tc_scope, Box::new(PlainDeserializer), bytes);
+                    let value = if deserializer.read_header(context).unwrap_or(false) {
+                        deserializer.read_value(context)
+                    } else {
+                        None
+                    };
+                    if tc_scope.has_caught() {
+                        tc_scope.reset();
+                    }
+                    match value {
+                        Some(value) => (v8::null(tc_scope).into(), value, true),
+                        // An undecodable payload: the realm fires `messageerror`.
+                        None => (
+                            v8::String::new(tc_scope, "").ok_or("empty")?.into(),
+                            v8::undefined(tc_scope).into(),
+                            false,
+                        ),
+                    }
+                }
+                None => (
+                    v8::String::new(tc_scope, &message.data_json).ok_or("payload too large")?.into(),
+                    v8::undefined(tc_scope).into(),
+                    false,
+                ),
+            };
+        let args: [v8::Local<v8::Value>; 6] = [
+            data_json,
+            v8::String::new(tc_scope, &message.origin).ok_or("origin")?.into(),
+            v8::Integer::new_from_unsigned(tc_scope, message.source_frame_id).into(),
+            v8::String::new(tc_scope, &message.target_origin).ok_or("target origin")?.into(),
+            value,
+            v8::Boolean::new(tc_scope, has_value).into(),
+        ];
+        deliver.call(tc_scope, global.into(), &args);
+        if tc_scope.has_caught() {
+            return Err(exception_text(tc_scope));
+        }
+        Ok(())
+    }
+
     /// Restore the configured V8 heap limit after the emergency headroom has
     /// allowed a terminated allocation to unwind. The callback is then armed
     /// again so a second hostile script cannot grow the isolate without bound.
@@ -1148,6 +1615,51 @@ impl ObscuraJsRuntime {
         self.finish_heap_checked(result)
     }
 
+    /// Run a trusted host expression with the realm's private bootstrap state.
+    /// Page expressions must continue through `execute_runtime_script`: this
+    /// entry point supplies an additional lexical capability, never a global.
+    fn execute_host_expression(
+        &mut self,
+        name: &'static str,
+        expression: String,
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        use deno_core::v8;
+        let function = self.execute_runtime_script(name, format!(
+            "(function(__hostState) {{ 'use strict'; return (\n{}\n); }})",
+            expression.trim_end().trim_end_matches(';'),
+        ))?;
+        let result = (|| {
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            let isolate = entered.v8_isolate();
+            v8::scope!(let scope, isolate);
+            let context = v8::Local::new(scope, main);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            v8::tc_scope!(let scope, scope);
+            let private = crate::host_state::get(scope)
+                .ok_or_else(|| "Runtime host state is unavailable".to_string())?;
+            let function = v8::Local::new(scope, function);
+            let function = v8::Local::<v8::Function>::try_from(function)
+                .map_err(|_| "Host expression did not compile to a function".to_string())?;
+            let receiver = v8::undefined(scope).into();
+            let value = function.call(scope, receiver, &[private])
+                .ok_or_else(|| exception_text(scope))?;
+            Ok(v8::Global::new(scope, value))
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    /// Embedding-only expression used by input dispatch; not a CDP evaluator.
+    #[doc(hidden)]
+    pub fn evaluate_host_expression(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        // Input hit testing sees the same applied resources as `evaluate`.
+        #[cfg(feature = "render")]
+        self.service_render_resources();
+        self.begin_javascript_task();
+        let value = self.execute_host_expression("<host-input>", expression.to_string())?;
+        self.v8_to_json(value)
+    }
+
     /// Parse and merge an inline document import map. Rules which would alter
     /// already-observed module resolutions are discarded while unrelated new
     /// rules remain available, matching Chromium's multiple-map model.
@@ -1166,11 +1678,13 @@ impl ObscuraJsRuntime {
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         let mut state = self.state.borrow_mut();
-        state.http_client = Some(client);
+        state.http_client = Some(client.clone());
         // A page transport makes the renderer cache-only; see
         // `ops::fresh_render_resources` for why layout must not fetch itself.
         #[cfg(feature = "render")]
         state.render_resources.set_sync_loading_enabled(false);
+        drop(state);
+        self.realm_states().borrow().set_http_client(client);
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1199,6 +1713,7 @@ impl ObscuraJsRuntime {
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
         {
+            gs.canvas_epoch = crate::ops::next_canvas_epoch();
             gs.prepared_render = None;
             gs.animation_sample = obscura_render::AnimationSample::default();
             gs.animation_timeline = obscura_render::AnimationTimelineState::default();
@@ -1224,6 +1739,12 @@ impl ObscuraJsRuntime {
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
+            #[cfg(feature = "webgl")]
+            {
+                crate::webgl_ops::canvas_placeholder::clear(&mut gs);
+                gs.webgl.entries.clear();
+                gs.webgl_surfaces.clear();
+            }
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -1429,6 +1950,15 @@ impl ObscuraJsRuntime {
     ) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
+        state.cdp_intercept_channel = false;
+    }
+
+    /// CDP owns request-event routing; ordinary embedder channels do not.
+    pub fn set_cdp_intercept_tx(
+        &self, tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>,
+    ) {
+        self.set_intercept_tx(tx);
+        self.state.borrow_mut().cdp_intercept_channel = true;
     }
 
     pub fn set_intercept_enabled(&self, enabled: bool) {
@@ -1460,13 +1990,12 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Language reported by `navigator.language(s)`. It is private host
+    /// state, so the override is neither a page global nor page-writable.
     pub fn set_locale(&mut self, locale: &str) {
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_host_expression(
             "<set-locale>",
-            format!(
-                "globalThis.__obscura_language = {};",
-                js_string_literal(locale)
-            ),
+            format!("__hostState.language = {}", js_string_literal(locale)),
         );
     }
 
@@ -1482,7 +2011,30 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Seed of the stealth fingerprint surfaces. The browser context owns it
+    /// so that every document, frame realm and worker of one profile reports
+    /// the same values (see `crate::fingerprint`). Takes effect from the next
+    /// document initialization.
+    pub fn set_fingerprint_seed(&mut self, seed: u32) {
+        self.js_runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::fingerprint::FingerprintSeed(seed));
+    }
+
+    pub fn fingerprint_seed(&mut self) -> u32 {
+        self.js_runtime
+            .op_state()
+            .borrow()
+            .try_borrow::<crate::fingerprint::FingerprintSeed>()
+            .map(|seed| seed.0)
+            .unwrap_or(0)
+    }
+
     pub fn set_stealth(&mut self, enabled: bool) {
+        // Chrome's natively implemented APIs never show up in a page's stack
+        // traces, so hide the engine's own script frames in stealth mode.
+        crate::stack_trace::set_hide_internal_frames(self.js_runtime.v8_isolate(), enabled);
         let _ = self.execute_runtime_script(
             "<set-stealth>",
             format!("globalThis.__obscura_stealth = {};", enabled),
@@ -1498,11 +2050,11 @@ impl ObscuraJsRuntime {
         }
         #[cfg(feature = "render")]
         self.state.borrow_mut().set_viewport(width, height);
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_host_expression(
             "<set-viewport>",
             format!(
-                "globalThis.__obscura_viewport_w={width};\
-                 globalThis.__obscura_viewport_h={height};\
+                "(function(){{__hostState.viewportWidth={width};\
+                 __hostState.viewportHeight={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
@@ -1513,7 +2065,7 @@ impl ObscuraJsRuntime {
                  }}\
                  if(typeof globalThis.__obscura_recompute_resizes==='function'){{\
                    globalThis.__obscura_recompute_resizes();\
-                 }}",
+                 }}}})()",
             ),
         );
     }
@@ -1527,11 +2079,31 @@ impl ObscuraJsRuntime {
             Some((width, height))
                 if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 =>
             {
-                format!("globalThis.__obscura_set_screen_override({width},{height},{emulated});")
+                format!("__hostState.setScreenOverride({width},{height},{emulated});")
             }
-            _ => format!("globalThis.__obscura_set_screen_override(null,null,{emulated});"),
+            _ => format!("__hostState.setScreenOverride(null,null,{emulated});"),
         };
-        let _ = self.execute_runtime_script("<set-screen-size>", script);
+        let _ = self.execute_host_expression("<set-screen-size>", script);
+        // Chrome emulates device metrics for the whole page: every frame
+        // reports the same screen as the top document.
+        self.sync_page_screen_to_realms();
+    }
+
+    /// Override the browser window size (`outerWidth`/`outerHeight`) exposed to
+    /// page JavaScript. CDP mobile device emulation reports the emulated view
+    /// size there; desktop emulation leaves the window alone. `None` restores
+    /// the profile's own window. Applies to the page and every frame realm.
+    pub fn set_window_size_override(&mut self, size: Option<(f64, f64)>) {
+        let script = match size {
+            Some((width, height))
+                if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 =>
+            {
+                format!("__hostState.setWindowOverride({width},{height});")
+            }
+            _ => "__hostState.setWindowOverride(null,null);".to_string(),
+        };
+        let _ = self.execute_host_expression("<set-window-size>", script);
+        self.sync_page_screen_to_realms();
     }
 
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.
@@ -1667,6 +2239,24 @@ impl ObscuraJsRuntime {
         surface_color: [u8; 4],
     ) -> Option<Vec<u8>> {
         let mut state = self.state.borrow_mut();
+        #[cfg(feature = "webgl")]
+        {
+            crate::webgl_ops::prepare_surfaces(&mut state);
+            let ObscuraState { dom, render_resources, canvas_surfaces, webgl_surfaces, element_scroll_offsets, .. } = &mut *state;
+            let dom = dom.as_ref()?;
+            let mut prepared = obscura_render::prepare_dom_at_animation_time(
+                dom, viewport, base_url, render_resources, animation_sample_time,
+            )?;
+            let resolved = prepared.resolve_scroll_state(dom, scroll, element_scroll_offsets);
+            let surfaces = RuntimeCanvasSurfaceSource { canvas: canvas_surfaces, webgl: webgl_surfaces };
+            let result = obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+                dom, &mut prepared, render_resources, &resolved, surface_color, &surfaces,
+            );
+            if result.is_some() { crate::webgl_ops::did_present(&mut state); }
+            return result;
+        }
+        #[cfg(not(feature = "webgl"))]
+        {
         let ObscuraState {
             dom,
             render_resources,
@@ -1681,6 +2271,7 @@ impl ObscuraJsRuntime {
             surface_color,
             render_resources,
         )
+        }
     }
 
     #[cfg(feature = "render")]
@@ -1696,6 +2287,8 @@ impl ObscuraJsRuntime {
             return None;
         }
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state)?;
             let ObscuraState {
                 dom,
@@ -1703,18 +2296,27 @@ impl ObscuraJsRuntime {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll.as_ref()?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()?,
                 prepared_render.as_mut()?,
                 render_resources,
                 scroll,
                 surface_color,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_some() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -1767,6 +2369,8 @@ impl ObscuraJsRuntime {
     ) -> Result<obscura_render::Pixmap, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
             let ObscuraState {
                 dom,
@@ -1774,13 +2378,19 @@ impl ObscuraJsRuntime {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -1791,7 +2401,10 @@ impl ObscuraJsRuntime {
                 region,
                 surface_color,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_ok() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -1805,6 +2418,8 @@ impl ObscuraJsRuntime {
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
             let ObscuraState {
                 dom,
@@ -1812,13 +2427,19 @@ impl ObscuraJsRuntime {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let (_, scroll) = resolved_scroll
                 .as_ref()
                 .ok_or(obscura_render::CaptureError::PaintFailed)?;
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom.as_ref()
                     .ok_or(obscura_render::CaptureError::PaintFailed)?,
                 prepared_render
@@ -1829,7 +2450,10 @@ impl ObscuraJsRuntime {
                 region,
                 paint_backgrounds,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_ok() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -1846,6 +2470,8 @@ impl ObscuraJsRuntime {
     ) -> Result<Vec<u8>, obscura_render::CaptureError> {
         let mut state = self.state.borrow_mut();
         with_sync_render_loading_disabled(&mut state, |state| {
+            #[cfg(feature = "webgl")]
+            crate::webgl_ops::prepare_surfaces(state);
             ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
             let ObscuraState {
                 dom,
@@ -1853,6 +2479,8 @@ impl ObscuraJsRuntime {
                 render_resources,
                 element_scroll_offsets,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = state;
             let dom = dom
@@ -1867,8 +2495,12 @@ impl ObscuraJsRuntime {
                     element_scroll_offsets,
                     (region.width, region.height),
                 );
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
-            obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
+            let result = obscura_render::screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surfaces(
                 dom,
                 prepared_render
                     .as_mut()
@@ -1878,7 +2510,10 @@ impl ObscuraJsRuntime {
                 region,
                 paint_backgrounds,
                 &canvas_surfaces,
-            )
+            );
+            #[cfg(feature = "webgl")]
+            if result.is_ok() { crate::webgl_ops::did_present(state); }
+            result
         })
     }
 
@@ -2155,6 +2790,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "stealth")]
         let stealth_client = state.stealth_client.clone();
         let initiator = url::Url::parse(&state.url).ok();
+        let top_frame = state.top_frame_url.as_deref().and_then(|url| url::Url::parse(url).ok());
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
             // the in-flight marks so a later scan may retry.
@@ -2179,6 +2815,7 @@ impl ObscuraJsRuntime {
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
                 let initiator = initiator.clone();
+                let top_frame = top_frame.clone();
                 let limiter = limiter.clone();
                 let fallback = (raw.clone(), profile, is_font);
                 let load = async move {
@@ -2203,6 +2840,7 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.top_frame = top_frame;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;
@@ -2252,6 +2890,11 @@ impl ObscuraJsRuntime {
                         profile,
                         is_font,
                         response: response.map(|response| crate::ops::RenderResourceResponse {
+                            #[cfg(feature = "webgl")]
+                            image_origin_clean: crate::image_security::response_origin_clean(
+                                &initiator, &parsed,
+                                profile.unwrap_or(crate::ops::ImageRequestProfile::NoCorsInclude), &response,
+                            ),
                             url: response.url.to_string(),
                             status: response.status,
                             headers: response.headers,
@@ -2332,6 +2975,27 @@ impl ObscuraJsRuntime {
         !self.state.borrow().render_resource_in_flight.is_empty()
     }
 
+    /// The page-transport loads running now.
+    #[cfg(feature = "render")]
+    pub fn render_resources_in_flight(&self) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        self.state.borrow().render_resource_in_flight.iter().cloned().collect()
+    }
+
+    /// Whether any of `loads` is still running.
+    #[cfg(feature = "render")]
+    pub fn any_render_resource_in_flight(&self, loads: &[(String, Option<crate::ops::ImageRequestProfile>, bool)]) -> bool {
+        let state = self.state.borrow();
+        loads.iter().any(|load| state.render_resource_in_flight.contains(load))
+    }
+
+    /// Whether web-font loads are still running for this document. Fonts
+    /// decide text metrics, so layout reads depend on them; images only change
+    /// their own box when it has no specified size.
+    #[cfg(feature = "render")]
+    pub fn has_pending_render_font_resources(&self) -> bool {
+        self.state.borrow().render_resource_in_flight.iter().any(|(_, _, is_font)| *is_font)
+    }
+
     /// Apply every finished page-transport load without waiting. Called at
     /// the runtime's own event-loop turns and promise waits and by the page
     /// around protocol commands, so late bytes reach layout, paint and the
@@ -2370,9 +3034,22 @@ impl ObscuraJsRuntime {
                 _ => None,
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
+            // Save provenance before the ordinary cache seed consumes the
+            // response. The permission is stored on that exact cache entry.
+            #[cfg(feature = "webgl")]
+            let image_permission = bytes.as_ref().map(|bytes| (
+                load.url.clone(), std::sync::Arc::clone(bytes),
+                load.response.as_ref().is_some_and(|r| r.image_origin_clean),
+            ));
             match load.profile {
                 Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
                 None => self.seed_shared_render_resource(load.url, bytes),
+            }
+            #[cfg(feature = "webgl")]
+            if let Some((url, bytes, clean)) = image_permission.filter(|_| !is_font) {
+                self.state.borrow_mut().render_resources.set_image_origin_for_bytes(
+                    &url, load.profile.unwrap_or(crate::ops::ImageRequestProfile::NoCorsInclude), &bytes, clean,
+                );
             }
             if let Some(response) = load.response {
                 self.state
@@ -2403,12 +3080,12 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
-    /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
+    /// Run the private initializer after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_host_expression(
             "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
+            "__hostState.initializeDocument()".to_string(),
         );
     }
 
@@ -2493,12 +3170,12 @@ impl ObscuraJsRuntime {
                     try {{\n\
                         var __result = await (0, eval)({src});\n\
                         globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
+                        __hostState.awaitMeta = {meta_fn};\n\
+                        __hostState.awaitRejected = false;\n\
                     }} catch(e) {{\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __hostState.awaitMeta = {err_meta_fn};\n\
+                        __hostState.awaitRejected = true;\n\
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
@@ -2509,9 +3186,9 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             )
         } else {
-            // The synchronous half writes the same two globals as the await
-            // half above, so one outcome protocol covers both and the reply
-            // builder does not have to care which path produced the value.
+            // The synchronous half writes the same two host-state fields as
+            // the await half above, so one outcome protocol covers both and the
+            // reply builder does not have to care which path produced the value.
             // Before this, a throw here became `__result = undefined`: the
             // command answered successfully with `undefined`, so a page error
             // was indistinguishable from an expression with no value.
@@ -2522,12 +3199,12 @@ impl ObscuraJsRuntime {
                         __result = (0, eval)({src});\n\
                     }} catch(e) {{\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                        return globalThis.__obscura_await_meta;\n\
+                        __hostState.awaitMeta = {err_meta_fn};\n\
+                        __hostState.awaitRejected = true;\n\
+                        return __hostState.awaitMeta;\n\
                     }}\n\
                     globalThis.__obscura_objects[{oid}] = __result;\n\
-                    globalThis.__obscura_await_rejected = false;\n\
+                    __hostState.awaitRejected = false;\n\
                     return {meta_fn};\n\
                 }})()",
                 src = source_literal,
@@ -2538,7 +3215,7 @@ impl ObscuraJsRuntime {
         };
 
         let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
+            .execute_host_expression("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
@@ -2574,7 +3251,7 @@ impl ObscuraJsRuntime {
                     preview,
                 );
             }
-            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            self.execute_host_expression("<readMeta>", "__hostState.awaitMeta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
@@ -2588,9 +3265,9 @@ impl ObscuraJsRuntime {
         // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
         // would throw the message away.
         let thrown = self
-            .execute_runtime_script(
+            .execute_host_expression(
                 "<readRejected>",
-                "globalThis.__obscura_await_rejected".to_string(),
+                "__hostState.awaitRejected".to_string(),
             )
             .map_err(|e| format!("JS error: {}", e))?;
         if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
@@ -2654,25 +3331,27 @@ impl ObscuraJsRuntime {
             let code = format!(
                 "(async function() {{\n\
                     {setup}\n\
-                    var __fn = ({fn_decl});\n\
+                    var __fn = (0, eval)({fn_source});\n\
                     var __this = ({this_expr});\n\
                     var __result;\n\
                     try {{\n\
                         __result = await __fn.call(__this, {args});\n\
                         globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
+                        __hostState.awaitMeta = {meta_fn};\n\
+                        __hostState.awaitRejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
                         globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __hostState.awaitMeta = {err_meta_fn};\n\
+                        __hostState.awaitRejected = true;\n\
                     }} finally {{\n\
                         globalThis.__obscura_done_{done_counter} = true;\n\
                     }}\n\
                 }})()",
                 setup = setup,
-                fn_decl = function_declaration,
+                // Compile caller code at global scope so it cannot capture
+                // the host wrapper's private state through a lexical closure.
+                fn_source = js_string_literal(&format!("({function_declaration}\n)")),
                 this_expr = this_expr,
                 args = args_list,
                 oid = js_string_literal(&oid),
@@ -2681,7 +3360,7 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.execute_runtime_script("<callFnAsync>", code)
+            self.execute_host_expression("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
@@ -2724,9 +3403,9 @@ impl ObscuraJsRuntime {
             // and `Promise.reject({code: 42})` as `{code: 42}`, which is
             // indistinguishable from resolving with it.
             let rejected = self
-                .execute_runtime_script(
+                .execute_host_expression(
                     "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
+                    "__hostState.awaitRejected".to_string(),
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
@@ -2738,7 +3417,7 @@ impl ObscuraJsRuntime {
             }
 
             let meta_result = self
-                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_host_expression("<readMeta>", "__hostState.awaitMeta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -3441,7 +4120,7 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
+    pub fn has_pending_network_requests(&self) -> bool {
         let state = self.state.borrow();
         state
             .page_in_flight
@@ -3483,6 +4162,12 @@ impl ObscuraJsRuntime {
     /// from `&self`.
     pub fn isolate_handle(&self) -> IsolateHandle {
         self.isolate_handle.clone()
+    }
+
+    /// Handle a protocol client uses to preempt this document's autonomous
+    /// task when it navigates the page away (see [`TurnPreemption`]).
+    pub fn turn_preemption(&self) -> std::sync::Arc<TurnPreemption> {
+        self.turn_preemption.clone()
     }
 
     /// Clear V8's termination flag after a watchdog armed externally (via the
@@ -3622,8 +4307,11 @@ impl ObscuraJsRuntime {
         self.finish_heap_checked(result)
     }
 
-    /// Drive one browser task while allowing the future to remain parked on
-    /// deno_core's real timer/network waker. This is the long-lived browser
+    /// Drive a cooperative event-loop turn with at most two deno_core polls,
+    /// allowing the future to remain parked on its real timer/network waker.
+    /// The first poll may deliver ready work before returning Pending; the
+    /// wake poll then returns control even if more work remains. A turn is not
+    /// a single JavaScript callback budget. This is the long-lived browser
     /// server counterpart to bounded screenshot settling: the owner selects
     /// this future alongside incoming protocol commands, so a page continues
     /// to make progress while the automation client is idle without polling at
@@ -3642,18 +4330,28 @@ impl ObscuraJsRuntime {
         self.service_render_resources();
         self.begin_javascript_task();
 
+        let checkpoint_preemption = self.turn_preemption.begin();
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
         );
         self.runtime().v8_isolate().perform_microtask_checkpoint();
-        if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
+        let checkpoint_overran = crate::cdp_watchdog::disarm(checkpoint_watchdog);
+        if checkpoint_preemption.finish() {
+            if checkpoint_overran {
+                self.cancel_termination();
+            }
+            tracing::debug!("a navigation preempted the document's autonomous microtask checkpoint");
+            return Ok(false);
+        }
+        if checkpoint_overran {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
+        let preemption = self.turn_preemption.begin();
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
@@ -3672,6 +4370,10 @@ impl ObscuraJsRuntime {
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
+            }
+            if matches!(tick, std::task::Poll::Ready(Err(_))) && preemption.close() {
+                // A navigation replaced this document while its task ran.
+                return std::task::Poll::Ready(Ok(false));
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -3699,6 +4401,10 @@ impl ObscuraJsRuntime {
             }
         })
         .await;
+        if preemption.finish() {
+            tracing::debug!("a navigation preempted the document's autonomous task");
+            return Ok(false);
+        }
         if matches!(result, Ok(false)) {
             tokio::task::yield_now().await;
         }
@@ -3939,6 +4645,13 @@ impl ObscuraJsRuntime {
             }
             if done_check(self) {
                 return true;
+            }
+            // A message between realms is a task too: deliver it now, and
+            // poll again at once, because the awaited promise usually waits
+            // for exactly this message or for the reply it causes.
+            if self.deliver_pending_frame_messages() {
+                tick_ms = 1;
+                continue;
             }
             if matches!(turn, Ok(Ok(true)) | Ok(Err(_))) {
                 // An idle loop or repeated page error must not spin while
@@ -4418,13 +5131,13 @@ impl ObscuraJsRuntime {
     /// rejected with.
     ///
     /// Both wrappers have already stored the value under `oid` and put its
-    /// metadata in `__obscura_await_meta`, so this reads them back and marks
-    /// the result. The mark is what lets the CDP layer answer the command with
-    /// `exceptionDetails` rather than fail it or, worse, present the value as
-    /// the evaluation result.
+    /// metadata in private host state (`awaitMeta`), so this reads them back
+    /// and marks the result. The mark is what lets the CDP layer answer the
+    /// command with `exceptionDetails` rather than fail it or, worse, present
+    /// the value as the evaluation result.
     fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
         let meta = self
-            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            .execute_host_expression("<readMeta>", "__hostState.awaitMeta".to_string())
             .map_err(|e| format!("JS error: {}", e))?;
         let meta = self.v8_to_json(meta)?;
         let meta_json = if let serde_json::Value::String(text) = &meta {
@@ -4569,28 +5282,36 @@ mod tests {
             rt.set_screen_size_override(Some((width as f64, height as f64)), true);
             assert_eq!(rt.evaluate("[screen.width, screen.height, screen.availWidth, screen.availHeight]").unwrap(),
                 serde_json::json!([width, height, width, height]));
+            // The override slots are private host state. No global property
+            // exists for page initialization to recreate as read-only.
             assert_eq!(rt.evaluate(r#"(() => {
                 const names = ['__obscura_screen_w', '__obscura_screen_h'];
-                return names.every(name => {
-                    const descriptor = Object.getOwnPropertyDescriptor(window, name);
-                    return descriptor.writable && descriptor.configurable && !descriptor.enumerable
-                        && !Reflect.ownKeys(window).includes(name);
-                });
+                return names.every(name => !(name in window)
+                    && Object.getOwnPropertyDescriptor(window, name) === undefined
+                    && !Reflect.ownKeys(window).includes(name));
             })()"#).unwrap(), serde_json::json!(true));
+            assert_eq!(rt.evaluate_host_expression("[__hostState.screenWidth, __hostState.screenHeight]").unwrap(),
+                serde_json::json!([width, height]));
             rt.set_screen_size_override(None, false);
-            assert_eq!(rt.evaluate("[__obscura_screen_w, __obscura_screen_h].every(value => value === undefined)").unwrap(),
+            assert_eq!(rt.evaluate_host_expression(
+                "[__hostState.screenWidth, __hostState.screenHeight].every(value => value === undefined)").unwrap(),
                 serde_json::json!(true));
         }
     }
 
-    #[test]
-    fn late_runtime_internal_names_use_the_existing_reflection_registry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_runtime_internal_names_use_the_existing_reflection_registry() {
         let mut rt = setup_runtime("<button id='target'>Click</button>");
         rt.set_viewport(900.0, 700.0);
         rt.set_screen_size_override(Some((1280.0, 800.0)), true);
+        // Drive the real evaluation path instead of writing the former global:
+        // its outcome is private host state and never reaches the page.
+        for source in ["Promise.reject(new Error('late'))", "1"] {
+            rt.evaluate_for_cdp(source, true, true).await.unwrap();
+        }
         assert_eq!(rt.evaluate(r#"(() => {
             document.getElementById('target').click();
-            globalThis.__obscura_await_rejected = false;
+            document.getElementById('target').focus();
             globalThis.__obscura_page_owned = 42;
             const names = ['__obscura_await_rejected', '__obscura_click_target',
                 '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
@@ -4747,6 +5468,8 @@ mod tests {
                     status: 200,
                     headers: Default::default(),
                     body: body.clone(),
+                    #[cfg(feature = "webgl")]
+                    image_origin_clean: false,
                 }),
             })
         };
@@ -5094,6 +5817,9 @@ mod tests {
             "<style>body{margin:4px}#parent{width:45px;height:30px}</style><div id='parent'></div>");
         assert_eq!(rt.evaluate(r#"(() => {
             const iframe = document.createElement('iframe');
+            // Chrome's default iframe size. The frame viewport follows the
+            // iframe's box, so x=400 lies outside it.
+            iframe.style.cssText = 'width:300px;height:150px';
             document.body.appendChild(iframe);
             const d = iframe.contentDocument;
             d.body.innerHTML = '<style>body{margin:8px}div{width:100px;height:20px}</style><div id="child"></div>';
@@ -5643,15 +6369,19 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("worker-queued-messages", r#"
             globalThis.__workerReplies = [];
-            const originalFetch = globalThis.fetch;
+            // The worker script is a browser load (op_fetch_url), held until
+            // the messages are queued.
+            const originalOp = __obscura_test_ops.op_fetch_url;
             let finishSource;
-            globalThis.fetch = async () => ({ text: () => new Promise(resolve => { finishSource = resolve; }) });
+            __obscura_test_ops.op_fetch_url = () => new Promise(resolve => {
+                finishSource = body => resolve(JSON.stringify({ status: 200, body, url: 'https://example.com/worker.js', headers: {} }));
+            });
             const worker = new Worker('https://example.com/worker.js');
             worker.onmessage = event => __workerReplies.push(event.data);
             worker.postMessage('first');
             worker.postMessage('second');
             setTimeout(() => {
-                globalThis.fetch = originalFetch;
+                __obscura_test_ops.op_fetch_url = originalOp;
                 finishSource('let count = 0; onmessage = event => postMessage([++count, event.data]);');
             }, 0);
         "#).unwrap();
@@ -8994,52 +9724,56 @@ mod tests {
             "nested-zero-interval",
             "globalThis.__outerTimerRan = false;\
              globalThis.__zeroIntervalTicks = 0;\
+             globalThis.__zeroIntervalTrace = [];\
+             globalThis.__zeroHostEpoch = 0;\
              setTimeout(() => {\
                globalThis.__outerTimerRan = true;\
-               globalThis.__zeroInterval = setInterval(\
-                 () => __zeroIntervalTicks++, 0);\
+               globalThis.__zeroInterval = setInterval(() => {\
+                 __zeroIntervalTicks++;\
+                 __zeroIntervalTrace.push([__zeroIntervalTicks, __zeroHostEpoch, performance.now()]);\
+               }, 0);\
              }, 0);",
         )
         .unwrap();
 
         let started = std::time::Instant::now();
-        rt.run_autonomous_event_loop_turn().await.unwrap();
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "a repeating timer must yield between ticks; elapsed={elapsed:?}",
-        );
-        assert_eq!(
-            rt.evaluate("globalThis.__outerTimerRan").unwrap(),
-            serde_json::json!(true),
-        );
-        let mut ticks = 0.0;
-        for _ in 0..12 {
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
             rt.run_autonomous_event_loop_turn().await.unwrap();
-            let next = rt
-                .evaluate("globalThis.__zeroIntervalTicks")
-                .unwrap()
-                .as_f64()
-                .unwrap();
-            assert!(
-                next <= ticks + 1.0,
-                "a repeating timer must yield between ticks: {ticks} -> {next}",
-            );
-            ticks = next;
-            if ticks == 6.0 {
-                break;
+            assert_eq!(rt.evaluate("globalThis.__outerTimerRan").unwrap(), serde_json::json!(true));
+            // The initial turn may already have delivered the first interval.
+            // A turn polls deno_core at most twice: ready work before parking,
+            // then a wake poll. Each poll can dispatch this interval once.
+            let mut ticks = rt.evaluate("globalThis.__zeroIntervalTicks").unwrap().as_f64().unwrap();
+            let mut turns = Vec::new();
+            for turn in 0..12 {
+                rt.evaluate("++globalThis.__zeroHostEpoch").unwrap();
+                // Exercise both an immediately re-entered owner and a delayed
+                // owner whose first poll may already find the timer ready.
+                let pause_ms = if turn % 2 == 0 { 0 } else { 5 };
+                if pause_ms != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+                }
+                rt.run_autonomous_event_loop_turn().await.unwrap();
+                let next = rt.evaluate("globalThis.__zeroIntervalTicks").unwrap().as_f64().unwrap();
+                assert!(next >= ticks && next <= ticks + 2.0,
+                    "a repeating timer must yield after at most two polls: {ticks} -> {next}");
+                turns.push(serde_json::json!({"turn":turn,"host_pause_ms":pause_ms,"before":ticks,"after":next}));
+                ticks = next;
+                if ticks >= 6.0 { break; }
             }
-        }
-        assert_eq!(
-            ticks, 6.0,
-            "V8 maintenance wakes must not starve the repeating timer",
-        );
-        rt.execute_script(
-            "clear-zero-interval",
-            "clearInterval(globalThis.__zeroInterval)",
-        )
-            .unwrap();
+            assert!(ticks >= 6.0, "V8 maintenance wakes must not starve the repeating timer");
+            rt.execute_script("clear-zero-interval", "clearInterval(globalThis.__zeroInterval)").unwrap();
+            let callbacks = rt.evaluate("globalThis.__zeroIntervalTrace").unwrap();
+            let mut previous = 0.0;
+            for callback in callbacks.as_array().unwrap() {
+                let tick = callback[0].as_f64().unwrap();
+                assert_eq!(tick, previous + 1.0, "interval callbacks must retain their order");
+                previous = tick;
+            }
+            assert_eq!(previous, ticks);
+            eprintln!("TIMER_TURN_TRACE {}", serde_json::json!({"turns":turns,"callbacks":callbacks}));
+        }).await.expect("the repeating timer must return control and make progress within 500ms");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13456,14 +14190,10 @@ mod tests {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_viewport(300.0, 200.0);
-        // Force the fingerprint seed whose screen-pool entry is 2560x1440.
+        // Use the fingerprint seed whose screen-pool entry is 2560x1440.
         // That physical screen must not silently turn a 1x render surface into
         // a 2x devicePixelContentBoxSize surface.
-        rt.execute_script(
-            "deterministic-high-resolution-screen",
-            "Date.now = () => 0; Math.random = () => 2 / 0xFFFFFFFF;",
-        )
-        .unwrap();
+        rt.set_fingerprint_seed(2);
         rt.run_page_init();
 
         assert_eq!(
@@ -15566,6 +16296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "webgl"))]
     fn unavailable_webgl_context_does_not_claim_success() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt
@@ -15703,10 +16434,16 @@ mod tests {
                 render_resources,
                 resolved_scroll,
                 canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl_surfaces,
                 ..
             } = &mut *state;
             let (_, scroll) = resolved_scroll.as_ref().expect("scroll snapshot");
-            let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            let canvas_surfaces = RuntimeCanvasSurfaceSource {
+                canvas: canvas_surfaces,
+                #[cfg(feature = "webgl")]
+                webgl: webgl_surfaces,
+            };
             obscura_render::paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
                 dom.as_ref().expect("canvas DOM"),
                 prepared_render.as_mut().expect("prepared canvas layout"),
@@ -17559,6 +18296,69 @@ mod tests {
     }
 
     #[test]
+    fn native_form_submission_normalizes_names_and_values_without_mutating_controls() {
+        for method in ["GET", "POST"] {
+            let mut rt = setup_runtime(
+                r#"<form action="/submit"><textarea id="notes" name="notes"></textarea></form>"#,
+            );
+            rt.evaluate(&format!("document.querySelector('form').method={method:?}"))
+                .unwrap();
+            assert_eq!(
+                rt.evaluate(
+                    r#"(() => {
+              const control=document.getElementById('notes');
+              control.setAttribute('name','n\rx\ny\r\nz');control.value='a\rb\nc\r\nd';
+              document.querySelector('form').submit();
+              return [control.getAttribute('name'),control.value];
+            })()"#
+                )
+                .unwrap(),
+                serde_json::json!(["n\rx\ny\r\nz", "a\rb\nc\r\nd"])
+            );
+            let encoded = "n%0D%0Ax%0D%0Ay%0D%0Az=a%0D%0Ab%0D%0Ac%0D%0Ad";
+            let expected = if method == "POST" {
+                (
+                    String::from("http://example.com/submit"),
+                    String::from("POST"),
+                    encoded.to_string(),
+                )
+            } else {
+                (
+                    format!("http://example.com/submit?{encoded}"),
+                    String::from("GET"),
+                    String::new(),
+                )
+            };
+            assert_eq!(rt.take_pending_navigation(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn native_form_submission_preserves_empty_values_duplicates_and_form_encoding() {
+        let mut rt = setup_runtime(
+            r#"<form action="/submit" method="post"><textarea name="empty">original text</textarea><input name="extra" value="first"><input name="extra" value="second"><input id="punctuation" name="a b!~'()*-._" value=""><input name="ignored" disabled value="no"><input type="checkbox" name="unchecked" value="no"><input type="checkbox" checked name="checked" value="yes"></form>"#,
+        );
+        rt.evaluate(
+            r#"(() => {
+          document.querySelector('textarea').value='';
+          document.getElementById('punctuation').value="a b!~'()*-._é";
+          document.querySelector('form').submit();
+        })()"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                String::from("http://example.com/submit"),
+                String::from("POST"),
+                String::from(
+                    "empty=&extra=first&extra=second&a+b%21%7E%27%28%29*-._=a+b%21%7E%27%28%29*-._%C3%A9&checked=yes"
+                )
+            ))
+        );
+    }
+
+    #[test]
     fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
         let mut rt =
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
@@ -18255,7 +19055,7 @@ mod tests {
     
     #[tokio::test(flavor = "current_thread")]
     async fn a_rejection_does_not_leak_into_the_next_call() {
-        // `__obscura_await_rejected` is a global, so the success branch has to
+        // The private rejection flag is reused, so the success branch must
         // clear it. Without that the first rejection would mark every later
         // call on the same runtime as thrown.
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -20093,6 +20893,66 @@ mod tests {
         )
     }
 
+    async fn embedder_continued_response_identity(stealth: bool) {
+        let mut rt = redirect_chain_runtime(1);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let resolver = tokio::spawn(async move {
+            let request: crate::ops::InterceptedRequest = rx.recv().await.unwrap();
+            let id = request.request_id.clone();
+            request.resolver.send(crate::ops::InterceptResolution::Continue {
+                url: None, method: None, headers: None, body: None,
+            }).unwrap();
+            id
+        });
+        let result = rt.call_function_on_for_cdp(
+            "async () => (await fetch('/hop/0')).text()", None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("arrived")));
+        let id = resolver.await.unwrap();
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, id);
+        assert!(!events[0].intercepted, "embedder is not a CDP event owner");
+        assert_eq!(rt.get_network_response_body(&id).unwrap().body, "arrived");
+        rt.clear_network_response_bodies();
+        assert!(rt.get_network_response_body(&id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_embedder_continue_retains_response_without_cdp_provenance() {
+        embedder_continued_response_identity(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_embedder_continue_retains_response_without_cdp_provenance() {
+        embedder_continued_response_identity(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_rejection_does_not_publish_success_or_store_body() {
+        let mut rt = cross_origin_redirect_runtime();
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true)));
+        let result = rt.call_function_on_for_cdp(
+            "async () => { try { await fetch('/start', {mode:'cors'}); return 'allowed'; } catch (_) { return 'blocked'; } }",
+            None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("blocked")));
+        assert!(rt.take_js_network_events().is_empty());
+        assert!(rt.state.borrow().network_response_bodies.is_empty());
+    }
+
     // #973: in cors mode, a cross-origin redirect response that lacks
     // Access-Control-Allow-Origin must be rejected before it is followed, even
     // if the final destination would authorize the request.
@@ -20212,6 +21072,11 @@ mod tests {
 
         let events = rt.take_js_network_events();
         assert_eq!(events.len(), 2);
+        assert_ne!(events[0].request_id, events[1].request_id);
+        assert!(events.iter().all(|event| !event.intercepted && event.method == "GET"));
+        for event in &events {
+            assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "arrived");
+        }
         assert!(
             events[0].url.ends_with("/hop/0"),
             "network response event did not report the final URL: {:?}",
@@ -20222,7 +21087,7 @@ mod tests {
     #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_fetch_response_reports_the_final_redirect_url() {
-        let mut rt = redirect_chain_runtime(2);
+        let mut rt = redirect_chain_runtime(3);
         rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
             std::sync::Arc::new(obscura_net::CookieJar::new()),
         )));
@@ -20230,7 +21095,8 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/hop/1");
-                    return { url: response.url, redirected: response.redirected };
+                    const direct = await fetch("/hop/0");
+                    return { url: response.url, redirected: response.redirected, directRedirected: direct.redirected };
                 }"#,
                 None,
                 &[],
@@ -20248,6 +21114,69 @@ mod tests {
                 .ends_with("/hop/0")
         );
         assert_eq!(value["redirected"], true);
+        let events = rt.take_js_network_events();
+        assert_eq!(value["directRedirected"], false);
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].request_id, events[1].request_id);
+        assert!(events.iter().all(|event| !event.intercepted && event.method == "GET"));
+        for event in &events {
+            assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, "arrived");
+        }
+        assert!(events[0].url.ends_with("/hop/0"));
+        assert_eq!(events[0].status, 200);
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "arrived");
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_response_exposes_no_engine_request_identity() {
+        let mut rt = redirect_chain_runtime(2);
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+        )));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    const own = Object.getOwnPropertyNames(response).sort();
+                    const reference = Object.getOwnPropertyNames(
+                        new Response("arrived", { status: 200 })
+                    ).sort();
+                    return {
+                        own,
+                        reference,
+                        symbols: Object.getOwnPropertySymbols(response).length,
+                        engine: own.filter((name) => name.startsWith("__obscura")),
+                        reachable: "__obscuraRequestId" in response,
+                        redirected: response.redirected,
+                        text: await response.text(),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        // Chrome's Response has no own properties. The inherited Response shim
+        // keeps its state in own fields, so compare with a page-constructed
+        // Response: a stealth fetch must not add any engine property.
+        assert_eq!(value["own"], value["reference"], "{value}");
+        assert_eq!(value["symbols"], 0);
+        assert_eq!(value["engine"], serde_json::json!([]));
+        assert_eq!(value["reachable"], false);
+        assert_eq!(value["redirected"], true);
+        assert_eq!(value["text"], "arrived");
+        // CDP still receives the identity through the retained completion.
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].request_id.starts_with("fetch-"), "{:?}", events[0].request_id);
+        assert!(!events[0].intercepted);
+        assert!(events[0].url.ends_with("/hop/0"));
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "arrived");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20530,7 +21459,7 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/start", { mode: "no-cors" });
-                    return { type: response.type, url: response.url, redirected: response.redirected };
+                    return { type: response.type, url: response.url, redirected: response.redirected, status: response.status, text: await response.text(), headers: Array.from(response.headers).length };
                 }"#,
                 None,
                 &[],
@@ -20541,8 +21470,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false, "status": 0, "text": "", "headers": 0 })
         );
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, 200);
+        assert_eq!(rt.get_network_response_body(&events[0].request_id).unwrap().body, "ok");
     }
 
     /// The other end of the same pair: the twenty-first redirect must

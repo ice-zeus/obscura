@@ -69,7 +69,7 @@ Default UA matches a recent Chrome on the build platform.
 
 ## Browser profile, timezone, and geolocation
 
-The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all.
+The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them. Default builds have no WebGL: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all. Builds with the optional `webgl` feature create real ANGLE contexts. Without `--stealth`, `WEBGL_debug_renderer_info` reports the actual driver strings. With `--stealth`, it reports a vendor/renderer pair drawn once per browser profile from a built-in pool for the stealth platform, and `VERSION`/`SHADING_LANGUAGE_VERSION` use Chrome's format. Limits, extensions, shader precision and pixels still come from the actual backend (for example SwiftShader), so they are not guaranteed to match the reported GPU.
 
 A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
 
@@ -77,6 +77,20 @@ A single stable profile is used by default. One IP cycling through different ide
 OBSCURA_PROFILE=2 obscura serve          # pin a specific profile by index
 OBSCURA_ROTATE_PROFILE=1 obscura serve   # random profile per browser context
 ```
+
+## Fingerprint seed
+
+The randomized surfaces (the WebGL vendor/renderer pair, screen size, `hardwareConcurrency`, `deviceMemory`, canvas, audio and battery values) all derive from one seed per browser context. Every page, reload, tab, same-origin or cross-origin frame and worker of that context reports the same values, as one real device does. Each new browser context draws a fresh random seed, so separate profiles get independent values from the same pools. Values a browser recomputes for every navigation, such as navigation timing and JS heap usage, still vary per document.
+
+To keep a profile's fingerprint across process restarts, pin the seed:
+
+```bash
+OBSCURA_FINGERPRINT_SEED=0x5eed obscura serve --stealth   # or any profile label, e.g. profile-17
+```
+
+The default browser context (and every CDP connection to it) uses the pinned seed. A context created with `Target.createBrowserContext` derives its own reproducible seed from the pinned seed and its context id.
+
+Canvas and WebGL output is part of the profile too. In stealth mode the seed decides a small rendering variation, as real GPUs and font stacks differ: text, curves, gradients and resampled images drawn on a 2D canvas, and shaded WebGL pixels read back with `readPixels`, `toDataURL`, `toBlob` or `drawImage`, have a few color channels shifted by one level. The same drawing reads back identically every time within a profile and differently between profiles. Blank canvases, solid rectangles, `putImageData` and flat WebGL clears stay exact, and alpha is never changed. Text widths from `measureText` carry a per-profile factor within 0.3%. Without `--stealth` the output is unchanged.
 
 Timezone is driven by the process zone so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report the same region. Default is `Europe/Berlin`; set it to match the exit IP:
 

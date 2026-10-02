@@ -4,9 +4,9 @@ pub async fn handle(method: &str, _params: &Value) -> Result<Value, String> {
     match method {
         "getVersion" => Ok(json!({
             "protocolVersion": "1.3",
-            "product": "Chrome/145.0.0.0",
+            "product": "Chrome/148.0.0.0",
             "revision": "@0000000000000000000000000000000000000000",
-            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             "jsVersion": "14.5.0.0",
         })),
         "close" => {

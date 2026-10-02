@@ -749,7 +749,7 @@ mod tests {
         ] {
             ctx.get_session_page_mut(&session)
                 .unwrap()
-                .evaluate("globalThis.__obscura_click_target = null");
+                .evaluate_host_expression("__hostState.clickTarget = null");
 
             handle("scrollIntoViewIfNeeded", &params, &mut ctx, &session)
                 .await
@@ -758,7 +758,7 @@ mod tests {
             let target_id = ctx
                 .get_session_page_mut(&session)
                 .unwrap()
-                .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
+                .evaluate_host_expression("__hostState.clickTarget && __hostState.clickTarget.id");
             assert_eq!(target_id, json!("target"));
         }
     }

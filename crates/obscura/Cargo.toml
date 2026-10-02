@@ -8,6 +8,8 @@ repository = "https://github.com/h4ckf0r0day/obscura"
 license = "Apache-2.0"
 
 [features]
+# Opt in to real ANGLE graphics; default feature sets remain unchanged.
+webgl = ["render", "obscura-browser/webgl"]
 default = ["api"]
 api = ["obscura-browser", "obscura-net", "tokio"]
 stealth = ["api", "obscura-browser/stealth"]

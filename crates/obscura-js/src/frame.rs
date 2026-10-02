@@ -131,6 +131,7 @@ impl FrameRealm {
                 ),
             )
             .ok()?;
+        parent.finish_realm_screen(&realm.context);
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
@@ -354,6 +355,7 @@ impl FrameRealm {
             dom.with_node(id, |node| DocumentScript {
                 src: node.get_attribute("src").unwrap_or("").to_string(),
                 type_attribute: node.get_attribute("type").unwrap_or("").to_lowercase(),
+                no_module: node.get_attribute("nomodule").is_some(),
                 text,
             })
         }).collect())
@@ -363,6 +365,7 @@ impl FrameRealm {
 struct DocumentScript {
     src: String,
     type_attribute: String,
+    no_module: bool,
     text: String,
 }
 
@@ -370,11 +373,11 @@ impl DocumentScript {
     /// An empty type, or a JavaScript MIME type, is a classic script. Anything
     /// else is data or a module.
     fn is_classic(&self) -> bool {
-        self.type_attribute.is_empty()
+        !self.no_module && (self.type_attribute.is_empty()
             || matches!(
                 self.type_attribute.as_str(),
                 "text/javascript" | "application/javascript" | "text/ecmascript"
-            )
+            ))
     }
 }
 
@@ -897,6 +900,29 @@ mod tests {
             "{problems:?}"
         );
         assert!(problems.iter().any(|p| p.contains("module")), "{problems:?}");
+    }
+
+    #[test]
+    fn frame_nomodule_scripts_are_neither_prefetched_nor_executed() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/frame/",
+            r#"<script>window.log = ['first'];</script>
+               <script nomodule>window.log.push('legacy-inline');</script>
+               <script nomodule="false" src="legacy.js"></script>
+               <script type="text/javascript" nomodule src="typed-legacy.js"></script>
+               <script src="current.js"></script>
+               <script>window.log.push('last');</script>"#).unwrap();
+        assert_eq!(frame.external_script_urls(&mut parent),
+            vec!["https://child.example/frame/current.js"]);
+        let loaded = RefCell::new(Vec::new());
+        let problems = frame.run_document_scripts(&mut parent, |url| {
+            loaded.borrow_mut().push(url.to_owned());
+            Some("window.log.push('external');".into())
+        });
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(*loaded.borrow(), vec!["https://child.example/frame/current.js"]);
+        assert_eq!(frame.evaluate(&mut parent, "window.log").unwrap(),
+            serde_json::json!(["first", "external", "last"]));
     }
 
     #[tokio::test(flavor = "current_thread")]

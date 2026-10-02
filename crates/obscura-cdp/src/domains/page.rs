@@ -554,14 +554,22 @@ fn encode_long_full_page_png(
 pub(crate) async fn prepare_capture_resources_if_requested(
     page: &mut obscura_browser::Page,
 ) {
-    let Some(deadline_ms) = std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
+    match std::env::var("OBSCURA_RENDER_RESOURCE_DEADLINE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value != 0)
-    else {
-        return;
-    };
-    let _ = page.prepare_screenshot_resources(deadline_ms).await;
+    {
+        Some(0) => {}
+        Some(deadline_ms) => {
+            let _ = page.prepare_screenshot_resources(deadline_ms).await;
+        }
+        // Captures never start loads of their own. Navigation keeps images
+        // loading in the background after its font warmup, so a capture waits
+        // (up to 1 s, the budget the navigation warmups used to spend) for the
+        // loads already in flight, and returns at once when there are none.
+        None => {
+            let _ = page.wait_for_in_flight_render_resources(1_000).await;
+        }
+    }
 }
 
 #[cfg(feature = "render")]
@@ -874,6 +882,132 @@ fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
                 .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
 }
 
+// Network subscriptions belong to attached sessions, not to the session that
+// happened to evaluate a form submission. Page/Runtime events retain their routes.
+fn route_network_events(
+    ctx: &mut CdpContext, page_id: &str, start: usize,
+    network_events: &[obscura_browser::NetworkEvent],
+) {
+    let continued: std::collections::HashMap<&str, Option<String>> = network_events.iter()
+        .filter(|event| event.intercepted)
+        .map(|event| (event.request_id.as_str(), ctx.intercepted_network_requests
+            .remove(&(page_id.to_string(), event.request_id.clone()))))
+        .collect();
+    let sessions = ctx.network_sessions_for_page(page_id);
+    let events = ctx.pending_events.split_off(start);
+    for event in events {
+        if event.method.starts_with("Network.") {
+            let previous_owner = event.params.get("requestId").and_then(Value::as_str)
+                .and_then(|request| continued.get(request));
+            // Missing provenance means the cap dropped this completion, or it
+            // belongs to a retired/different page. Do not fabricate routing.
+            if previous_owner == Some(&None) { continue; }
+            for session in &sessions {
+                if event.method == "Network.requestWillBeSent"
+                    && previous_owner.is_some_and(|owner| owner.as_ref() == Some(session))
+                { continue; }
+                ctx.pending_events.push(CdpEvent {
+                    method: event.method.clone(),
+                    params: event.params.clone(),
+                    session_id: Some(session.clone()),
+                });
+            }
+        } else {
+            ctx.pending_events.push(event);
+        }
+    }
+}
+
+fn transport_response(hop: &obscura_net::client::NavigationExchange) -> Value {
+    json!({"url": hop.request.url.as_str(), "status": hop.status, "statusText": "",
+        "headers": hop.response_headers, "mimeType": hop.response_headers.get("content-type").cloned().unwrap_or_default()})
+}
+
+// Each vector is one HTTP redirect chain. Client-side navigation starts a new
+// loader; the last chain is the document committed by emit_navigation_events.
+fn transport_navigation_events(
+    chains: &[Vec<obscura_net::client::NavigationExchange>],
+    frame_id: &str,
+    loader_id: &str,
+    last_is_document: bool,
+) -> (Vec<CdpEvent>, Vec<CdpEvent>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for (index, chain) in chains.iter().enumerate() {
+        let last_chain = last_is_document && index + 1 == chains.len();
+        let id = if last_chain {
+            loader_id.to_string()
+        } else {
+            format!("{loader_id}-navigation-{index}")
+        };
+        for (hop_index, hop) in chain.iter().enumerate() {
+            let mut request = json!({"url": hop.request.url.as_str(), "method": hop.request.method,
+                "headers": hop.request.headers, "hasPostData": hop.has_post_data});
+            if let Some(body) = &hop.post_data {
+                use base64::Engine as _;
+                request["postData"] = json!(body);
+                // Current CDP clients consume the byte entries rather than
+                // the deprecated text field. Only advertise captured bytes.
+                request["postDataEntries"] = json!([{
+                    "bytes": base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
+                }]);
+            }
+            let mut params = json!({"requestId": id, "loaderId": id, "documentURL": hop.request.url.as_str(),
+                "request": request, "timestamp": hop.timestamp, "wallTime": hop.timestamp,
+                "initiator": {"type":"other"}, "type":"Document", "frameId":frame_id});
+            if hop_index > 0 && chain[hop_index - 1].status.is_some() {
+                params["redirectResponse"] = transport_response(&chain[hop_index - 1]);
+                params["redirectHasExtraInfo"] = json!(false);
+            }
+            before.push(CdpEvent {
+                method: "Network.requestWillBeSent".into(),
+                params,
+                session_id: None,
+            });
+        }
+        if let Some(last) = chain.last() {
+            let destination = if last_chain { &mut after } else { &mut before };
+            if last.status.is_some() {
+                destination.push(CdpEvent {
+                    method: "Network.responseReceived".into(),
+                    params: json!({"requestId":id,"loaderId":id,"timestamp":last.timestamp,
+                        "type":"Document","response":transport_response(last),"frameId":frame_id}),
+                    session_id: None,
+                });
+            }
+            if last.failed {
+                destination.push(CdpEvent {
+                    method: "Network.loadingFailed".into(),
+                    params: json!({"requestId":id,"timestamp":last.timestamp,"type":"Document",
+                        "errorText":"net::ERR_FAILED","canceled":false}),
+                    session_id: None,
+                });
+            } else if let Some(bytes) = last.response_body_size {
+                destination.push(CdpEvent {method:"Network.loadingFinished".into(),
+                    params:json!({"requestId":id,"timestamp":last.timestamp,"encodedDataLength":bytes}),session_id:None});
+            }
+        }
+    }
+    (before, after)
+}
+
+pub(crate) fn emit_failed_navigation_events(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    frame_id: &str,
+    loader_id: &str,
+) {
+    let chains = ctx
+        .get_page_mut(page_id)
+        .map(|page| page.take_navigation_exchanges())
+        .unwrap_or_default();
+    let (before, after) = transport_navigation_events(&chains, frame_id, loader_id, true);
+    let start = ctx.pending_events.len();
+    ctx.pending_events.extend(before);
+    ctx.pending_events.extend(after);
+    route_network_events(ctx, page_id, start, &[]);
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -889,6 +1023,12 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    let event_start = ctx.pending_events.len();
+    let chains = ctx.get_page_mut(page_id).map(|page|page.take_navigation_exchanges()).unwrap_or_default();
+    let has_transport_trace = chains.last().and_then(|chain|chain.last())
+        .is_some_and(|hop|hop.request.url.as_str()==page_url);
+    let (transport_before, transport_after) = transport_navigation_events(&chains,frame_id,loader_id,has_transport_trace);
+    ctx.pending_events.extend(transport_before);
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
@@ -938,7 +1078,7 @@ pub fn emit_navigation_events(
 
     // Playwright needs `Network.requestWillBeSent` for the main document to
     // arrive BEFORE `Page.frameNavigated` (issue #190).
-    if let Some(idx) = nav_idx {
+    if let Some(idx) = nav_idx.filter(|_| !has_transport_trace) {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
@@ -1022,9 +1162,11 @@ pub fn emit_navigation_events(
         }
     }
 
+    ctx.pending_events.extend(transport_after);
     for (i, net_event) in network_events.iter().enumerate() {
+        if has_transport_trace && Some(i) == nav_idx { continue; }
         let rid = &nav_request_ids[i];
-        if Some(i) != nav_idx && !net_event.intercepted {
+        if Some(i) != nav_idx {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
                 params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
@@ -1109,6 +1251,7 @@ pub fn emit_navigation_events(
             }
         }),
     ));
+    route_network_events(ctx,page_id,event_start,network_events);
 }
 
 pub(crate) fn emit_same_document_navigation(
@@ -1139,6 +1282,7 @@ pub(crate) fn emit_runtime_network_events(
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
 ) {
+    let event_start = ctx.pending_events.len();
     if network_events.is_empty() {
         return;
     }
@@ -1149,27 +1293,25 @@ pub(crate) fn emit_runtime_network_events(
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
     for network_event in network_events {
         let request_id = &network_event.request_id;
-        if !network_event.intercepted {
-            ctx.pending_events.push(CdpEvent {
-                method: "Network.requestWillBeSent".into(),
-                params: json!({
-                    "requestId": request_id,
-                    "loaderId": loader_id,
-                    "documentURL": page_url,
-                    "request": {
-                        "url": network_event.url,
-                        "method": network_event.method,
-                        "headers": network_event.headers,
-                    },
-                    "timestamp": network_event.timestamp,
-                    "wallTime": network_event.timestamp,
-                    "initiator": {"type": "script"},
-                    "type": network_event.resource_type,
-                    "frameId": frame_id,
-                }),
-                session_id: session_id.clone(),
-            });
-        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(),
+            params: json!({
+                "requestId": request_id,
+                "loaderId": loader_id,
+                "documentURL": page_url,
+                "request": {
+                    "url": network_event.url,
+                    "method": network_event.method,
+                    "headers": network_event.headers,
+                },
+                "timestamp": network_event.timestamp,
+                "wallTime": network_event.timestamp,
+                "initiator": {"type": "script"},
+                "type": network_event.resource_type,
+                "frameId": frame_id,
+            }),
+            session_id: session_id.clone(),
+        });
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({
@@ -1201,6 +1343,7 @@ pub(crate) fn emit_runtime_network_events(
             session_id: session_id.clone(),
         });
     }
+    route_network_events(ctx,page_id,event_start,network_events);
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1265,6 +1408,9 @@ async fn do_navigate(
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
+    let (previous_page, previous_generation) = ctx.get_session_page(session_id)
+        .map(|page| (page.id.clone(), page.network_document_generation())).ok_or("No page for session")?;
+    let previous_requests = ctx.take_intercepted_network_requests(&previous_page);
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
             .get_session_page_mut(session_id)
@@ -1282,14 +1428,17 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
-                .await
-                .map_err(|e| e.to_string())?;
+        let result = if nav_method == "POST" {
+            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await
         } else {
-            page.navigate_with_wait(url, wait_until)
-                .await
-                .map_err(|e| e.to_string())?;
+            page.navigate_with_wait(url, wait_until).await
+        };
+        if let Err(error) = result {
+            let page_id=page.id.clone();
+            let unchanged = page.network_document_generation() == previous_generation;
+            if unchanged { ctx.restore_intercepted_network_requests(&previous_page, previous_requests); }
+            emit_failed_navigation_events(ctx,&page_id,&frame_id,&loader_id);
+            return Err(error.to_string());
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
@@ -1387,6 +1536,9 @@ pub async fn handle(
                 .get_session_page(session_id)
                 .map(|p| p.url_string())
                 .unwrap_or_else(|| "about:blank".to_string());
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.mark_next_navigation_reload();
+            }
             let reload_params = json!({
                 "waitUntil": params.get("waitUntil").cloned().unwrap_or(json!("load"))
             });
@@ -2064,12 +2216,65 @@ mod tests {
     }
 
     #[test]
+    fn continued_network_provenance_is_page_scoped_bounded_and_retired() {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let other = ctx.create_page();
+        for (session, target) in [("owner", &page), ("audit", &page), ("disabled", &page), ("foreign", &other)] {
+            ctx.sessions.insert(session.into(), target.clone());
+            if session != "disabled" { ctx.network_enabled_sessions.insert(session.into()); }
+        }
+        let event = |id: &str, cdp: bool| obscura_browser::NetworkEvent {
+            intercepted: cdp, request_id: id.into(), url: "https://fixture.test/asset".into(),
+            method: "GET".into(), resource_type: "Fetch".into(), status: 200,
+            headers: Default::default(), response_headers: std::sync::Arc::new(Default::default()),
+            body_size: 36, timestamp: 42.0,
+        };
+        ctx.note_intercepted_network_request(&page, "intercept-1", "owner");
+        ctx.note_intercepted_network_request(&other, "intercept-1", "foreign");
+        emit_runtime_network_events(&mut ctx, &Some("owner".into()), "frame", "https://fixture.test/", &page, &[event("intercept-1", true)]);
+        assert_eq!(ctx.pending_events.iter().filter(|e| e.session_id.as_deref() == Some("owner")).count(), 2);
+        assert_eq!(ctx.pending_events.iter().filter(|e| e.session_id.as_deref() == Some("audit")).count(), 3);
+        assert!(ctx.pending_events.iter().all(|e| matches!(e.session_id.as_deref(), Some("owner" | "audit"))));
+        assert!(ctx.intercepted_network_requests.contains_key(&(other.clone(), "intercept-1".into())));
+        ctx.pending_events.clear();
+        // A detached/disabled original owner must not be replaced by an arbitrary
+        // observer; remaining enabled subscribers still get a coherent request.
+        ctx.note_intercepted_network_request(&page, "detached", "owner");
+        ctx.sessions.remove("owner");ctx.network_enabled_sessions.remove("owner");
+        emit_runtime_network_events(&mut ctx, &Some("audit".into()), "frame", "https://fixture.test/", &page, &[event("detached", true)]);
+        assert_eq!(ctx.pending_events.len(), 3);
+        assert!(ctx.pending_events.iter().all(|e| e.session_id.as_deref() == Some("audit")));
+        ctx.pending_events.clear();
+        // Embedder interception has no CDP provenance and must remain observable.
+        emit_runtime_network_events(&mut ctx, &Some("audit".into()), "frame", "https://fixture.test/", &page, &[event("embedder", false)]);
+        assert_eq!(ctx.pending_events.len(), 3);ctx.pending_events.clear();
+        for index in 0..4096 { ctx.note_intercepted_network_request(&page, &format!("cap-{index}"), "owner"); }
+        assert_eq!(ctx.intercepted_network_requests.len(), 4096);
+        assert!(!ctx.intercepted_network_requests.contains_key(&(page.clone(), "cap-4095".into())));
+        emit_runtime_network_events(&mut ctx, &Some("audit".into()), "frame", "https://fixture.test/", &page, &[event("cap-4095", true)]);
+        assert!(ctx.pending_events.is_empty(), "cap must not invent request/response identity");
+        ctx.note_intercepted_network_request(&page, "cap-0", "audit");
+        emit_runtime_network_events(&mut ctx, &Some("audit".into()), "frame", "https://fixture.test/", &page, &[event("cap-0", true)]);
+        assert_eq!(ctx.pending_events.len(), 2);ctx.pending_events.clear();
+        let prior = ctx.take_intercepted_network_requests(&page);
+        assert_eq!(ctx.intercepted_network_requests.len(), 1);
+        ctx.restore_intercepted_network_requests(&page, prior);
+        assert_eq!(ctx.intercepted_network_requests.len(), 4095);
+        ctx.remove_page(&page);
+        assert_eq!(ctx.intercepted_network_requests.len(), 1);
+        ctx.remove_page(&other);
+        assert!(ctx.intercepted_network_requests.is_empty());
+    }
+
+    #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
             .insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.network_enabled_sessions.insert(session_id.clone().unwrap());
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
@@ -2112,7 +2317,10 @@ mod tests {
 
         // Live interception already sent requestWillBeSent/requestPaused.
         // Replaying either leaves Playwright waiting for a second request.
+        // The pause recorded its owner session, as emit_intercepted_request does.
         ctx.pending_events.clear();
+        let owner = session_id.clone().unwrap();
+        ctx.note_intercepted_network_request(&page_id, "fetch-7", &owner);
         let event = obscura_browser::NetworkEvent { intercepted: true, ..event };
         emit_runtime_network_events(
             &mut ctx, &session_id, "frame-1", "https://example.test/", &page_id,
@@ -2124,6 +2332,7 @@ mod tests {
 
         ctx.pending_events.clear();
         ctx.fetch_intercept.enabled = true;
+        ctx.note_intercepted_network_request(&page_id, "fetch-7", &owner);
         emit_navigation_events(
             &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
             &page_id, &[event], WaitUntil::Load, true,
@@ -2171,6 +2380,7 @@ mod tests {
             let page_id = ctx.create_page();
             let session_id = Some(format!("{page_id}-session"));
             ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+            ctx.network_enabled_sessions.insert(session_id.clone().unwrap());
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.iter().map(|p| p.to_string()).collect();
             emit_navigation_events(
@@ -2958,6 +3168,12 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit nonblocking mode on macOS.
+                        // Wait for request bytes, but bound a stalled fixture client.
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                            .unwrap();
                         let mut request = [0u8; 2048];
                         let _ = stream.read(&mut request);
                         observed.fetch_add(1, Ordering::SeqCst);
@@ -3706,3 +3922,7 @@ mod tests {
         assert_eq!(info["canAccessOpener"], json!(false));
     }
 }
+
+#[cfg(test)]
+#[path = "navigation_network_tests.rs"]
+mod navigation_network_tests;

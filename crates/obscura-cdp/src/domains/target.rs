@@ -246,6 +246,7 @@ pub async fn handle(
                 let page_id = ctx.sessions.remove(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
+                ctx.network_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
                     let params = json!({"sessionId": session_id, "targetId": page_id});

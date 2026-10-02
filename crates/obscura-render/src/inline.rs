@@ -67,6 +67,12 @@ const SYSTEM_FAMILY: &str = "DejaVu Sans";
 /// large, and loading it for every page would spend RSS and startup time even
 /// when no emoji can be shaped.
 pub(crate) fn text_may_need_emoji_font(text: &str) -> bool {
+    // Every candidate below is outside ASCII. Layout runs this over every text
+    // node, including large inline scripts, so reject ASCII text with the
+    // vectorized check instead of matching each character.
+    if text.is_ascii() {
+        return false;
+    }
     text.chars().any(|ch| {
         matches!(
             ch,
@@ -1079,6 +1085,8 @@ struct ReplacedItem {
     preferred_width: Option<f32>,
     preferred_height: Option<f32>,
     preferred_ratio: f32,
+    /// A zero-axis canvas has definite dimensions but no natural ratio.
+    independent_axes: bool,
     min_width: Option<f32>,
     min_height: Option<f32>,
     max_width: Option<f32>,
@@ -1133,13 +1141,14 @@ impl ReplacedItem {
         ReplacedItem {
             intrinsic_width: intrinsic
                 .width
-                .filter(|width| width.is_finite() && *width > 0.0),
+                .filter(|width| width.is_finite() && (*width > 0.0 || (intrinsic.canvas_bitmap && *width == 0.0))),
             intrinsic_height: intrinsic
                 .height
-                .filter(|height| height.is_finite() && *height > 0.0),
+                .filter(|height| height.is_finite() && (*height > 0.0 || (intrinsic.canvas_bitmap && *height == 0.0))),
             preferred_width: px(style.width),
             preferred_height: px(style.height),
             preferred_ratio: explicit_ratio.unwrap_or(intrinsic_ratio),
+            independent_axes: intrinsic.canvas_bitmap && explicit_ratio.is_none(),
             min_width: px(style.min_width),
             min_height: px(style.min_height),
             max_width: px(style.max_width),
@@ -1210,6 +1219,14 @@ impl ReplacedItem {
     }
 
     fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
+        if self.independent_axes {
+            return taffy::Size {
+                width: Self::clamp(known.width.or(self.preferred_width)
+                    .or(self.intrinsic_width).unwrap_or(0.0), self.min_width, self.max_width),
+                height: Self::clamp(known.height.or(self.preferred_height)
+                    .or(self.intrinsic_height).unwrap_or(0.0), self.min_height, self.max_height),
+            };
+        }
         let (width, height) = match (known.width, known.height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (width, width / self.preferred_ratio),
@@ -1249,6 +1266,17 @@ impl ReplacedItem {
             }
         }
     }
+}
+
+pub(crate) fn constrained_intrinsic_replaced_size(
+    intrinsic: crate::ReplacedIntrinsic,
+    style: &LayoutStyle,
+) -> taffy::Size<f32> {
+    if !intrinsic.canvas_bitmap {
+        let (width, height) = intrinsic.natural_size().unwrap_or((300.0, 150.0));
+        return constrained_auto_replaced_size(width, height, style);
+    }
+    ReplacedItem::from_intrinsic(intrinsic, style).size(taffy::Size { width: None, height: None })
 }
 
 pub(crate) fn constrained_auto_replaced_size(
@@ -4301,6 +4329,49 @@ mod tests {
     }
 
     #[test]
+    fn zero_axis_canvas_keeps_independent_natural_and_css_dimensions() {
+        let unknown = taffy::Size { width: None, height: None };
+        for (width, height) in [(0, 0), (0, 12), (20, 0)] {
+            let intrinsic = crate::ReplacedIntrinsic::from_canvas_dimensions(width, height);
+            assert_eq!(intrinsic.natural_size(), Some((width as f32, height as f32)));
+            let mut style = LayoutStyle::default();
+            let item = ReplacedItem::from_intrinsic(intrinsic, &style);
+            assert_eq!(item.size(unknown), taffy::Size { width: width as f32, height: height as f32 });
+            assert_eq!(item.size(taffy::Size { width: Some(40.0), height: None }),
+                taffy::Size { width: 40.0, height: height as f32 });
+            assert_eq!(item.size(taffy::Size { width: None, height: Some(30.0) }),
+                taffy::Size { width: width as f32, height: 30.0 });
+            style.width = Dimension::Px(50.0);
+            assert_eq!(ReplacedItem::from_intrinsic(intrinsic, &style).size(unknown),
+                taffy::Size { width: 50.0, height: height as f32 });
+            style.width = Dimension::Auto;
+            style.height = Dimension::Px(25.0);
+            assert_eq!(ReplacedItem::from_intrinsic(intrinsic, &style).size(unknown),
+                taffy::Size { width: width as f32, height: 25.0 });
+        }
+    }
+
+    #[test]
+    fn zero_axis_canvas_honors_constraints_and_explicit_css_ratio() {
+        let intrinsic = crate::ReplacedIntrinsic::from_canvas_dimensions(0, 12);
+        let mut style = LayoutStyle::default();
+        style.min_width = Dimension::Px(8.0);
+        style.max_width = Dimension::Px(3.0);
+        style.max_height = Dimension::Px(10.0);
+        assert_eq!(constrained_intrinsic_replaced_size(intrinsic, &style),
+            taffy::Size { width: 8.0, height: 10.0 });
+        style = LayoutStyle::default();
+        style.aspect_ratio = Some(4.0);
+        style.width = Dimension::Px(40.0);
+        assert_eq!(constrained_intrinsic_replaced_size(intrinsic, &style),
+            taffy::Size { width: 40.0, height: 10.0 });
+        style.width = Dimension::Auto;
+        style.height = Dimension::Px(15.0);
+        assert_eq!(constrained_intrinsic_replaced_size(intrinsic, &style),
+            taffy::Size { width: 60.0, height: 15.0 });
+    }
+
+    #[test]
     fn partial_replaced_intrinsics_use_the_default_object_axis() {
         let unknown = taffy::Size {
             width: None,
@@ -4309,6 +4380,7 @@ mod tests {
         let style = LayoutStyle::default();
         let width_only = ReplacedItem::from_intrinsic(
             crate::ReplacedIntrinsic {
+                canvas_bitmap: false,
                 width: Some(100.0),
                 height: None,
                 ratio: None,
@@ -4320,6 +4392,7 @@ mod tests {
 
         let height_only = ReplacedItem::from_intrinsic(
             crate::ReplacedIntrinsic {
+                canvas_bitmap: false,
                 width: None,
                 height: Some(100.0),
                 ratio: None,
@@ -5409,6 +5482,9 @@ gamma</div>"#,
     #[test]
     fn emoji_font_is_loaded_only_for_emoji_documents() {
         assert!(!text_may_need_emoji_font("Plain text and arrows ->"));
+        assert!(!text_may_need_emoji_font(&"var a = 1; // ascii script text\n".repeat(4096)));
+        assert!(!text_may_need_emoji_font("Café, naïve, 日本語 — no emoji"));
+        assert!(text_may_need_emoji_font("Trade mark \u{2122} sign"));
         assert!(text_may_need_emoji_font("Add ➕ or remove ➖"));
         assert!(text_may_need_emoji_font("Launch 🚀"));
 

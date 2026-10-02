@@ -98,6 +98,8 @@ mod paint;
 #[cfg(feature = "paint")]
 pub use tiny_skia::Pixmap;
 #[cfg(feature = "paint")]
+pub mod image_pixels;
+#[cfg(feature = "paint")]
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
@@ -299,6 +301,29 @@ pub mod inline {
             "meter" => Some((font_size * 5.0, font_size)),
             _ => None,
         }
+    }
+
+    pub(crate) fn constrained_intrinsic_replaced_size(
+        intrinsic: crate::ReplacedIntrinsic,
+        style: &crate::LayoutStyle,
+    ) -> taffy::Size<f32> {
+        let (width, height) = intrinsic.natural_size().unwrap_or((300.0, 150.0));
+        if intrinsic.canvas_bitmap && intrinsic.ratio.is_none()
+            && !style.aspect_ratio.is_some_and(|ratio| ratio.is_finite() && ratio > 0.0)
+        {
+            let axis = |natural: f32, preferred, min, max| {
+                let px = |dimension| match dimension {
+                    crate::Dimension::Px(value) => Some(value.max(0.0)), _ => None,
+                };
+                px(preferred).unwrap_or(natural)
+                    .min(px(max).unwrap_or(f32::INFINITY)).max(px(min).unwrap_or(0.0))
+            };
+            return taffy::Size {
+                width: axis(width, style.width, style.min_width, style.max_width),
+                height: axis(height, style.height, style.min_height, style.max_height),
+            };
+        }
+        constrained_auto_replaced_size(width, height, style)
     }
 
     pub(crate) fn constrained_auto_replaced_size(
@@ -1646,6 +1671,8 @@ pub(crate) struct BorderCascadeOp {
 /// declare one dimension, both dimensions, or only a `viewBox` ratio.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ReplacedIntrinsic {
+    /// Canvas bitmap axes are definite even when zero; image fallback rules do not apply.
+    pub(crate) canvas_bitmap: bool,
     pub(crate) width: Option<f32>,
     pub(crate) height: Option<f32>,
     pub(crate) ratio: Option<f32>,
@@ -1654,6 +1681,7 @@ pub(crate) struct ReplacedIntrinsic {
 impl ReplacedIntrinsic {
     pub fn from_dimensions(width: f32, height: f32) -> Self {
         Self {
+            canvas_bitmap: false,
             width: Some(width),
             height: Some(height),
             ratio: (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
@@ -1661,10 +1689,18 @@ impl ReplacedIntrinsic {
         }
     }
 
+    #[cfg(feature = "paint")]
+    pub fn from_canvas_dimensions(width: u32, height: u32) -> Self {
+        Self { canvas_bitmap: true, ..Self::from_dimensions(width as f32, height as f32) }
+    }
+
     /// Resolve the concrete natural size from CSS Images' 300x150 default
     /// object size. A definite authored layout axis still overrides this
     /// fallback and transfers through the intrinsic ratio.
     pub fn natural_size(self) -> Option<(f32, f32)> {
+        if self.canvas_bitmap {
+            return self.width.zip(self.height);
+        }
         let width = self.width.filter(|value| value.is_finite() && *value > 0.0);
         let height = self
             .height

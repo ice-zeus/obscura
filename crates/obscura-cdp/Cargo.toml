@@ -10,6 +10,8 @@ autotests = false
 name = "integration"
 
 [features]
+# Opt in to real ANGLE graphics; default feature sets remain unchanged.
+webgl = ["render", "obscura-browser/webgl"]
 default = []
 stealth = ["obscura-browser/stealth"]
 # Enable Page.captureScreenshot via obscura-render. Propagates render to

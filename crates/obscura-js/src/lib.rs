@@ -1,5 +1,16 @@
 pub mod cdp_watchdog;
+pub mod fingerprint;
+mod stack_trace;
 pub mod frame;
+mod host_state;
+#[cfg(feature = "webgl")]
+mod webgl_ops;
+#[cfg(feature = "webgl")]
+mod image_security;
+#[cfg(test)]
+mod host_state_tests;
+#[cfg(test)]
+mod script_nomodule_tests;
 mod import_map;
 pub mod markdown;
 pub mod module_loader;
