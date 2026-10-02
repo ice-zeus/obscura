@@ -757,7 +757,11 @@ impl StealthHttpClient {
             // preferences. If it marks an accepted hint critical that this
             // request lacked, Chrome restarts the navigation once with it.
             if request.mode == RequestMode::Navigate && request.destination() == "document" {
-                let header = |name: &str| resp.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_string);
+                // Every field line counts: Google sends one Accept-CH line per hint.
+                let header = |name: &str| {
+                    let values: Vec<&str> = resp.headers().get_all(name).iter().filter_map(|value| value.to_str().ok()).collect();
+                    (!values.is_empty()).then(|| values.join(", "))
+                };
                 self.client_hints.accept(&current_url, header("accept-ch").as_deref());
                 if !status.is_redirection() && !restarted_once {
                     if let Some(critical) = header("critical-ch") {

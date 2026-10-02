@@ -147,6 +147,23 @@ async fn accepted_hints_reach_later_navigations_and_same_origin_subresources() {
 }
 
 #[tokio::test]
+async fn every_accept_ch_field_line_counts() {
+    // Google sends one Accept-CH line per hint.
+    let server = Server::new(|path| {
+        if path == "/lines" { "Accept-CH: Sec-CH-Prefers-Color-Scheme\r\nAccept-CH: Downlink\r\nAccept-CH: Sec-CH-UA-Arch, RTT\r\n" } else { "" }
+    });
+    let client = client();
+    client.fetch(&server.url("127.0.0.1", "/lines")).await.unwrap();
+    client.fetch(&server.url("127.0.0.1", "/next")).await.unwrap();
+    let seen = server.take();
+    let next = &seen[1].1;
+    assert_eq!(value(next, "sec-ch-prefers-color-scheme"), Some("light"));
+    assert_eq!(value(next, "downlink"), Some("10"));
+    assert_eq!(value(next, "rtt"), Some("50"));
+    assert_eq!(value(next, "sec-ch-ua-arch"), Some("\"x86\""));
+}
+
+#[tokio::test]
 async fn critical_hint_restarts_the_navigation_once_with_hints_after_accept() {
     let server = Server::new(|_| "Accept-CH: Sec-CH-Prefers-Color-Scheme\r\nCritical-CH: Sec-CH-Prefers-Color-Scheme\r\n");
     let client = client();
