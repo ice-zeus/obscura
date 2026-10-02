@@ -124,7 +124,8 @@ pub(crate) fn header_map_order<'a>(names: &[&'a str]) -> Vec<&'a str> {
         place(&mut table, name);
         count += 1;
         if count * 2 >= table.len() {
-            let old = std::mem::replace(&mut table, vec![None; table.len() * 2]);
+            let size = table.len() * 2;
+            let old = std::mem::replace(&mut table, vec![None; size]);
             for entry in old.into_iter().flatten() {
                 place(&mut table, entry);
             }
