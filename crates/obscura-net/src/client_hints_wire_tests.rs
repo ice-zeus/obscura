@@ -92,9 +92,14 @@ fn client() -> StealthHttpClient {
     StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true)
 }
 
-/// Header names in wire order, without the `Host` line the transport adds.
+/// Header names in wire order, without the `Host` and `Connection` lines
+/// HTTP/1.1 adds first.
 fn names(headers: &[(String, String)]) -> Vec<&str> {
-    headers.iter().map(|(name, _)| name.as_str()).filter(|name| !name.eq_ignore_ascii_case("host")).collect()
+    headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !name.eq_ignore_ascii_case("host") && !name.eq_ignore_ascii_case("connection"))
+        .collect()
 }
 
 fn value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {

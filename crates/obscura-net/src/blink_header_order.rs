@@ -60,7 +60,9 @@ fn rapidhash_case_folded(name: &[u8]) -> u64 {
             let delta = ((len & 24) >> (len >> 3)) / 2;
             b = (read32(name, delta) << 32) | read32(name, last - delta);
         } else if len > 0 {
-            a = fold(name[0]);
+            // A single UTF-16 unit: bytes [low, 0], so p[len >> 1] and
+            // p[len - 1] are both the zero high byte.
+            a = fold(name[0]) << 56;
             b = 0;
         } else {
             a = 0;
@@ -89,8 +91,9 @@ fn rapidhash_case_folded(name: &[u8]) -> u64 {
                 seed = mix(read64(name, p + 8) ^ SECRET[2], read64(name, p + 12) ^ seed);
             }
         }
-        a = read64(name, p + (remaining - 16) / 2);
-        b = read64(name, p + (remaining - 8) / 2);
+        // The last 16 bytes, which may reach back into the consumed blocks.
+        a = read64(name, p + remaining / 2 - 8);
+        b = read64(name, p + remaining / 2 - 4);
     }
     a ^= SECRET[1];
     b ^= seed;
