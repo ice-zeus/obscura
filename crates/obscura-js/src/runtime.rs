@@ -12673,33 +12673,44 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn fixed_flex_image_resource_arrival_still_rebuilds_geometry() {
-        let dom = parse_html(
-            r#"<html><body><div style="display:flex">
-                <img id="hero" src="http://example.test/flex.png"
-                     style="width:20px;height:10px">
-            </div></body></html>"#,
-        );
-        let mut rt = ObscuraJsRuntime::new();
-        rt.set_dom(dom);
-        rt.set_url("http://example.test/page");
-        rt.state.borrow_mut().render_resources =
-            obscura_render::RenderResourceCache::with_loader(|_: &str| None);
-        rt.run_page_init();
-        rt.evaluate("hero.getBoundingClientRect().width")
-            .expect("prepare flex geometry");
-        assert!(rt.state.borrow().resolved_scroll.is_some());
+        // A shrinking line consults the item's automatic minimum size, which
+        // follows the natural size; a fixed item alone in a wide line does not.
+        for (line, rebuilds) in [
+            (r#"<div style="display:flex;width:30px">
+                <img id="hero" src="http://example.test/flex.png" style="width:20px;height:10px">
+                <span style="display:block;width:60px"></span></div>"#, true),
+            (r#"<div style="display:flex">
+                <img id="hero" src="http://example.test/flex.png" style="width:20px;height:10px">
+                </div>"#, false),
+        ] {
+            let dom = parse_html(&format!("<html><body>{line}</body></html>"));
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(dom);
+            rt.set_url("http://example.test/page");
+            rt.state.borrow_mut().render_resources =
+                obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+            rt.run_page_init();
+            rt.evaluate("hero.getBoundingClientRect().width")
+                .expect("prepare flex geometry");
+            assert!(rt.state.borrow().resolved_scroll.is_some());
 
-        rt.seed_render_image_resource(
-            "http://example.test/flex.png".to_string(),
-            crate::ops::ImageRequestProfile::NoCorsInclude,
-            Some(two_by_three_png()),
-        );
-        let state = rt.state.borrow();
-        assert_eq!(
-            state.pending_style_mutations,
-            vec![obscura_render::RetainedStyleMutation::Resource]
-        );
-        assert!(state.resolved_scroll.is_none());
+            rt.seed_render_image_resource(
+                "http://example.test/flex.png".to_string(),
+                crate::ops::ImageRequestProfile::NoCorsInclude,
+                Some(two_by_three_png()),
+            );
+            let state = rt.state.borrow();
+            if rebuilds {
+                assert_eq!(
+                    state.pending_style_mutations,
+                    vec![obscura_render::RetainedStyleMutation::Resource]
+                );
+                assert!(state.resolved_scroll.is_none());
+            } else {
+                assert!(state.pending_style_mutations.is_empty(), "{line}");
+                assert!(state.resolved_scroll.is_some(), "{line}");
+            }
+        }
     }
 
     #[cfg(feature = "render")]
