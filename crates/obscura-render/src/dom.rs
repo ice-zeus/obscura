@@ -5213,30 +5213,7 @@ fn layout_dom_once(
     grow_trailing_auto_cells(tree, &mut styles);
 
     let descendants = tree.descendants(tree.document());
-    // Only text a box can shape matters. Text under an element without a box
-    // (script and style bodies by default, or any `display: none` parent) is
-    // skipped: result pages carry hundreds of kilobytes of non-ASCII inline
-    // script that every layout would otherwise scan character by character.
-    let needs_emoji_font = descendants.iter().any(|id| {
-        tree.with_node(*id, |node| match &node.data {
-            obscura_dom::tree::NodeData::Text { contents } => {
-                let shaped = node.parent.is_none_or(|parent| {
-                    styles.get(&parent).is_none_or(|style| style.display != crate::Display::None)
-                });
-                shaped && crate::inline::text_may_need_emoji_font(contents)
-            }
-            _ => false,
-        }).unwrap_or(false)
-    }) || styles.values().any(|style| {
-        style
-            .before_content
-            .as_deref()
-            .is_some_and(crate::inline::text_may_need_emoji_font)
-            || style
-                .after_content
-                .as_deref()
-                .is_some_and(crate::inline::text_may_need_emoji_font)
-    });
+    let needs_emoji_font = document_needs_emoji_font(tree, &descendants, &styles);
 
     // The leaf context is the index of a cosmic-text inline formatting
     // context in `engine`; leaves without text carry no context.
@@ -9820,6 +9797,39 @@ fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
 /// comments and other node kinds are not. When no node is assigned, the slot's
 /// ordinary children remain its fallback content.
 /// Return the flattened-tree children that generate boxes for `id`.
+/// Whether any text a box can shape, or any generated content, may request
+/// emoji presentation. Text whose parent element generates no box (script
+/// and style bodies by default, or any `display: none` parent) is never
+/// shaped and is skipped: result pages carry hundreds of kilobytes of
+/// non-ASCII inline script that every layout would otherwise scan character
+/// by character.
+fn document_needs_emoji_font(
+    tree: &DomTree,
+    descendants: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    descendants.iter().any(|id| {
+        tree.with_node(*id, |node| match &node.data {
+            obscura_dom::tree::NodeData::Text { contents } => {
+                let shaped = node.parent.is_none_or(|parent| {
+                    styles.get(&parent).is_none_or(|style| style.display != crate::Display::None)
+                });
+                shaped && crate::inline::text_may_need_emoji_font(contents)
+            }
+            _ => false,
+        }).unwrap_or(false)
+    }) || styles.values().any(|style| {
+        style
+            .before_content
+            .as_deref()
+            .is_some_and(crate::inline::text_may_need_emoji_font)
+            || style
+                .after_content
+                .as_deref()
+                .is_some_and(crate::inline::text_may_need_emoji_font)
+    })
+}
+
 pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     if let Some(shadow_children) = tree.shadow_children(id) {
         // A shadow host's light children stay in the DOM but its box tree is
@@ -18019,6 +18029,24 @@ mod tests {
             &[mutation("aria-hidden"), mutation("ahbak"), mutation("data-tibak"), mutation("tabindex")]));
         assert!(!can_retain_layout_for_metadata(&tree, viewport, &mut cache,
             &[mutation("aria-hidden"), mutation("class")]));
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn emoji_face_is_needed_only_for_text_a_box_can_shape() {
+        for (case, html, needed) in [
+            ("script body", "<p>plain</p><script>var s = '\u{1F680} launch';</script>", false),
+            ("style body", "<style>p::after{content:'x'} /* \u{1F680} */</style><p>plain</p>", false),
+            ("hidden parent", "<div style='display:none'>\u{1F680}</div><p>plain</p>", false),
+            ("paragraph", "<p>launch \u{1F680}</p>", true),
+            ("displayed script", "<style>script{display:block}</style><script>// \u{1F680}</script>", true),
+            ("generated content", "<style>p::before{content:'\u{1F680}'}</style><p>plain</p>", true),
+        ] {
+            let tree = parse_html(&format!("<html><body>{html}</body></html>"));
+            let layout = layout_dom(&tree, (400.0, 300.0));
+            let descendants = tree.descendants(tree.document());
+            assert_eq!(document_needs_emoji_font(&tree, &descendants, &layout.styles), needed, "{case}");
+        }
     }
 
     #[test]
