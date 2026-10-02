@@ -4111,9 +4111,98 @@ fn retained_style_plan(
     }
 }
 
+/// Attribute names HTML, SVG or MathML define. A renderer may read any of
+/// them natively (geometry, form controls, resources, presentational hints),
+/// so a change to one of them never takes the metadata path below. Names
+/// outside this list are author or framework metadata (for example
+/// `jsaction`, or a page's own backup attributes) that only selectors and
+/// `attr()` can observe.
+const KNOWN_ATTRIBUTES: &[&str] = &[
+    // HTML, including obsolete presentational and frame attributes.
+    "abbr", "accept", "accept-charset", "accesskey", "action", "align", "alink", "allow",
+    "allowfullscreen", "alt", "archive", "as", "async", "autocapitalize", "autocomplete",
+    "autocorrect", "autofocus", "autoplay", "axis", "background", "behavior", "bgcolor",
+    "blocking", "border", "bordercolor", "bottommargin", "cellpadding", "cellspacing", "char",
+    "charoff", "charset", "checked", "cite", "class", "classid", "clear", "closedby", "code",
+    "codebase", "codetype", "color", "cols", "colspan", "command", "commandfor", "compact",
+    "content", "contenteditable", "controls", "coords", "crossorigin", "data", "datetime",
+    "declare", "decoding", "default", "defer", "dir", "direction", "dirname", "disabled",
+    "download", "draggable", "enctype", "enterkeyhint", "event", "exportparts", "face",
+    "fetchpriority", "for", "form", "formaction", "formenctype", "formmethod",
+    "formnovalidate", "formtarget", "frame", "frameborder", "headers", "height", "hidden",
+    "high", "href", "hreflang", "hspace", "http-equiv", "id", "imagesizes", "imagesrcset",
+    "inert", "inputmode", "integrity", "is", "ismap", "itemid", "itemprop", "itemref",
+    "itemscope", "itemtype", "kind", "label", "lang", "language", "leftmargin", "link", "list",
+    "loading", "longdesc", "loop", "low", "manifest", "marginheight", "marginwidth", "max",
+    "maxlength", "media", "method", "min", "minlength", "multiple", "muted", "name", "nohref",
+    "nomodule", "nonce", "noresize", "noshade", "novalidate", "nowrap", "object", "open",
+    "optimum", "part", "pattern", "ping", "placeholder", "playsinline", "popover",
+    "popovertarget", "popovertargetaction", "poster", "preload", "profile", "readonly",
+    "referrerpolicy", "rel", "required", "rev", "reversed", "rightmargin", "rows", "rowspan",
+    "rules", "sandbox", "scheme", "scope", "scrollamount", "scrolldelay", "scrolling",
+    "selected", "shadowrootclonable", "shadowrootcustomelementregistry",
+    "shadowrootdelegatesfocus", "shadowrootmode", "shadowrootserializable", "shape", "size",
+    "sizes", "slot", "span", "spellcheck", "src", "srcdoc", "srclang", "srcset", "standby",
+    "start", "step", "style", "summary", "target", "text", "title", "topmargin", "translate",
+    "truespeed", "type", "usemap", "valign", "value", "valuetype", "version", "vlink",
+    "vspace", "width", "wrap", "writingsuggestions", "xmlns", "xml:base", "xml:lang",
+    "xml:space", "xmlns:xlink", "xlink:actuate", "xlink:arcrole", "xlink:href", "xlink:role",
+    "xlink:show", "xlink:title", "xlink:type",
+    // SVG attributes and presentation attributes (compared lowercase).
+    "accent-height", "accumulate", "additive", "alignment-baseline", "amplitude",
+    "attributename", "attributetype", "azimuth", "basefrequency", "baseline-shift", "begin",
+    "bias", "by", "calcmode", "clip", "clip-path", "clippathunits", "clip-rule",
+    "color-interpolation", "color-interpolation-filters", "color-rendering", "cursor", "cx",
+    "cy", "d", "diffuseconstant", "display", "divisor", "dominant-baseline", "dur", "dx", "dy",
+    "edgemode", "elevation", "end", "exponent", "fill", "fill-opacity", "fill-rule", "filter",
+    "filterunits", "flood-color", "flood-opacity", "font-family", "font-size",
+    "font-size-adjust", "font-stretch", "font-style", "font-variant", "font-weight", "fr",
+    "from", "fx", "fy", "glyph-orientation-horizontal", "glyph-orientation-vertical",
+    "gradienttransform", "gradientunits", "image-rendering", "in", "in2", "intercept", "k",
+    "k1", "k2", "k3", "k4", "kernelmatrix", "kernelunitlength", "keypoints", "keysplines",
+    "keytimes", "lengthadjust", "letter-spacing", "lighting-color", "limitingconeangle",
+    "marker-end", "marker-mid", "marker-start", "markerheight", "markerunits", "markerwidth",
+    "mask", "mask-type", "maskcontentunits", "maskunits", "mode", "numoctaves", "offset",
+    "opacity", "operator", "order", "orient", "origin", "overflow", "paint-order", "path",
+    "pathlength", "patterncontentunits", "patterntransform", "patternunits",
+    "pointer-events", "points", "pointsatx", "pointsaty", "pointsatz", "preservealpha",
+    "preserveaspectratio", "primitiveunits", "r", "radius", "refx", "refy", "repeatcount",
+    "repeatdur", "requiredextensions", "requiredfeatures", "restart", "result", "rotate",
+    "rx", "ry", "scale", "seed", "shape-rendering", "side", "spacing", "specularconstant",
+    "specularexponent", "spreadmethod", "startoffset", "stddeviation", "stitchtiles",
+    "stop-color", "stop-opacity", "stroke", "stroke-dasharray", "stroke-dashoffset",
+    "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "stroke-opacity",
+    "stroke-width", "surfacescale", "systemlanguage", "tablevalues", "targetx", "targety",
+    "text-anchor", "text-decoration", "text-overflow", "text-rendering", "textlength", "to",
+    "transform", "transform-origin", "u1", "u2", "unicode-bidi", "values", "vector-effect",
+    "viewbox", "visibility", "white-space", "word-spacing", "writing-mode", "x", "x1", "x2",
+    "xchannelselector", "y", "y1", "y2", "ychannelselector", "z", "zoomandpan",
+    // MathML.
+    "accent", "accentunder", "columnalign", "columnlines", "columnspacing", "columnspan",
+    "definitionurl", "depth", "displaystyle", "encoding", "fence", "fontstyle", "fontweight",
+    "framespacing", "largeop", "linethickness", "lspace", "mathbackground", "mathcolor",
+    "mathsize", "mathvariant", "maxsize", "minsize", "movablelimits", "notation", "rowalign",
+    "rowlines", "rowspacing", "rspace", "scriptlevel", "separator", "stretchy", "symmetric",
+    "voffset",
+];
+
+/// Whether `name` is metadata that only selectors and `attr()` can observe:
+/// author `data-*` attributes, ARIA states and properties, `role`,
+/// `tabindex`, and names no markup language defines (framework metadata such
+/// as `jsaction`). Event handler content attributes (`on*`) run script but do
+/// not render.
+fn is_selector_only_metadata_attribute(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("data-")
+        || name.starts_with("aria-")
+        || matches!(name.as_str(), "role" | "tabindex")
+        || (!name.is_empty() && !KNOWN_ATTRIBUTES.contains(&name.as_str()))
+}
+
 /// Selector-only metadata cannot change layout or paint when the current
-/// stylesheet has no dependency on it. Keep this deliberately narrow:
-/// other zero-dirty attributes can still affect native geometry.
+/// stylesheet has no dependency on it. Keep this deliberately narrow: other
+/// zero-dirty attributes can still affect native geometry, so every attribute
+/// a markup language defines (`KNOWN_ATTRIBUTES`) is excluded.
 pub(crate) fn can_retain_layout_for_metadata(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -4123,11 +4212,7 @@ pub(crate) fn can_retain_layout_for_metadata(
     if mutations.is_empty()
         || !mutations.iter().all(|mutation| {
             matches!(mutation, RetainedStyleMutation::Attribute(attribute)
-                if (attribute.name.eq_ignore_ascii_case("tabindex")
-                    || attribute
-                        .name
-                        .get(..5)
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data-")))
+                if is_selector_only_metadata_attribute(&attribute.name)
                     && retained_attribute_mutation_kind(tree, attribute.node, &attribute.name)
                         == RetainedAttributeMutationKind::Selector)
         })
@@ -4172,7 +4257,7 @@ pub(crate) fn image_source_updates_without_style_damage(
             return None;
         };
         let name = attribute.name.to_ascii_lowercase();
-        let metadata = (name.starts_with("data-") || name == "tabindex")
+        let metadata = is_selector_only_metadata_attribute(&name)
             && retained_attribute_mutation_kind(tree, attribute.node, &name)
                 == RetainedAttributeMutationKind::Selector;
         if !metadata {
@@ -17870,7 +17955,7 @@ mod tests {
             &tree, viewport, &HashMap::new(), &[], &mut cache,
         );
         let misses = cache.miss_count();
-        for name in ["data-sfc-inited", "tabindex", "data-state"] {
+        for name in ["data-sfc-inited", "tabindex", "data-state", "aria-hidden", "role", "jsaction", "ahbak"] {
             let mutation = RetainedStyleMutation::Attribute(AttributeStyleMutation {
                 node: target, name: name.into(), old_value: None, new_value: Some("2".into()),
             });
@@ -17878,6 +17963,55 @@ mod tests {
                 name != "data-state", "linked CSS dependency: {name}");
             assert_eq!(cache.miss_count(), misses, "metadata probe replaced the full stylesheet cache");
         }
+    }
+
+    #[test]
+    fn framework_and_aria_metadata_keep_layout_unless_a_selector_reads_them() {
+        assert!(is_selector_only_metadata_attribute("jsaction"));
+        assert!(is_selector_only_metadata_attribute("aria-hidden"));
+        assert!(is_selector_only_metadata_attribute("data-ved"));
+        assert!(is_selector_only_metadata_attribute("ahbak"));
+        for native in ["open", "colspan", "rowspan", "span", "start", "reversed", "placeholder",
+            "alt", "size", "slot", "id", "class", "style", "src", "width", "height", "hidden",
+            "checked", "selected", "value", "viewbox", "d", "x", "transform", "popover", "inert",
+            "contenteditable", "dir", "lang", "nowrap", "border", "colspan", "multiple", "label"]
+        {
+            assert!(!is_selector_only_metadata_attribute(native), "{native}");
+        }
+        for (name, css, reusable) in [
+            ("aria-hidden", "", true),
+            ("aria-hidden", "[aria-hidden=true] { display: none }", false),
+            ("jsaction", "", true),
+            ("jsaction", "div:has([jsaction]) p { height: 40px }", false),
+            ("ahbak", "p::after { content: attr(ahbak) }", false),
+            ("role", "[role] { padding: 4px }", false),
+        ] {
+            let tree = parse_html(&format!("<style>{css}</style><div><p id=target>text</p></div>"));
+            let target = tree.get_element_by_id("target").unwrap();
+            let viewport = (500.0, 300.0);
+            let mut cache = crate::css::StylesheetCache::default();
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree, viewport, &HashMap::new(), &[], &mut cache,
+            );
+            let mutation = RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                node: target, name: name.into(), old_value: None, new_value: Some("true".into()),
+            });
+            assert_eq!(can_retain_layout_for_metadata(&tree, viewport, &mut cache, &[mutation]),
+                reusable, "{name}: {css}");
+        }
+        // A batch is retained only when every mutation is metadata.
+        let tree = parse_html("<p id=target>text</p>");
+        let target = tree.get_element_by_id("target").unwrap();
+        let viewport = (500.0, 300.0);
+        let mut cache = crate::css::StylesheetCache::default();
+        let _ = layout_dom_with_web_fonts_and_stylesheet_cache(&tree, viewport, &HashMap::new(), &[], &mut cache);
+        let mutation = |name: &str| RetainedStyleMutation::Attribute(AttributeStyleMutation {
+            node: target, name: name.into(), old_value: None, new_value: Some("1".into()),
+        });
+        assert!(can_retain_layout_for_metadata(&tree, viewport, &mut cache,
+            &[mutation("aria-hidden"), mutation("ahbak"), mutation("data-tibak"), mutation("tabindex")]));
+        assert!(!can_retain_layout_for_metadata(&tree, viewport, &mut cache,
+            &[mutation("aria-hidden"), mutation("class")]));
     }
 
     #[test]
