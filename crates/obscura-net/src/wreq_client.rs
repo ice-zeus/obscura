@@ -1474,8 +1474,8 @@ mod tests {
             http_cache: None,
             profile: super::stealth_profile_headers(),
             proxy_url: None,
-            client_hints: ClientHintStore::new(),
-            hint_environment: Arc::new(std::sync::RwLock::new(HintEnvironment::default())),
+            client_hints: crate::client_hints::ClientHintStore::new(),
+            hint_environment: Arc::new(std::sync::RwLock::new(crate::client_hints::HintEnvironment::default())),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client
