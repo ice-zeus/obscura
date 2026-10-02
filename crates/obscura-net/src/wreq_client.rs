@@ -193,6 +193,14 @@ pub struct StealthHttpClient {
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
 
+/// Scripted fetch exposes these headers before consuming the bounded body.
+#[cfg(feature = "stealth")]
+pub struct StealthResponseHeaders {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: futures_util::future::BoxFuture<'static, Result<Vec<u8>, ObscuraNetError>>,
+}
+
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
@@ -493,14 +501,32 @@ impl StealthHttpClient {
         cookie_context: Option<SameSiteContext>,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let response = self.send_single_headers_with_context(
+            method, url, headers, body, cookie_context, store_cookies, 64 * 1024 * 1024,
+        ).await?;
+        Ok(Response {
+            url: url.clone(), status: response.status, headers: response.headers,
+            body: response.body.await?, redirected_from: Vec::new(),
+        })
+    }
+
+    /// Preserve request policy and cookie handling while deferring body reads.
+    pub async fn send_single_headers_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
-            return Ok(Response {
+            return Ok(StealthResponseHeaders {
                 status: 0,
-                url: url.clone(),
                 headers: HashMap::new(),
-                body: Vec::new(),
-                redirected_from: Vec::new(),
+                body: Box::pin(async { Ok(Vec::new()) }),
             });
         }
 
@@ -543,15 +569,14 @@ impl StealthHttpClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
-        drop(in_flight);
-
-        Ok(Response {
-            url: url.clone(),
+        let body_url = url.clone();
+        Ok(StealthResponseHeaders {
             status: status.as_u16(),
             headers: response_headers,
-            body: resp_body,
-            redirected_from: Vec::new(),
+            body: Box::pin(async move {
+                let _in_flight = in_flight;
+                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
+            }),
         })
     }
 

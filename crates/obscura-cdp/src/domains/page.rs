@@ -835,10 +835,7 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
 pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     matches!(
         method,
-        "Page.navigate"
-            | "Page.reload"
-            | "Page.navigateToHistoryEntry"
-            | "Input.dispatchMouseEvent"
+        "Input.dispatchMouseEvent"
             | "Input.dispatchKeyEvent"
             | "Input.dispatchTouchEvent"
             | "Emulation.setDeviceMetricsOverride"
@@ -1046,6 +1043,16 @@ pub fn emit_navigation_events(
         });
     }
 
+    // A recorder can stop as soon as navigation completes. Give the new
+    // document a compositor opportunity before publishing that boundary,
+    // through the normal sampling and bounded acknowledgement window.
+    #[cfg(feature = "render")]
+    if session_id.as_ref().is_some_and(|id| ctx.screencasts.contains_key(id)) {
+        schedule_screencast_frame(ctx, session_id);
+        if let Err(error) = queue_screencast_frame(ctx, session_id, false) {
+            tracing::warn!("could not produce navigation screencast frame: {error}");
+        }
+    }
     let mut phase3 = vec![
         CdpEvent {
             method: "Page.lifecycleEvent".into(),

@@ -82,6 +82,21 @@ await page.route('**/*', route => {
 });
 ```
 
+## JavaScript heap measurements
+
+```js
+const client = await context.newCDPSession(page);
+await client.send('HeapProfiler.collectGarbage'); // Optional explicit collection.
+const heap = await client.send('Runtime.getHeapUsage');
+console.log(heap.usedSize, heap.totalSize, heap.backingStorageSize);
+await client.detach();
+```
+
+These are native V8 isolate byte counts, not process memory. Reading them does
+not run page tasks or force collection. `embedderHeapUsedSize` is zero because
+Obscura's Rust DOM is not a V8-managed cppgc heap; Rust allocations and renderer
+memory are not included.
+
 ## Multiple pages
 
 ```js

@@ -20,12 +20,12 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, RuntimeExceptionEvent, StoredNetworkResponseBody, build_extension,
-    node_is_script,
+    ObscuraState, RuntimeEvent, RuntimeExceptionEvent, StoredNetworkResponseBody,
+    begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
 use crate::ops::{
-    begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
+    clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
 };
 
 #[cfg(feature = "render")]
@@ -536,6 +536,16 @@ impl ObscuraJsRuntime {
         EnteredRuntime(&mut self.js_runtime)
     }
 
+    /// Read native isolate statistics without evaluating scripts or forcing GC.
+    pub fn heap_statistics(&mut self) -> v8::HeapStatistics {
+        self.runtime().v8_isolate().get_heap_statistics()
+    }
+
+    /// Run a full collection only when an automation client explicitly asks.
+    pub fn collect_garbage(&mut self) {
+        self.runtime().v8_isolate().low_memory_notification();
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
@@ -545,7 +555,6 @@ impl ObscuraJsRuntime {
         // heap-limit termination before any later task enters V8 even when the
         // caller that triggered it did not need the error value.
         self.recover_heap_limit();
-        #[cfg(feature = "render")]
         begin_animation_task(&mut self.state.borrow_mut());
     }
     pub fn new() -> Self {
@@ -949,26 +958,15 @@ impl ObscuraJsRuntime {
     /// client, callbacks and the stealth transport. A frame shares these with
     /// its page, exactly as it shares them in a browser.
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
-        let parent = self.state.borrow();
-        frame.cookie_jar = parent.cookie_jar.clone();
-        frame.http_client = parent.http_client.clone();
-        frame.callbacks = parent.callbacks.clone();
-        frame.encoding = parent.encoding.clone();
-        frame.blocked_urls = parent.blocked_urls.clone();
-        frame.intercept_enabled = parent.intercept_enabled;
-        frame.page_in_flight = parent.page_in_flight.clone();
-        #[cfg(feature = "stealth")]
-        {
-            frame.stealth_client = parent.stealth_client.clone();
-        }
         // A frame realm shares the page transport, so its renderer cache must
         // not open synchronous requests either. Frame geometry currently
         // resolves against the main document's renderer state, so frame-scoped
         // background loading is not wired up here.
-        #[cfg(feature = "render")]
-        if crate::ops::has_page_transport(&parent) {
-            frame.render_resources.set_sync_loading_enabled(false);
-        }
+        frame.inherit_resources(&self.state.borrow());
+    }
+
+    pub fn forget_frame_state(&mut self, frame_id: u32) {
+        self.realm_states().borrow_mut().forget_frame(frame_id);
     }
 
     /// The origin of the document this runtime is running, or `"null"` for a
@@ -1499,16 +1497,7 @@ impl ObscuraJsRuntime {
             return;
         }
         #[cfg(feature = "render")]
-        {
-            let mut state = self.state.borrow_mut();
-            let viewport = (width as f32, height as f32);
-            if state.viewport != viewport {
-                state.viewport = viewport;
-                state.prepared_render = None;
-                state.pending_style_mutations.clear();
-                state.resolved_scroll = None;
-            }
-        }
+        self.state.borrow_mut().set_viewport(width, height);
         let _ = self.execute_runtime_script(
             "<set-viewport>",
             format!(
@@ -3546,10 +3535,9 @@ impl ObscuraJsRuntime {
                 Ok(Ok(false)) => {
                     // End-of-task microtasks belong to this turn, but work
                     // queued from them belongs to a subsequent cooperative
-                    // turn. Yield so the wall deadline remains observable even
-                    // when every turn immediately schedules another one.
+                    // turn. The cooperative helper yields to Tokio even when
+                    // every turn immediately schedules another one.
                     self.runtime().v8_isolate().perform_microtask_checkpoint();
-                    tokio::task::yield_now().await;
                 }
                 Ok(Err(error)) => {
                     if is_fatal_event_loop_error(&error) {
@@ -3590,15 +3578,16 @@ impl ObscuraJsRuntime {
         self.run_event_loop_bounded(budget_ms).await
     }
 
-    /// Drive one deno_core event-loop tick at a time. When the first tick
-    /// parks, process one more tick after its registered waker fires, then
-    /// yield back to the embedder even if that tick schedules more work.
+    /// Return after a poll that delivers browser tasks. If the first poll
+    /// has no ready task, wait for its registered waker and process one more
+    /// poll before returning, including V8 maintenance wakes. Busy turns also
+    /// yield to Tokio so every caller can make network and timer progress.
     ///
     /// `JsRuntime::run_event_loop()` is a run-to-idle future. When a page keeps
     /// it continuously ready (zero-delay schedulers, streaming traffic, or a
     /// framework work queue), Tokio never regains control to observe a timeout
-    /// or our readiness policy. This future deliberately turns the wake for a
-    /// second tick into a return to the caller. If no work is immediately
+    /// or our readiness policy. A pending poll can already have delivered a
+    /// task; do not await another wake in that case. If no work is immediately
     /// ready, it remains parked on deno_core's real I/O/timer waker, so the
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
@@ -3606,6 +3595,7 @@ impl ObscuraJsRuntime {
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            let task_generation = self.state.borrow().animation_task_generation;
             let tick = self
                 .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
@@ -3614,7 +3604,11 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => {
                     std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
-                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
+                std::task::Poll::Pending if waiting_for_wake
+                    || self.state.borrow().animation_task_generation != task_generation =>
+                {
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3622,6 +3616,9 @@ impl ObscuraJsRuntime {
             }
         })
         .await;
+        if matches!(result, Ok(false)) {
+            tokio::task::yield_now().await;
+        }
         self.finish_heap_checked(result)
     }
 
@@ -3661,6 +3658,7 @@ impl ObscuraJsRuntime {
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
+            let task_generation = self.state.borrow().animation_task_generation;
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
@@ -3689,7 +3687,11 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => {
                     std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
                 }
-                std::task::Poll::Pending if waiting_for_wake => std::task::Poll::Ready(Ok(false)),
+                std::task::Poll::Pending if waiting_for_wake
+                    || self.state.borrow().animation_task_generation != task_generation =>
+                {
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Pending => {
                     waiting_for_wake = true;
                     std::task::Poll::Pending
@@ -3697,6 +3699,9 @@ impl ObscuraJsRuntime {
             }
         })
         .await;
+        if matches!(result, Ok(false)) {
+            tokio::task::yield_now().await;
+        }
         self.finish_heap_checked(result)
     }
 
@@ -3920,29 +3925,30 @@ impl ObscuraJsRuntime {
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
-            // Pump for a short slice. If the loop returns idle in <tick_ms,
-            // run_event_loop returns Ok and we check the predicate again.
+            // Return between browser turns even when a framework keeps its
+            // posted-task queue ready. A run-to-idle wait can spend the whole
+            // slice in JS, then repeatedly observe expired sleeps without
+            // yielding to the network reactor.
             let slice_deadline = (tokio::time::Instant::now()
                 + tokio::time::Duration::from_millis(tick_ms)).min(deadline);
-            let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
-                runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
-            });
-            let _ = tokio::time::timeout_at(slice_deadline, event_loop).await;
+            let turn = tokio::time::timeout_at(
+                slice_deadline, self.run_cooperative_event_loop_tick(),
+            ).await;
             if self.recover_heap_limit() {
                 return false;
             }
             if done_check(self) {
                 return true;
             }
-            // An idle event loop can return immediately while an unresolvable
-            // promise remains pending. Yield here so connection shutdown can
-            // cancel the evaluation, and actually back off instead of spinning.
-            // Reuse the slice deadline so a busy poll does not pay twice.
-            tokio::time::sleep_until(slice_deadline).await;
-            // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
-            // worst case we miss the result by <50ms.
-            if tick_ms < 50 {
+            if matches!(turn, Ok(Ok(true)) | Ok(Err(_))) {
+                // An idle loop or repeated page error must not spin while
+                // an unresolvable promise remains pending.
+                tokio::time::sleep_until(slice_deadline).await;
                 tick_ms = (tick_ms * 2).min(50);
+            } else {
+                // A busy turn may already exceed the slice. An expired sleep
+                // is not a yield; let I/O and other tasks make progress now.
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -5019,6 +5025,129 @@ mod tests {
                 "constructible": false,
             })
         );
+    }
+
+    #[test]
+    fn initial_blank_iframe_eval_uses_the_child_realm() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const iframe = document.createElement('iframe');
+                    document.body.appendChild(iframe);
+                    const child = iframe.contentWindow;
+                    const globalMatches = child.eval('globalThis') === child;
+                    const constructorMatches = child.eval('Array') === child.Array;
+                    child.eval('globalThis.__initialFrameSentinel = 123');
+                    return [globalMatches, constructorMatches,
+                        child.__initialFrameSentinel === 123,
+                        globalThis.__initialFrameSentinel === undefined];
+                })()"#,
+            ).unwrap(),
+            serde_json::json!([true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn document_open_does_not_use_overridden_head_or_body_getters() {
+        let mut rt = setup_runtime(
+            "<html><head><base href='https://parent.example/'></head><body>parent</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const childDocument = iframe.contentDocument;
+            Object.defineProperties(childDocument, {
+                head: { get: () => document.head },
+                body: { get: () => document.body },
+            });
+            Document.prototype.open.call(childDocument);
+            return [document.body.textContent, document.baseURI];
+        })()"#).unwrap(), serde_json::json!(["parent", "https://parent.example/"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn synchronous_iframe_geometry_uses_the_owning_document() {
+        let mut rt = setup_runtime(
+            "<html><head><style>body{margin:4px}#parent{width:45px;height:30px}</style></head><body><div id='parent'></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>body{margin:8px}div{width:100px;height:20px}</style><div id="child"></div>';
+            const element = d.getElementById('child');
+            const range = d.createRange(); range.selectNode(element);
+            return [[...element.getClientRects()].map(r => [r.width, r.height, r.bottom]),
+                [...range.getClientRects()].map(r => r.bottom),
+                [element.clientWidth, element.clientHeight, element.offsetWidth, element.offsetHeight],
+                d.elementFromPoint(10, 10) === element,
+                document.getElementById('parent').getBoundingClientRect().width];
+        })()"#).unwrap(), serde_json::json!([
+            [[100, 20, 28]], [28], [100, 20, 100, 20], true, 45
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn borrowed_document_hit_testing_uses_the_receiver_realm() {
+        let mut rt = setup_runtime(
+            "<style>body{margin:4px}#parent{width:45px;height:30px}</style><div id='parent'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>body{margin:8px}div{width:100px;height:20px}</style><div id="child"></div>';
+            const child = d.getElementById('child'), parent = document.getElementById('parent');
+            const foreign = iframe.contentWindow.Document.prototype;
+            return [document.elementFromPoint(10, 10) === parent,
+                d.elementFromPoint(10, 10) === child,
+                Document.prototype.elementFromPoint.call(d, 10, 10) === child,
+                foreign.elementFromPoint.call(document, 10, 10) === parent,
+                Document.prototype.elementFromPoint.call(d, 400, 10) === null,
+                foreign.elementFromPoint.call(document, 400, 10) === document.body,
+                Document.prototype.elementsFromPoint.call(d, 10, 10)[0] === child,
+                foreign.elementsFromPoint.call(document, 10, 10)[0] === parent];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_style_on_a_foreign_frame_element_tracks_its_document() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>#child{width:100px;height:20px;color:rgb(12,34,56)}</style><div id="child"></div>';
+            const element = d.getElementById('child');
+            const style = getComputedStyle(element);
+            const before = [style.width, style.color];
+            element.style.width = '120px';
+            element.style.color = 'rgb(78,90,12)';
+            return [before, [style.width, style.color], getComputedStyle(element).color];
+        })()"#).unwrap(), serde_json::json!([
+            ["100px", "rgb(12, 34, 56)"], ["120px", "rgb(78, 90, 12)"], "rgb(78, 90, 12)"
+        ]));
+    }
+
+    #[test]
+    fn borrowed_document_methods_keep_the_receiver_realm_after_prototype_remap() {
+        let mut rt = setup_runtime(
+            "<html><head><base href='https://parent.example/'></head><body>parent</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            const childDocument = child.document;
+            Object.setPrototypeOf(childDocument, Document.prototype);
+            const initialUrl = childDocument.URL;
+            const separateBody = childDocument.querySelector('body') !== document.body;
+            Document.prototype.open.call(childDocument);
+            return [document.body.textContent, document.baseURI, document.readyState,
+                separateBody, initialUrl];
+        })()"#).unwrap(), serde_json::json!([
+            "parent", "https://parent.example/", "complete", true, "about:blank"
+        ]));
     }
 
     #[test]
@@ -8401,6 +8530,30 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_refreshes_after_viewport_changes_without_dom_mutation() {
+        let mut rt = setup_runtime(r#"<style>
+            body { margin:0 }
+            #box { width:50vw; height:25vh; color:rgb(12,34,56) }
+            @media(max-width:250px) { #box { color:rgb(78,90,12) } }
+        </style><div id=box></div>"#);
+        rt.set_viewport(300.0, 80.0);
+        assert_eq!(rt.evaluate(r#"(() => {
+            globalThis.savedStyle = getComputedStyle(document.getElementById('box'));
+            return [savedStyle.width, savedStyle.height, savedStyle.color];
+        })()"#).unwrap(), serde_json::json!(["150px", "20px", "rgb(12, 34, 56)"]));
+        rt.set_viewport(200.0, 120.0);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const fresh = getComputedStyle(document.getElementById('box'));
+            return [[savedStyle.width, savedStyle.height, savedStyle.color],
+                [fresh.width, fresh.height, fresh.color]];
+        })()"#).unwrap(), serde_json::json!([
+            ["100px", "30px", "rgb(78, 90, 12)"],
+            ["100px", "30px", "rgb(78, 90, 12)"]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn computed_style_non_geometric_reads_defer_layout_without_losing_damage() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(r#"<!doctype html><style>
@@ -8890,6 +9043,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ready_interval_yields_before_polling_v8_again() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "ready-interval",
+            "globalThis.__readyTicks = 0;\
+             globalThis.__readyInterval = setInterval(() => __readyTicks++, 0);",
+        ).unwrap();
+
+        for (autonomous, expected_ticks) in [(true, 1.0), (false, 2.0)] {
+            // Make the timer due before the first poll. Even if the future
+            // yields to Tokio, resuming it must not deliver another tick.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let result = {
+                let mut turn: Pin<Box<dyn Future<Output = Result<bool, String>> + '_>> =
+                    if autonomous {
+                        Box::pin(rt.run_autonomous_event_loop_turn())
+                    } else {
+                        Box::pin(rt.run_cooperative_event_loop_tick())
+                    };
+                match std::future::poll_fn(|cx| Poll::Ready(turn.as_mut().poll(cx))).await {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        turn.await
+                    }
+                }
+            };
+            result.unwrap();
+            assert_eq!(rt.evaluate("__readyTicks").unwrap(), serde_json::json!(expected_ticks));
+        }
+        rt.execute_script("clear-ready-interval", "clearInterval(__readyInterval)").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adaptive_settle_yields_to_tokio_during_ready_posted_tasks() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let awake = Arc::new(AtomicBool::new(false));
+        let observed = awake.clone();
+        let heartbeat = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            observed.store(true, Ordering::Relaxed);
+        });
+        tokio::task::yield_now().await;
+        rt.execute_script("ready-posted-tasks", r#"
+            const channel = new MessageChannel();
+            const deadline = Date.now() + 1000;
+            globalThis.__settleMessages = 0;
+            channel.port1.onmessage = () => {
+                __settleMessages++;
+                if (Date.now() < deadline) channel.port2.postMessage(null);
+            };
+            channel.port2.postMessage(null);
+        "#).unwrap();
+        rt.run_event_loop_until_quiescent(100, 30).await.unwrap();
+        heartbeat.abort();
+        assert!(awake.load(Ordering::Relaxed),
+            "adaptive settle starved Tokio while page tasks stayed ready");
+        assert!(rt.evaluate("__settleMessages > 0").unwrap().as_bool().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn top_level_zero_delay_interval_clamps_after_six_ticks() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -8904,13 +9119,22 @@ mod tests {
         )
         .unwrap();
 
-        for _ in 0..7 {
+        // A V8 maintenance wake may finish a turn without delivering a timer.
+        // Count actual ticks, while retaining a bound and the per-turn yield.
+        let mut ticks = 0.0;
+        for _ in 0..14 {
             rt.run_autonomous_event_loop_turn().await.unwrap();
+            let next = rt.evaluate("globalThis.__nestedTimerDelays.length")
+                .unwrap().as_f64().unwrap();
+            assert!(next <= ticks + 1.0,
+                "a repeating timer must yield between ticks: {ticks} -> {next}");
+            ticks = next;
+            if ticks == 7.0 {
+                break;
+            }
         }
         assert_eq!(
-            rt.evaluate("globalThis.__nestedTimerDelays.length")
-                .unwrap(),
-            serde_json::json!(7.0),
+            ticks, 7.0,
             "the interval must continue yielding and making progress",
         );
         let observed = rt.evaluate("globalThis.__nestedTimerDelays").unwrap();
@@ -13361,10 +13585,10 @@ mod tests {
                 const nativeBulk = __obscura_test_ops.op_resize_observer_measurements;
                 const nativeGeometry = __obscura_test_ops.op_layout_geometry;
                 const nativeComputedStyle = __obscura_test_ops.op_computed_style;
-                __obscura_test_ops.op_resize_observer_measurements = input => {
+                __obscura_test_ops.op_resize_observer_measurements = (input, frameId) => {
                     __resizeBulkCalls++;
                     __resizeBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    return nativeBulk(input, frameId);
                 };
                 __obscura_test_ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
@@ -13729,10 +13953,10 @@ mod tests {
                 const nativeBulk = __obscura_test_ops.op_intersection_observer_measurements;
                 const nativeGeometry = __obscura_test_ops.op_layout_geometry;
                 const nativeComputedStyle = __obscura_test_ops.op_computed_style;
-                __obscura_test_ops.op_intersection_observer_measurements = input => {
+                __obscura_test_ops.op_intersection_observer_measurements = (input, frameId) => {
                     __intersectionBulkCalls++;
                     __intersectionBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    return nativeBulk(input, frameId);
                 };
                 __obscura_test_ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;
@@ -14353,6 +14577,75 @@ mod tests {
             result,
             serde_json::json!([300, 270, 240, 240, 250, 250, 600, 600])
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_moves_nested_scrollports_before_the_viewport() {
+        let dom = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:1800px">
+                <div id="scroller" style="margin-top:200px;height:200px;overflow:auto">
+                    <div style="height:600px"></div>
+                    <div id="target" style="height:40px"></div>
+                    <div style="height:600px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(800.0, 600.0);
+        rt.run_page_init();
+        let result = rt.evaluate(r#"
+            const scroller = document.getElementById('scroller');
+            const target = document.getElementById('target');
+            const results = [];
+            for (const block of ['nearest', 'center', 'start', 'end']) {
+                scrollTo(0, 0);
+                scroller.scrollTop = 0;
+                target.scrollIntoView({block});
+                results.push([scroller.scrollTop, scrollY, target.getBoundingClientRect().top]);
+            }
+            scrollTo(0, 0);
+            target.scrollIntoView({block: 'nearest'});
+            results.push([scroller.scrollTop, scrollY, target.getBoundingClientRect().top]);
+            return results;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [440, 0, 360], [520, 0, 280], [600, 200, 0],
+            [440, 0, 360], [440, 0, 360],
+        ]));
+    }
+
+    #[test]
+    fn removing_a_focused_subtree_clears_focus_without_firing_blur() {
+        let mut rt = setup_runtime("<main id=parent></main>");
+        let result = rt.evaluate(r#"
+            const parent = document.getElementById('parent');
+            const rows = [];
+            for (const remove of [
+                host => host.remove(),
+                host => parent.removeChild(host),
+                host => parent.replaceChild(document.createElement('div'), host),
+                host => { parent.innerHTML = ''; },
+                host => { parent.textContent = ''; },
+                host => parent.replaceChildren(),
+                host => host.replaceWith(document.createElement('div')),
+            ]) {
+                parent.innerHTML = '<section><button>Apply</button></section>';
+                const host = parent.firstChild, button = host.firstChild;
+                let blurred = 0;
+                button.addEventListener('blur', () => blurred++);
+                button.addEventListener('focusout', () => blurred++);
+                button.focus();
+                const focused = document.activeElement === button;
+                remove(host);
+                // Reinsert without reading activeElement while disconnected.
+                parent.appendChild(host);
+                rows.push([focused, document.activeElement === document.body, blurred]);
+            }
+            return rows;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(vec![serde_json::json!([true,true,0]); 7]));
     }
 
     #[cfg(feature = "render")]
@@ -17651,6 +17944,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn awaited_fetch_progresses_while_posted_tasks_remain_ready() {
+        let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+                const channel = new MessageChannel();
+                const deadline = Date.now() + 2000;
+                let turns = 0;
+                channel.port1.onmessage = () => {
+                    turns++;
+                    const taskEnd = Date.now() + 60;
+                    while (Date.now() < taskEnd) {}
+                    if (Date.now() < deadline) channel.port2.postMessage(null);
+                };
+                channel.port2.postMessage(null);
+                const text = await (await fetch('/hydrate')).text();
+                channel.port1.close();
+                channel.port2.close();
+                return { text, turns };
+            })()"#,
+            true, true,
+        ).await.unwrap();
+        let elapsed = started.elapsed();
+        accepted.recv_timeout(std::time::Duration::from_millis(100)).unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(value["text"], "hydrated");
+        assert!(value["turns"].as_f64().unwrap() > 0.0);
+        assert!(elapsed < std::time::Duration::from_millis(1000),
+            "network progress waited for the posted-task queue to drain: {elapsed:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn resolved_cdp_promise_does_not_run_unrelated_ready_timer() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("ready-timer", "globalThis.timerRan = false; setTimeout(() => timerRan = true, 0);").unwrap();
@@ -19166,6 +19491,139 @@ mod tests {
                 "invalidFetchRejected": true,
             })
         );
+    }
+
+    async fn held_fetch_body_runtime() -> (
+        ObscuraJsRuntime, tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/resource", listener.local_addr().unwrap());
+        let (release, body_release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\
+                Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n").await.unwrap();
+            body_release.await.unwrap();
+            stream.write_all(b"tail").await
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let cookie_jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                cookie_jar.clone(), None, true,
+            ),
+        ));
+        #[cfg(feature = "stealth")]
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::with_proxy(cookie_jar, None, true),
+        ));
+        rt.execute_script("header-first-fetch", &format!(
+            "globalThis.headerResponse = null; fetch({target:?}).then(r => headerResponse = r);"
+        )).unwrap();
+        (rt, release, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_resolves_headers_before_the_response_body_finishes() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        let pending_body = rt.has_pending_network_requests();
+        // Release and verify the bytes even on RED, so the fixture never hangs.
+        release.send(()).unwrap();
+        let result = rt.call_function_on_for_cdp(
+            "async () => { const r = headerResponse || await new Promise(resolve => { \
+                const check = () => headerResponse ? resolve(headerResponse) : setTimeout(check, 1); \
+                check(); }); const unread = !r.bodyUsed; \
+                return { status: r.status, unread, text: await r.text(), used: r.bodyUsed }; }",
+            None, &[], true, true,
+        ).await.unwrap();
+        server.await.unwrap().unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "status": 200, "unread": true, "text": "tail", "used": true,
+        })));
+        assert!(headers_first, "fetch must expose headers while the body is still held");
+        assert!(pending_body, "headers must not mark the unfinished body as network-idle");
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_fetch_clone_cancellation_preserves_the_other_body() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        if headers_first {
+            assert_eq!(rt.evaluate("(() => { \
+                const copy = headerResponse.clone(); const stream = copy.body; \
+                stream.cancel(); stream.cancel(); \
+                return [headerResponse.bodyUsed, copy.bodyUsed]; })()").unwrap(),
+                serde_json::json!([false, true]));
+        }
+        release.send(()).unwrap();
+        let result = rt.call_function_on_for_cdp(
+            "async () => await headerResponse.text()", None, &[], true, true,
+        ).await.unwrap();
+        let _ = server.await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("tail")));
+        assert!(headers_first);
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_clone_body_bytes_are_independent() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        if headers_first {
+            rt.execute_script("clone-held-body", "globalThis.clonedResponse = headerResponse.clone();").unwrap();
+        }
+        release.send(()).unwrap();
+        let result = rt.call_function_on_for_cdp(
+            "async () => { const reader = headerResponse.body.getReader(); \
+                const { value } = await reader.read(); value[0] = 88; \
+                return [new TextDecoder().decode(value), await clonedResponse.text()]; }",
+            None, &[], true, true,
+        ).await.unwrap();
+        server.await.unwrap().unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(["Xail", "tail"])));
+        assert!(headers_first);
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_all_fetch_clones_releases_the_pending_body() {
+        let (mut rt, release, server) = held_fetch_body_runtime().await;
+        let headers_first = rt.resolve_promises_until(
+            |rt| rt.evaluate("headerResponse !== null").unwrap() == serde_json::json!(true),
+            2_000,
+        ).await;
+        if headers_first {
+            let result = rt.call_function_on_for_cdp(
+                "async () => { const copy = headerResponse.clone(); \
+                    await copy.body.cancel(); await headerResponse.body.cancel(); \
+                    return [headerResponse.bodyUsed, copy.bodyUsed]; }",
+                None, &[], true, true,
+            ).await.unwrap();
+            assert_eq!(result.value, Some(serde_json::json!([true, true])));
+        }
+        let cancelled = rt.resolve_promises_until(
+            |rt| !rt.has_pending_network_requests(), 2_000,
+        ).await;
+        release.send(()).unwrap();
+        let _ = server.await.unwrap();
+        assert!(headers_first);
+        assert!(cancelled, "cancelling every clone must release the held network body");
     }
 
     fn cors_preflight_runtime() -> (ObscuraJsRuntime, String, std::sync::mpsc::Receiver<String>) {
@@ -22473,6 +22931,56 @@ mod tests {
         }
         // And the forwarded observe() actually observes.
         assert_eq!(patched["taken"], 1);
+    }
+
+    #[test]
+    fn mutation_observer_attribute_filter_is_per_target_and_preserves_child_lists() {
+        let mut rt = setup_runtime("<html><body><div id='root'><span id='child'></span></div></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const root = document.getElementById('root');
+            const child = document.getElementById('child');
+            const filtered = new MutationObserver(() => {});
+            filtered.observe(root, {attributes: true, attributeFilter: ['data-state'], subtree: true, childList: true});
+            filtered.observe(child, {attributes: true, attributeFilter: ['title']});
+            const empty = new MutationObserver(() => {});
+            empty.observe(root, {attributes: true, attributeFilter: [], subtree: true, childList: true});
+            const all = new MutationObserver(() => {});
+            all.observe(root, {attributes: true, subtree: true});
+            root.style.setProperty('--indicator', '1px');
+            root.setAttribute('data-state', 'active');
+            child.setAttribute('data-state', 'active');
+            child.setAttribute('title', 'selected');
+            child.setAttribute('class', 'selected');
+            root.appendChild(document.createElement('i'));
+            const names = observer => observer.takeRecords().map(record => record.attributeName || record.type);
+            const result = {filtered: names(filtered), empty: names(empty), all: names(all)};
+            for (const observer of [filtered, empty, all]) observer.disconnect();
+            return result;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "filtered": ["data-state", "data-state", "title", "childList"],
+            "empty": ["childList"],
+            "all": ["style", "data-state", "data-state", "title", "class"]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_observer_attribute_filter_does_not_feed_back_style_writes() {
+        let mut rt = setup_runtime("<html><body><div id='tabs'><span id='tab'></span></div></body></html>");
+        rt.evaluate(r#"(() => {
+            const tabs = document.getElementById('tabs');
+            globalThis.indicatorUpdates = 0;
+            const observer = new MutationObserver(() => {
+                indicatorUpdates++;
+                // Bound the broken implementation so the regression cannot hang V8.
+                if (indicatorUpdates === 4) observer.disconnect();
+                tabs.style.setProperty('--indicator', '1px');
+            });
+            observer.observe(tabs, {attributes: true, attributeFilter: ['data-state'], subtree: true});
+            document.getElementById('tab').setAttribute('data-state', 'active');
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("indicatorUpdates").unwrap().as_f64(), Some(1.0));
     }
 
     // Writing goes through the same insertion steps as any other insertion.

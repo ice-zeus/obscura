@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
 use deno_core::JsBuffer;
 use deno_core::OpState;
+use deno_core::{AsyncResult, CancelFuture, CancelHandle, Resource};
 use deno_core::op2;
 use deno_core::v8;
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
@@ -111,6 +112,9 @@ pub(crate) struct CanvasBackingSurface {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    /// Initial about:blank documents retain their creator's base URL and origin.
+    pub(crate) about_base_url: Option<String>,
+    pub(crate) inherited_origin: Option<String>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -221,9 +225,9 @@ pub struct ObscuraState {
     pub animation_timeline: obscura_render::AnimationTimelineState,
     #[cfg(feature = "render")]
     pub animation_timeline_origin: std::time::Instant,
-    /// Host/HTML task epoch for document-timeline sampling. Geometry and
-    /// computed-style reads within one task share one frozen animation frame.
-    #[cfg(feature = "render")]
+    /// Host/HTML task epoch for cooperative delivery and document-timeline
+    /// sampling. It remains available without rendering so a ready timer or
+    /// posted task returns control before the embedder polls again.
     pub animation_task_generation: u64,
     #[cfg(feature = "render")]
     pub animation_sampled_task_generation: u64,
@@ -354,12 +358,32 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    pub(crate) fn inherit_resources(&mut self, parent: &Self) {
+        self.cookie_jar = parent.cookie_jar.clone();
+        self.http_client = parent.http_client.clone();
+        self.callbacks = parent.callbacks.clone();
+        self.encoding = parent.encoding.clone();
+        self.blocked_urls = parent.blocked_urls.clone();
+        self.intercept_enabled = parent.intercept_enabled;
+        self.page_in_flight = parent.page_in_flight.clone();
+        #[cfg(feature = "stealth")]
+        {
+            self.stealth_client = parent.stealth_client.clone();
+        }
+        #[cfg(feature = "render")]
+        if has_page_transport(parent) {
+            self.render_resources.set_sync_loading_enabled(false);
+        }
+    }
+
     pub fn new() -> Self {
         #[cfg(feature = "render")]
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            about_base_url: None,
+            inherited_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
@@ -406,7 +430,6 @@ impl ObscuraState {
             animation_timeline: obscura_render::AnimationTimelineState::default(),
             #[cfg(feature = "render")]
             animation_timeline_origin: std::time::Instant::now(),
-            #[cfg(feature = "render")]
             animation_task_generation: 0,
             #[cfg(feature = "render")]
             animation_sampled_task_generation: 0,
@@ -456,6 +479,16 @@ impl ObscuraState {
             already_started_scripts: RefCell::new(HashSet::new()),
             write_stream: RefCell::new(None),
             document_write_inserted_script: Cell::new(false),
+        }
+    }
+    #[cfg(feature = "render")]
+    pub(crate) fn set_viewport(&mut self, width: f64, height: f64) {
+        let viewport = (width as f32, height as f32);
+        if self.viewport != viewport {
+            self.viewport = viewport;
+            self.prepared_render = None;
+            self.pending_style_mutations.clear();
+            self.resolved_scroll = None;
         }
     }
 }
@@ -587,6 +620,36 @@ fn response_body_byte_limit() -> usize {
         .unwrap_or(2 * 1024 * 1024)
 }
 
+fn record_js_network_completion(
+    state: &RefCell<OpState>,
+    event: JsNetworkEvent,
+    body: &str,
+    base64_encoded: bool,
+) {
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
+        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
+            body: body.to_string(), base64_encoded,
+        });
+        gs.network_response_body_order.push_back(event.request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    gs.js_network_events.push(event);
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+}
+
 /// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
 /// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
 /// copy of it, so an unbounded body OOMs the process. This bounds the initial
@@ -631,6 +694,65 @@ async fn read_body_capped(
     Ok(buf)
 }
 
+struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+impl Drop for PageInFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct FetchBodyResource {
+    body: RefCell<Option<AsyncResult<Vec<u8>>>>,
+    cancel: Rc<CancelHandle>,
+    opaque: bool,
+}
+
+impl Resource for FetchBodyResource {
+    fn close(self: Rc<Self>) {
+        self.cancel.cancel();
+        self.body.borrow_mut().take();
+    }
+}
+
+#[op2]
+#[buffer]
+async fn op_fetch_body(
+    state: Rc<RefCell<OpState>>,
+    rid: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let resource = state.borrow().resource_table.get::<FetchBodyResource>(rid)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    let body = resource.body.borrow_mut().take()
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Body is already consumed"))?;
+    let result = body.or_cancel(resource.cancel.clone()).await
+        .map_err(|_| deno_error::JsErrorBox::generic("Response body was cancelled"));
+    let closed = state.borrow_mut().resource_table.take_any(rid);
+    if let Ok(resource) = closed {
+        resource.close();
+    }
+    result?.map(|bytes| if resource.opaque { Vec::new() } else { bytes })
+}
+
+async fn fetch_body_result(
+    state: &RefCell<OpState>,
+    mut metadata: serde_json::Value,
+    body: AsyncResult<Vec<u8>>,
+    internal_load: bool,
+) -> Result<String, deno_error::JsErrorBox> {
+    if internal_load {
+        let bytes = body.await?;
+        metadata["body"] = serde_json::json!(String::from_utf8_lossy(&bytes));
+        metadata["bodyBase64"] = serde_json::json!(BASE64.encode(&bytes));
+    } else {
+        let rid = state.borrow_mut().resource_table.add(FetchBodyResource {
+            body: RefCell::new(Some(body)), cancel: CancelHandle::new_rc(),
+            opaque: metadata["opaque"].as_bool().unwrap_or(false),
+        });
+        metadata["bodyRid"] = serde_json::json!(rid);
+    }
+    Ok(metadata.to_string())
+}
+
 /// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
 /// `fetch()`/XHR and grow it without bound on the process heap (where V8's
 /// heap-limit guard never sees it). It only feeds the CLI's `--dump assets`
@@ -663,6 +785,18 @@ pub struct RealmStates {
 }
 
 impl RealmStates {
+    pub(crate) fn live_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn context(&self, frame_id: u32) -> Option<v8::Global<v8::Context>> {
+        self.entries.iter().find(|(_, id, _)| *id == frame_id)
+            .map(|(context, _, _)| context.clone())
+    }
+
+    pub(crate) fn forget_frame(&mut self, frame_id: u32) {
+        self.entries.retain(|(_, id, _)| *id != frame_id);
+    }
     pub fn register(
         &mut self,
         context: v8::Global<v8::Context>,
@@ -676,7 +810,7 @@ impl RealmStates {
         self.entries.retain(|(known, _, _)| known != context);
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
@@ -1790,6 +1924,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_origin" => serde_json::to_string(&gs.inherited_origin.clone().unwrap_or_else(|| {
+            url::Url::parse(&gs.url).map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|_| "null".to_string())
+        })).unwrap_or("\"null\"".into()),
         // The base for relative URLs. It differs from document_url exactly when the page carries
         // a <base href>, and that is the point: HTML resolves against the base, not the document.
         "document_base_url" => serde_json::to_string(
@@ -3207,12 +3345,6 @@ async fn op_fetch_url(
         })
         .to_string());
     }
-    struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
-    impl Drop for PageInFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
     let credentials = FetchCredentials::parse(&credentials);
@@ -3247,7 +3379,18 @@ async fn op_fetch_url(
                     body: b,
                     body_base64: bb,
                 }) => {
-                    return Ok(intercept_fulfill_response(
+                    // Keep fulfilled responses visible to CDP just like transport
+                    // responses, including exact binary bodies and bounded retention.
+                    let encoded = !bb.is_empty();
+                    let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
+                    record_js_network_completion(&state, JsNetworkEvent {
+                        request_id: request_id.clone(), intercepted: true,
+                        url: url.clone(), method: method.clone(), status,
+                        response_headers: h.clone(), body_size,
+                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs_f64(),
+                    }, if encoded { &bb } else { &b }, encoded);
+                    let mut response = intercept_fulfill_response(
                         status,
                         h,
                         &b,
@@ -3257,8 +3400,9 @@ async fn op_fetch_url(
                         &mode,
                         credentials,
                         internal_load,
-                    )
-                    .to_string());
+                    );
+                    response["requestId"] = serde_json::json!(request_id);
+                    return Ok(response.to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -3467,6 +3611,8 @@ async fn op_fetch_url(
         };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
+                state.clone(),
+                _page_in_flight,
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -3714,81 +3860,6 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
-    let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(
-                current_url.as_str(),
-                status,
-                resp_headers.clone(),
-                resp_bytes.to_vec(),
-                redirected_from,
-            );
-            let info = RequestInfo {
-                url: resp.url.clone(),
-                method: current_method.as_str().to_string(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            intercepted: was_intercepted,
-            url: current_url.clone(),
-            method: current_method.as_str().to_string(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
-
-    tracing::debug!(
-        "op_fetch_url completed: {} {} ({} bytes)",
-        method,
-        url,
-        resp_body.len()
-    );
-
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
@@ -3796,17 +3867,45 @@ async fn op_fetch_url(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
-    Ok(serde_json::json!({
+    let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
-        "body": if opaque { String::new() } else { resp_body },
-        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
-        "requestId": response_request_id,
+        "requestId": request_id,
         "url": current_url,
         "redirected": redirected,
         "opaque": opaque,
         "headers": script_headers,
-    })
-    .to_string())
+    });
+    // A resource must not form an ownership cycle with its OpState table.
+    let body_state = Rc::downgrade(&state);
+    let body = Box::pin(async move {
+        let _page_in_flight = _page_in_flight;
+        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        if let Some(ref cbs) = callbacks {
+            if cbs.has_response_callbacks().await {
+                let resp = fetch_response(
+                    current_url.as_str(), status, resp_headers.clone(),
+                    resp_bytes.to_vec(), redirected_from,
+                );
+                let info = RequestInfo {
+                    url: resp.url.clone(), method: current_method.as_str().to_string(),
+                    headers: resp_headers.clone(), resource_type: ResourceType::Fetch,
+                };
+                cbs.fire_response(&info, &resp).await;
+            }
+        }
+        if let Some(state) = body_state.upgrade() {
+            record_js_network_completion(&state, JsNetworkEvent {
+                request_id, intercepted: was_intercepted,
+                url: current_url, method: current_method.as_str().to_string(), status,
+                response_headers: resp_headers, body_size: resp_bytes.len(),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64(),
+            }, &String::from_utf8_lossy(&resp_bytes), false);
+        }
+        tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
+        Ok(resp_bytes)
+    });
+    fetch_body_result(&state, metadata, body, internal_load).await
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -3836,6 +3935,8 @@ fn fetch_response(
 /// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
+    state: Rc<RefCell<OpState>>,
+    page_in_flight: PageInFlightGuard,
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
@@ -3861,7 +3962,7 @@ async fn stealth_fetch_all(
         .unwrap_or(false);
     let cookie_initiator = url::Url::parse(&page_origin).ok();
 
-    let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
+    let response = loop {
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -3894,19 +3995,20 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_with_context(
+            .send_single_headers_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
                 &current_body,
                 cookie_context,
                 credentials_allowed,
+                fetch_max_body_bytes().min(64 * 1024 * 1024),
             )
             .await
             .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
 
         if !(300..400).contains(&r.status) {
-            break (r.status, r.headers, r.body);
+            break r;
         }
         // Cross-origin redirect responses must pass the CORS check too, before
         // the redirect is followed (#973).
@@ -3934,11 +4036,11 @@ async fn stealth_fetch_all(
             }
         }
         let Some(location) = r.headers.get("location").cloned() else {
-            break (r.status, r.headers, r.body);
+            break r;
         };
         let next_url = match parsed_current.join(&location) {
             Ok(u) => u,
-            Err(_) => break (r.status, r.headers, r.body),
+            Err(_) => break r,
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
@@ -3972,6 +4074,8 @@ async fn stealth_fetch_all(
         current_url = next_url.to_string();
     };
 
+    let status = response.status;
+    let resp_headers = response.headers;
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -4004,27 +4108,6 @@ async fn stealth_fetch_all(
         }
     }
 
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
-    let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_response_callbacks().await {
-            let resp = fetch_response(
-                current_url.as_str(),
-                status,
-                resp_headers.clone(),
-                resp_bytes.clone(),
-                redirected_from,
-            );
-            let info = RequestInfo {
-                url: resp.url.clone(),
-                method: current_method.clone(),
-                headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
-            };
-            cbs.fire_response(&info, &resp).await;
-        }
-    }
-
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
@@ -4032,16 +4115,33 @@ async fn stealth_fetch_all(
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
 
-    Ok(serde_json::json!({
+    let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
-        "body": if opaque { String::new() } else { resp_body },
-        "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": opaque,
         "headers": script_headers,
-    })
-    .to_string())
+    });
+    let body = Box::pin(async move {
+        let _page_in_flight = page_in_flight;
+        let resp_bytes = response.body.await
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        if let Some(ref cbs) = callbacks {
+            if cbs.has_response_callbacks().await {
+                let resp = fetch_response(
+                    current_url.as_str(), status, resp_headers.clone(),
+                    resp_bytes.clone(), redirected_from,
+                );
+                let info = RequestInfo {
+                    url: resp.url.clone(), method: current_method,
+                    headers: resp_headers, resource_type: ResourceType::Fetch,
+                };
+                cbs.fire_response(&info, &resp).await;
+            }
+        }
+        Ok(resp_bytes)
+    });
+    fetch_body_result(&state, metadata, body, internal_load).await
 }
 
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
@@ -5334,13 +5434,23 @@ fn frame_message_queue_byte_limit() -> usize {
 // handshake actually depends on.
 #[op2(fast)]
 fn op_post_frame_message(
+    scope: &mut v8::PinScope,
     state: &OpState,
     target_frame_id: u32,
-    source_frame_id: u32,
-    #[string] origin: &str,
     #[string] target_origin: &str,
     #[string] data_json: &str,
-) {
+) -> bool {
+    let source = realm_state(scope, state);
+    let source = source.borrow();
+    let source_frame_id = source.frame_id;
+    if source_frame_id == 0 && target_frame_id == 0 {
+        return false; // The page's self-post uses its existing local task queue.
+    }
+    let origin = source.inherited_origin.clone().unwrap_or_else(|| {
+        url::Url::parse(&source.url).map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "null".to_string())
+    });
+    drop(source);
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
@@ -5355,7 +5465,7 @@ fn op_post_frame_message(
             gs.pending_frame_messages.len(),
             gs.pending_frame_message_bytes,
         );
-        return;
+        return true;
     }
     gs.pending_frame_message_bytes = gs
         .pending_frame_message_bytes
@@ -5363,10 +5473,11 @@ fn op_post_frame_message(
     gs.pending_frame_messages.push(PendingFrameMessage {
         target_frame_id,
         source_frame_id,
-        origin: origin.to_string(),
+        origin,
         target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
     });
+    true
 }
 
 /// Resolves after `millis`, as the timer source for child frame realms.
@@ -5428,6 +5539,124 @@ fn op_frame_document_ready(
         parent_frame_id,
     });
     frame_id
+}
+
+// deno_core owns the context-state and module-map slots. Store traced V8 values
+// after them, not Global handles that would keep the context alive after detach.
+const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
+const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
+
+#[op2(nofast)]
+fn op_register_document_realm(
+    scope: &mut v8::PinScope,
+    members: v8::Local<v8::Object>,
+    frame_id: u32,
+) {
+    if let Some(context) = members.get_creation_context(scope) {
+        context.set_embedder_data(DOCUMENT_MEMBERS_SLOT, members.into());
+        let id = v8::Integer::new_from_unsigned(scope, frame_id);
+        context.set_embedder_data(DOCUMENT_OWNER_SLOT, id.into());
+    }
+}
+
+/// Resolve a borrowed document member from the receiver's creation realm, not
+/// its public prototype, which a membrane is allowed to replace.
+#[op2]
+fn op_document_realm_member<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    receiver: v8::Local<'s, v8::Object>,
+    #[string] name: &str,
+    caller_frame_id: u32,
+) -> v8::Local<'s, v8::Value> {
+    let member = (|| {
+        let context = receiver.get_creation_context(scope)?;
+        let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+        if owner == caller_frame_id { return None; }
+        let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
+        let key = v8::String::new(scope, name)?;
+        let value = members.get(scope, key.into())?;
+        value.is_function().then_some(value)
+    })();
+    member.unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+/// Limit live contexts and DOM trees, including initial realms awaiting Page
+/// adoption. Synchronous and fetched frames share the same per-page budget.
+pub fn max_live_frames() -> usize {
+    std::env::var("OBSCURA_MAX_LIVE_FRAMES").ok()
+        .and_then(|value| value.parse().ok()).unwrap_or(64)
+}
+
+/// An initial about:blank needs its own realm before the next JS statement.
+#[op2(nofast)]
+fn op_initial_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    parent_frame_id: u32,
+    initialize: v8::Local<v8::Function>,
+) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let page = state.borrow::<SharedState>().clone();
+        let parent_state = frame_state(state, parent_frame_id);
+        if registry.borrow().live_count() >= max_live_frames()
+            || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+            || page.borrow().pending_frame_bytes.saturating_add("about:blank".len()) > MAX_PENDING_FRAME_BYTES
+        {
+            return 0;
+        }
+        let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
+        page.borrow_mut().frame_id_counter = frame_id;
+        let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
+        let main_context = scope.get_current_context();
+        let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
+            .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
+        else { return 0 };
+        // Same borrowed deno_core slots as fetched frame realms. Child contexts
+        // must not own or free these pointers.
+        unsafe {
+            for index in [deno_core::CONTEXT_STATE_SLOT_INDEX, deno_core::MODULE_MAP_SLOT_INDEX] {
+                let pointer = main_context.get_aligned_pointer_from_embedder_data(index);
+                context.set_aligned_pointer_in_embedder_data(index, pointer);
+            }
+        }
+        context.set_security_token(parent_context.get_security_token(scope));
+        let mut child = ObscuraState::new();
+        #[cfg(feature = "render")]
+        child.set_viewport(300.0, 150.0);
+        {
+            let parent = parent_state.borrow();
+            child.dom = Some(obscura_dom::parse_html(
+                "<!DOCTYPE html><html><head></head><body></body></html>"));
+            child.frame_id = frame_id;
+            child.about_base_url = document_base_url(&parent);
+            child.inherited_origin = Some(parent.inherited_origin.clone().unwrap_or_else(|| {
+                url::Url::parse(&parent.url).map(|url| url.origin().ascii_serialization())
+                    .unwrap_or_else(|_| "null".to_string())
+            }));
+            child.inherit_resources(&parent);
+        }
+        let handle = v8::Global::new(scope, context);
+        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
+        let window = context.global(scope);
+        let id = v8::Integer::new_from_unsigned(scope, frame_id);
+        let receiver = v8::undefined(scope);
+        if initialize.call(scope, receiver.into(), &[window.into(), id.into()]).is_none() {
+            registry.borrow_mut().forget(&handle);
+            return 0;
+        }
+        let mut page = page.borrow_mut();
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add("about:blank".len());
+        page.pending_frames.push(PendingFrame {
+            frame_id,
+            parent_frame_id,
+            url: "about:blank".to_string(),
+            html: String::new(),
+            viewport_width: 300,
+            viewport_height: 150,
+        });
+        frame_id
+    })).unwrap_or(0)
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -6321,12 +6550,16 @@ pub fn build_extension() -> Extension {
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
+        op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
         op_session_history(),
         op_history_traverse(),
         op_frame_document_ready(),
+        op_initial_frame(),
+        op_document_realm_member(),
+        op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),
@@ -6349,12 +6582,12 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        op_begin_render_task(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     {
-        ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
@@ -6551,9 +6784,16 @@ fn op_waapi_control(state: &OpState, id: f64, #[string] action: &str, value: f64
 
 // Rendering and JS URL reflection share one document-generation cache. Geometry
 // and image getters must not run a whole-document selector on every read.
-#[cfg(feature = "render")]
+// Not tied to `render`: the JS layer resolves every relative URL through here, in all build
+// variants, and initial about:blank frames inherit their creator's base URL from it.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     base_values_memoized(state).0
+}
+
+/// The URL a document's base resolves against. Initial about:blank documents use the base URL
+/// they inherited from their creator instead of their own URL.
+fn base_resolution_url(state: &ObscuraState) -> &str {
+    state.about_base_url.as_deref().unwrap_or(&state.url)
 }
 
 fn resolve_document_base_url(document_url: &str, base_href: Option<&str>) -> Option<String> {
@@ -6604,7 +6844,7 @@ fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>
     if let Some(cached) = state.base_url_cache.borrow().as_ref() {
         if cached.activity_generation == state.activity_generation
             && cached.document_generation == state.document_generation
-            && cached.url == state.url
+            && cached.url == base_resolution_url(state)
         {
             return (cached.resolved.clone(), cached.raw_href.clone());
         }
@@ -6612,13 +6852,13 @@ fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>
     // Resolve both forms from the same first <base href>. Keep the existing
     // conservative mutation key so reordering/removal and URL changes are seen.
     let raw_href = document_base_href(state);
-    let resolved = resolve_document_base_url(&state.url, raw_href.as_deref());
+    let resolved = resolve_document_base_url(base_resolution_url(state), raw_href.as_deref());
     *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
         activity_generation: state.activity_generation,
         document_generation: state.document_generation,
         #[cfg(feature = "render")]
         task_generation: state.animation_task_generation,
-        url: state.url.clone(),
+        url: base_resolution_url(state).to_string(),
         resolved: resolved.clone(),
         raw_href: raw_href.clone(),
     });
@@ -6841,12 +7081,10 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
     state.resolved_scroll = None;
 }
 
-#[cfg(feature = "render")]
 pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
     state.animation_task_generation = state.animation_task_generation.wrapping_add(1);
 }
 
-#[cfg(feature = "render")]
 #[op2(fast)]
 fn op_begin_render_task(state: &OpState) {
     let shared = state.borrow::<SharedState>().clone();
@@ -7318,8 +7556,8 @@ fn clamp_scroll_offset_for_consumer(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7375,8 +7613,8 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7402,8 +7640,8 @@ fn op_layout_box_metrics(state: &OpState, #[string] nid_str: String) -> String {
 /// point is outside the viewport or no rendered element contains it.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_layout_hit_test(state: &OpState, x: f64, y: f64) -> i32 {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7436,13 +7674,13 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64) -> i32 {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String, frame_id: u32) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7501,13 +7739,13 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: String, frame_id: u32) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7561,8 +7799,9 @@ fn op_computed_style(
     #[string] nid_str: String,
     #[string] pseudo: String,
     #[string] property: String,
+    frame_id: u32,
 ) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7641,8 +7880,8 @@ fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_metrics(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_metrics(state: &OpState, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let viewport = gs.viewport;
@@ -7658,8 +7897,8 @@ fn op_layout_metrics(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7695,8 +7934,8 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7739,8 +7978,8 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_offset(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_offset(state: &OpState, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let requested = gs.scroll_offset;
@@ -7751,8 +7990,8 @@ fn op_scroll_offset(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_to(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));

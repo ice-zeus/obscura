@@ -161,6 +161,10 @@ const _dom = (cmd, a1, a2) => {
   // not make JS believe a move happened.
   if (result === "true" && _DOM_TREE_MUTATION_COMMANDS.has(cmd)) {
     _treeMutationEpoch++;
+    // HTML removal steps reset the focused area to the viewport without
+    // dispatching blur/change events. Cover native replacement paths too.
+    const focused = globalThis.__obscura_focused;
+    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
   }
   return result;
 };
@@ -4922,6 +4926,7 @@ class Element extends Node {
     if (oldId) {
       delete globalThis.__obscura_frameElements[oldId];
       delete globalThis.__obscura_frameWindows[oldId];
+      delete globalThis.__obscura_frameObjects[oldId];
     }
     this._frameId = 0;
     this._iframeLoadingUrl = null;
@@ -4958,6 +4963,7 @@ class Element extends Node {
         // document below stays: it is what the parent reads through
         // contentDocument.
         const box = el.getBoundingClientRect();
+        if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
@@ -4993,6 +4999,7 @@ class Element extends Node {
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
+    if (_ensureInitialFrameRealm(this) === false) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -5015,6 +5022,7 @@ class Element extends Node {
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
+    if (_ensureInitialFrameRealm(this) === false) return null;
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -5302,7 +5310,7 @@ class Element extends Node {
   _renderBoxMetrics() {
     if (typeof __obscuraCore.ops.op_layout_box_metrics === 'function') {
       try {
-        const raw = __obscuraCore.ops.op_layout_box_metrics(String(this._nid | 0));
+        const raw = __obscuraCore.ops.op_layout_box_metrics(String(this._nid | 0), _realmFrameId);
         if (!raw) return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
         const metrics = JSON.parse(raw);
         if (metrics && Number.isFinite(metrics.clientWidth)
@@ -5321,7 +5329,7 @@ class Element extends Node {
     }
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -5348,7 +5356,7 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -5412,7 +5420,7 @@ class Element extends Node {
   _renderScrollMetrics() {
     if (typeof __obscuraCore.ops.op_layout_metrics !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_metrics();
+      const raw = __obscuraCore.ops.op_layout_metrics(_realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5421,7 +5429,7 @@ class Element extends Node {
   _renderElementScrollMetrics() {
     if (typeof __obscuraCore.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -5432,7 +5440,7 @@ class Element extends Node {
   _renderScrollOffset() {
     if (typeof __obscuraCore.ops.op_scroll_offset !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_scroll_offset();
+      const raw = __obscuraCore.ops.op_scroll_offset(_realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5441,7 +5449,7 @@ class Element extends Node {
   _setRenderScroll(x, y) {
     if (typeof __obscuraCore.ops.op_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_scroll_to(+x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_scroll_to(+x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5450,7 +5458,7 @@ class Element extends Node {
   _setRenderElementScroll(x, y) {
     if (typeof __obscuraCore.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5615,23 +5623,22 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView(arg) {
-    globalThis.__obscura_click_target = this;
-    const rect = this.getBoundingClientRect();
-    // A viewport-fixed subtree is already expressed in the viewport's
-    // coordinate space and cannot be brought closer by moving the document.
-    if (rect.__obscuraViewportFixed) return;
-
     let block = "start", inline = "nearest";
     if (arg === false) block = "end";
     else if (arg && typeof arg === "object") {
       if (["start", "center", "end", "nearest"].includes(arg.block)) block = arg.block;
       if (["start", "center", "end", "nearest"].includes(arg.inline)) inline = arg.inline;
     }
-    const currentX = globalThis.scrollX || 0;
-    const currentY = globalThis.scrollY || 0;
-    const vw = globalThis.innerWidth || 1280;
-    const vh = globalThis.innerHeight || 720;
+    this._scrollIntoView(block, inline, false, arg && arg.behavior);
+  }
+  scrollIntoViewIfNeeded(centerIfNeeded = true) {
+    const alignment = centerIfNeeded ? "center" : "nearest";
+    this._scrollIntoView(alignment, alignment, true);
+  }
+  _scrollIntoView(block, inline, onlyIfNeeded, behavior) {
+    globalThis.__obscura_click_target = this;
     const align = (mode, start, end, size, viewportSize, current) => {
+      if (onlyIfNeeded && start >= 0 && end <= viewportSize) return current;
       if (mode === "start") return current + start;
       if (mode === "center") return current + start - (viewportSize - size) / 2;
       if (mode === "end") return current + end - viewportSize;
@@ -5640,13 +5647,41 @@ class Element extends Node {
       if ((start >= 0 && end <= viewportSize) || (start < 0 && end > viewportSize)) {
         return current;
       }
-      if (start < 0) return current + start;
-      if (end > viewportSize) return current + end - viewportSize;
+      if (start < 0) return current + (size <= viewportSize ? start : end - viewportSize);
+      if (end > viewportSize) return current + (size <= viewportSize ? end - viewportSize : start);
       return current;
     };
+    // Use the renderer's retained scroll ranges, not overflow guesses. A
+    // clipped/non-scrolling box has zero range even when descendants overflow.
+    const viewportFixed = this.getBoundingClientRect().__obscuraViewportFixed;
+    for (let ancestor = this.parentElement;
+         typeof __obscuraCore.ops.op_element_scroll_metrics === 'function' && ancestor && !ancestor._isViewportRoot();
+         ancestor = ancestor.parentElement) {
+      const metrics = ancestor._renderElementScrollMetrics();
+      if (metrics && (metrics.maxX > 0 || metrics.maxY > 0)) {
+        const rect = this.getBoundingClientRect();
+        const port = ancestor.getBoundingClientRect();
+        const x = port.left + ancestor.clientLeft;
+        const y = port.top + ancestor.clientTop;
+        ancestor.scrollTo({
+          left: align(inline, rect.left - x, rect.right - x, rect.width, metrics.clientWidth, metrics.x),
+          top: align(block, rect.top - y, rect.bottom - y, rect.height, metrics.clientHeight, metrics.y),
+          behavior,
+        });
+      }
+      // A fixed scrollport can scroll its contents, but moving ancestors
+      // outside its fixed containing block cannot bring the target into view.
+      if (viewportFixed && globalThis.getComputedStyle(ancestor).position === 'fixed') break;
+    }
+    const rect = this.getBoundingClientRect();
+    if (rect.__obscuraViewportFixed) return;
+    const currentX = globalThis.scrollX || 0;
+    const currentY = globalThis.scrollY || 0;
+    const vw = globalThis.innerWidth || 1280;
+    const vh = globalThis.innerHeight || 720;
     const left = align(inline, rect.left, rect.right, rect.width, vw, currentX);
     const top = align(block, rect.top, rect.bottom, rect.height, vh, currentY);
-    globalThis.scrollTo({ left, top, behavior: arg && arg.behavior });
+    globalThis.scrollTo({ left, top, behavior });
   }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
   // The setters fire a scroll event of their own, so suppress the per-axis ones
@@ -6022,7 +6057,11 @@ class Document extends Node {
     }
     title.textContent = value;
   }
-  get URL() { return this._detached ? "about:blank" : (_domParse("document_url") ?? ""); }
+  get URL() {
+    const get = _documentRealmMember(this, 'URL');
+    if (get) return Reflect.apply(get, this, []);
+    return this._detached ? "about:blank" : (_domParse("document_url") ?? "");
+  }
   get documentURI() { return this.URL; }
   get domain() {
     return this === globalThis.document
@@ -6052,7 +6091,11 @@ class Document extends Node {
     if (this._detached) return;
     __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', '');
   }
-  get defaultView() { return this._detached ? null : globalThis; }
+  get defaultView() {
+    const get = _documentRealmMember(this, 'defaultView');
+    if (get) return Reflect.apply(get, this, []);
+    return this._detached ? null : globalThis;
+  }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
@@ -6084,7 +6127,11 @@ class Document extends Node {
     if (/\.(?:xml|svg)(?:[?#]|$)/i.test(url)) return "application/xml";
     return "text/html";
   }
-  get readyState() { return this._detached ? 'complete' : (globalThis.__documentReadyState__ || 'complete'); }
+  get readyState() {
+    const get = _documentRealmMember(this, 'readyState');
+    if (get) return Reflect.apply(get, this, []);
+    return this._detached ? 'complete' : (globalThis.__documentReadyState__ || 'complete');
+  }
   get currentScript() {
     // Next.js / Turbopack chunk loader reads document.currentScript.src to
     // derive its base path. page.rs sets __currentScriptNid before each
@@ -6095,6 +6142,8 @@ class Document extends Node {
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) {
+    const method = _documentRealmMember(this, 'getElementById');
+    if (method) return Reflect.apply(method, this, [id]);
     const needle = String(id);
     if (needle === "") return null;
     if (this._detached) {
@@ -6103,10 +6152,14 @@ class Document extends Node {
     return _wrapEl(+_dom("get_element_by_id", needle));
   }
   querySelector(s) {
+    const method = _documentRealmMember(this, 'querySelector');
+    if (method) return Reflect.apply(method, this, [s]);
     if (this._detached) return _wrapEl(+_dom("query_selector_scoped", this._nid, s));
     return _wrapEl(+_dom("query_selector", s));
   }
   querySelectorAll(s) {
+    const method = _documentRealmMember(this, 'querySelectorAll');
+    if (method) return Reflect.apply(method, this, [s]);
     const ids = (this._detached
       ? _domParse("query_selector_all_scoped", this._nid, s)
       : _domParse("query_selector_all", s)) || [];
@@ -6612,8 +6665,12 @@ class Document extends Node {
     this.write(args.join('') + '\n');
   }
   open() {
-    if (this.head) this.head.innerHTML = '';
-    var body = this.body;
+    const method = _documentRealmMember(this, 'open');
+    if (method) return Reflect.apply(method, this, []);
+    // Native algorithms use the receiver's tree, not script-overridden getters.
+    const head = _wrapEl(+_dom('query_selector', 'head'));
+    if (head) head.innerHTML = '';
+    const body = _wrapEl(+_dom('query_selector', 'body'));
     if (body) body.innerHTML = '';
     // A new parse begins. Whatever the input stream still held is gone.
     _dom("document_write_reset");
@@ -6626,6 +6683,8 @@ class Document extends Node {
     return this;
   }
   close() {
+    const method = _documentRealmMember(this, 'close');
+    if (method) return Reflect.apply(method, this, []);
     if (!this._writeOpen) return;
     this._writeOpen = false;
     const generation = this._writeGeneration;
@@ -6652,6 +6711,13 @@ class Document extends Node {
   }
   hasFocus() { return !this._detached; }
   execCommand() { return false; }
+}
+
+// Preserve the receiver realm's implementations even if a membrane remaps the
+// document's public prototype. The ordinary own-document path makes no op call.
+function _documentRealmMember(receiver, name) {
+  return receiver === globalThis.document ? undefined
+    : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
 }
 
 class DocumentFragment extends Node {
@@ -8098,6 +8164,13 @@ globalThis.fetch = async (input, init = {}) => {
     url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
+  if (typeof parsed.bodyRid === 'number') {
+    // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
+    // stream backpressure rather than eagerly queuing every network chunk.
+    const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid);
+    promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
+    response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
+  }
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
       value: parsed.requestId,
@@ -8549,6 +8622,7 @@ if (typeof Response === 'undefined') {
       this._bodyNull = body === null || body === undefined;
       this._bodyStream = null;
       this._bodyUsed = false;
+      this._fetchBody = null;
     }
     _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
@@ -8560,8 +8634,18 @@ if (typeof Response === 'undefined') {
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
-            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
-            controller.close();
+            const deliver = (bytes) => {
+              if (bytes.length) controller.enqueue(bytes);
+              controller.close();
+            };
+            if (this._fetchBody) this._fetchBody.promise.then(deliver, error => controller.error(error));
+            else deliver(this._bodyBytes);
+          },
+          cancel: () => {
+            this._bodyUsed = true;
+            if (this._fetchBody && --this._fetchBody.resource.consumers === 0) {
+              __obscuraCore.ops.op_try_close(this._fetchBody.resource.rid);
+            }
           },
         });
         // bodyUsed flips the moment the stream is locked for reading
@@ -8582,11 +8666,20 @@ if (typeof Response === 'undefined') {
       return this._bodyStream;
     }
     get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    clone() {
+      const copy = new Response(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+      if (this._fetchBody) {
+        const promise = this._fetchBody.promise.then(bytes => bytes.slice());
+        promise.catch(() => {});
+        this._fetchBody.resource.consumers++;
+        copy._fetchBody = { promise, resource: this._fetchBody.resource };
+      }
+      return copy;
+    }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
     static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
@@ -8767,7 +8860,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8869,7 +8962,7 @@ function _roMeasurements(targets) {
   if (typeof bulk === "function"
       && targets.every(target => target?._nid != null)) {
     try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)), _realmFrameId);
       const geometries = raw ? JSON.parse(raw) : null;
       if (Array.isArray(geometries) && geometries.length === targets.length) {
         for (let index = 0; index < targets.length; index++) {
@@ -9260,13 +9353,20 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
   };
 });
 // getComputedStyle() returns a fresh declaration object, but those objects all
-// observe the same computed style for an element until the document mutates.
+// observe the same computed style until the document or viewport changes.
 // Share the immutable native snapshot behind them. Frameworks routinely call
 // getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
 // several hundred properties for every wrapper dominated real-page startup.
 const _computedStyleSnapshotCache = new WeakMap();
 globalThis.getComputedStyle = (el, pseudo = '') => {
   if (!el) el = document.body || {};
+  // Resolve foreign elements in their document's realm, including its live
+  // mutation epoch. Node ids and style caches are document-local.
+  const view = el.ownerDocument?.defaultView;
+  if (view && view !== globalThis && typeof view.getComputedStyle === 'function'
+      && view.getComputedStyle !== globalThis.getComputedStyle) {
+    return view.getComputedStyle(el, pseudo);
+  }
   pseudo = String(pseudo || '').toLowerCase();
   const style = el?.style || el?._style || new CSSStyleDeclaration();
   // Render builds expose one immutable snapshot from the retained final
@@ -9275,21 +9375,25 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
   let snapshot = !pseudo && cacheable ? _computedStyleSnapshotCache.get(el) : null;
   if (!snapshot) {
-    snapshot = { rendered: null, epoch: -1, names: [], complete: false };
+    snapshot = { rendered: null, epoch: -1, viewportWidth: -1, viewportHeight: -1, names: [], complete: false };
     if (!pseudo && cacheable) _computedStyleSnapshotCache.set(el, snapshot);
   }
   const refreshRendered = (property = '') => {
+    const viewportWidth = globalThis.innerWidth, viewportHeight = globalThis.innerHeight;
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
     if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation
+        && snapshot.viewportWidth === viewportWidth && snapshot.viewportHeight === viewportHeight
         && (snapshot.complete || (property && snapshot.rendered
             && Object.prototype.hasOwnProperty.call(snapshot.rendered, property)))) return;
     snapshot.epoch = _domMutationEpoch;
+    snapshot.viewportWidth = viewportWidth;
+    snapshot.viewportHeight = viewportHeight;
     snapshot.rendered = null;
     snapshot.complete = true;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), pseudo, property);
+        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), pseudo, property, _realmFrameId);
         if (raw) [snapshot.complete, snapshot.rendered] = JSON.parse(raw);
       } catch (e) {}
     }
@@ -10665,7 +10769,7 @@ function _ioMeasurements(elements) {
   const nativeElements = elements.filter(element => element?._nid != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
-    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)), _realmFrameId);
     const geometries = raw ? JSON.parse(raw) : null;
     if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
       for (let index = 0; index < nativeElements.length; index++) {
@@ -14064,7 +14168,7 @@ globalThis.__obscura_forgetFrame = function (frameId) {
 };
 
 function _realmOrigin() {
-  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+  return _domParse('document_origin') || 'null';
 }
 
 // Whether a postMessage restricted to `targetOrigin` may be delivered to a
@@ -14097,8 +14201,20 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   // An unspecified targetOrigin stays permissive (empty string); the receiver
   // enforces a specified one against its own origin in __obscura_deliverMessage.
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
-  __obscuraCore.ops.op_post_frame_message(
-    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
+  if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
+  // Top-level self-posts also work in a standalone runtime without a Page to
+  // drain cross-realm messages. Serialize only once, before scheduling.
+  const origin = _realmOrigin();
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
+  const clone = JSON.parse(json).v;
+  setTimeout(() => {
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+    } catch (error) {
+      console.error('message listener failed:', error && error.message || error);
+    }
+  }, 0);
 }
 
 // The frame's own window and document, when this page is allowed to touch
@@ -14116,6 +14232,44 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
+function _ensureInitialFrameRealm(element) {
+  if (element._frameId || !element.isConnected) return;
+  // An opaque sandbox must never receive the creator's security token.
+  if (element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
+    const core = child.__obscura_core_handoff;
+    for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
+    delete child.__obscura_core_handoff;
+    delete child.Deno;
+    for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
+                       '__obscura_ua_platform_version', '__obscura_stealth',
+                       '__obscura_geo_lat', '__obscura_geo_lon']) {
+      if (globalThis[name] !== undefined) child[name] = globalThis[name];
+    }
+    child.__obscura_frameId = id;
+    child.__obscura_parentFrameId = _realmFrameId;
+    child.__obscura_init();
+    Object.defineProperties(child, {
+      parent: { value: globalThis, configurable: true },
+      top: { value: globalThis.top, configurable: true },
+      frameElement: { value: element, configurable: true },
+    });
+    child.innerWidth = 300;
+    child.innerHeight = 150;
+    globalThis.__obscura_frameObjects[id] = {
+      window: child, document: child.document, initial: true,
+    };
+  });
+  if (frameId) {
+    element._frameId = frameId;
+    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
+    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    globalThis.__obscura_frameElements[frameId] = element;
+  }
+  return frameId !== 0;
+}
+
 // The window object this realm uses to stand for frame `frameId`, built once
 // and reused so `event.source === iframe.contentWindow` holds.
 //
@@ -14128,6 +14282,7 @@ function _frameWindowFor(frameId) {
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
   if (!real) return existing || null;
+  if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
   const post = _markNative(function (data, targetOrigin, _transfer) {
@@ -15447,26 +15602,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
 globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  let clone = data;
-  // Match the cross-realm path: a value postMessage cannot carry is rejected
-  // at the call, not delivered as something else.
-  try {
-    clone = JSON.parse(JSON.stringify({ v: data === undefined ? null : data })).v;
-  } catch (_) {
-    throw new DOMException('The object could not be cloned.', 'DataCloneError');
-  }
-  const origin = _realmOrigin();
-  // A self-post honours targetOrigin too: sender and receiver are this realm,
-  // so a targetOrigin naming a different origin drops the message.
-  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
-  setTimeout(() => {
-    try {
-      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-        new MessageEvent('message', { data: clone, origin, source: globalThis })));
-    } catch (error) {
-      console.error('message listener failed:', error && error.message || error);
-    }
-  }, 0);
+  _sendRealmMessage(_realmFrameId, data, targetOrigin);
 };
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
@@ -15540,7 +15676,9 @@ if (typeof ReadableStream === 'undefined') {
       };
     }
     cancel(reason) {
+      if (this._state === "errored") return Promise.reject(this._error);
       this._queue.length = 0;
+      if (this._state === "closed") return Promise.resolve();
       this._controller.close();
       try { return Promise.resolve(this._source.cancel?.(reason)); }
       catch (error) { return Promise.reject(error); }
@@ -16788,6 +16926,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // querySelectorAll returns tree order, which also makes descendants and
   // later siblings replace the matching boxes behind them.
   Document.prototype.elementFromPoint = function(x, y) {
+    const method = _documentRealmMember(this, 'elementFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
@@ -16795,7 +16935,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
     if (typeof __obscuraCore.ops.op_layout_hit_test === 'function') {
-      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y);
+      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y, _realmFrameId);
       if (hitNid >= 0) {
         var hit = _wrapEl(hitNid);
         return hit === this.documentElement && this.body ? this.body : hit;
@@ -16881,9 +17021,17 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+// Capture late-defined document members too, before page code can replace them.
+const _documentMembers = Object.freeze(Object.fromEntries(
+  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+    return [name, descriptor.value || descriptor.get];
+  })));
+
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  __obscuraCore.ops.op_register_document_realm(_documentMembers, _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);

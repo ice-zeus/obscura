@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::ops::max_live_frames;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -342,18 +343,6 @@ pub struct Page {
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
-
-/// How many child frame realms one document may hold at once.
-///
-/// Real pages use a handful; the cap exists so a page that creates iframes in a
-/// loop cannot make the engine hold an unbounded number of contexts and DOM
-/// trees. Frames are released when the document is replaced.
-fn max_live_frames() -> usize {
-    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
-}
 
 /// The first navigation counts. The low default stops a page that resets
 /// `location` on every load.
@@ -1413,6 +1402,9 @@ impl Page {
     /// page's same-origin frame table. This also covers a frame rejected before
     /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
     fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
+        if let Some(js) = self.js.as_mut() {
+            js.forget_frame_state(frame_id);
+        }
         let script = format!(
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
@@ -3730,11 +3722,9 @@ impl Page {
 
         for _ in 0..ROUNDS {
             if let Some(js) = &mut self.js {
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(ROUND_MS),
-                    js.run_event_loop(),
-                )
-                .await;
+                // A Tokio timeout cannot interrupt synchronous microtasks.
+                // Use the same cooperative, watchdog-bounded pump as settling.
+                let _ = js.run_event_loop_bounded(ROUND_MS).await;
             }
             if !self.advance_frames().await {
                 break;
@@ -7763,6 +7753,31 @@ mod tests {
                 .unwrap(),
             serde_json::json!([1, 1, true]),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_discovery_bounds_a_microtask_storm() {
+        let mut page = import_map_test_page(
+            "frame-discovery-microtasks",
+            "https://example.test/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        page.js.as_mut().unwrap().execute_script(
+            "frame-discovery-busy-task",
+            "setTimeout(() => {\
+               const end = Date.now() + 7000;\
+               const spin = () => { if (Date.now() < end) Promise.resolve().then(spin); };\
+               spin();\
+             }, 0);",
+        ).unwrap();
+
+        let started = std::time::Instant::now();
+        page.build_document_frames().await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(6500),
+            "frame discovery must bound synchronous microtasks, not rely on a Tokio timeout: {:?}",
+            started.elapsed());
+        assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0),
+            "the page must remain usable after an overrun");
     }
 
     #[tokio::test(flavor = "current_thread")]
